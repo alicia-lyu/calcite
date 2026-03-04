@@ -99,6 +99,20 @@ public class EnumerableRules {
   public static final EnumerableSortRule ENUMERABLE_SORT_RULE =
       EnumerableSortRule.DEFAULT_CONFIG.toRule(EnumerableSortRule.class);
 
+  /**
+   * Rule that replaces an order-based pipeline
+   * ({@link EnumerableMergeJoin} over two {@link EnumerableSort}s over
+   * {@link EnumerableTableScan}s) with a single
+   * {@link EnumerableMergedIndexScan} when a matching merged index is
+   * registered in
+   * {@link org.apache.calcite.materialize.MergedIndexRegistry}.
+   *
+   * <p>Not included in {@link #ENUMERABLE_RULES}; callers opt in explicitly.
+   */
+  public static final PipelineToMergedIndexScanRule
+      ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE =
+          PipelineToMergedIndexScanRule.Config.DEFAULT.toRule();
+
   public static final EnumerableLimitSortRule ENUMERABLE_LIMIT_SORT_RULE =
       EnumerableLimitSortRule.Config.DEFAULT.toRule();
 

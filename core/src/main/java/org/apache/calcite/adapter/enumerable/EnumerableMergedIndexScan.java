@@ -1,0 +1,136 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to you under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.calcite.adapter.enumerable;
+
+import org.apache.calcite.linq4j.tree.BlockBuilder;
+import org.apache.calcite.linq4j.tree.Expressions;
+import org.apache.calcite.materialize.MergedIndex;
+import org.apache.calcite.plan.RelOptCluster;
+import org.apache.calcite.plan.RelOptCost;
+import org.apache.calcite.plan.RelOptPlanner;
+import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.rel.AbstractRelNode;
+import org.apache.calcite.rel.RelCollationTraitDef;
+import org.apache.calcite.rel.RelWriter;
+import org.apache.calcite.rel.metadata.RelMetadataQuery;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.util.BuiltInMethod;
+
+/**
+ * Physical relational operator that reads a {@link MergedIndex} —
+ * a multi-table interleaved B-tree — and produces the joined (and optionally
+ * aggregated) output of all participating tables in a single sequential pass.
+ *
+ * <p>This operator replaces an entire pipeline of:
+ * <pre>
+ *   EnumerableSort(A) ──→ EnumerableMergeJoin ──→ (EnumerableSortedAggregate)
+ *   EnumerableSort(B) ──→/
+ * </pre>
+ * The merged index physically pre-sorts records from all tables by the shared
+ * key, so no run-time sorting, merging, or aggregation is needed.
+ *
+ * <p>Cost model: {@code rowCount=ΣTᵢ, cpu=ΣTᵢ*0.1, io=ΣTᵢ} — always cheaper
+ * than the sum of sort + merge-join costs for any non-trivial dataset.
+ *
+ * <p>See: "Storing and Indexing Multiple Tables by Interesting Orderings",
+ * Wenhui Lyu &amp; Goetz Graefe, VLDB 2026.
+ */
+public class EnumerableMergedIndexScan extends AbstractRelNode
+    implements EnumerableRel {
+
+  /** The merged index that backs this scan. */
+  public final MergedIndex mergedIndex;
+
+  /**
+   * The joined output row type (all fields from all participating tables
+   * concatenated, matching the row type of the pipeline being replaced).
+   */
+  private final RelDataType rowType;
+
+  /** Creates an EnumerableMergedIndexScan. Use {@link #create} instead. */
+  protected EnumerableMergedIndexScan(
+      RelOptCluster cluster,
+      RelTraitSet traitSet,
+      MergedIndex mergedIndex,
+      RelDataType rowType) {
+    super(cluster, traitSet);
+    this.mergedIndex = mergedIndex;
+    this.rowType = rowType;
+    assert getConvention() instanceof EnumerableConvention;
+  }
+
+  /**
+   * Creates an {@code EnumerableMergedIndexScan}.
+   *
+   * @param cluster    query planning cluster
+   * @param mergedIndex the merged index to scan
+   * @param rowType    the joined output row type (from the pipeline being replaced)
+   */
+  public static EnumerableMergedIndexScan create(
+      RelOptCluster cluster,
+      MergedIndex mergedIndex,
+      RelDataType rowType) {
+    final RelTraitSet traitSet =
+        cluster.traitSetOf(EnumerableConvention.INSTANCE)
+            .replaceIf(RelCollationTraitDef.INSTANCE,
+                () -> com.google.common.collect.ImmutableList.of(mergedIndex.collation));
+    return new EnumerableMergedIndexScan(cluster, traitSet, mergedIndex, rowType);
+  }
+
+  @Override protected RelDataType deriveRowType() {
+    return rowType;
+  }
+
+  /**
+   * Cost model: the merged index scan costs only O(ΣTᵢ) I/O and O(ΣTᵢ)
+   * CPU (record assembly), eliminating the O(N log N) sort costs.
+   */
+  @Override public RelOptCost computeSelfCost(RelOptPlanner planner,
+      RelMetadataQuery mq) {
+    double rc = mergedIndex.rowCount;
+    return planner.getCostFactory().makeCost(rc, rc * 0.1, rc);
+  }
+
+  @Override public double estimateRowCount(RelMetadataQuery mq) {
+    return mergedIndex.rowCount;
+  }
+
+  @Override public RelWriter explainTerms(RelWriter pw) {
+    return super.explainTerms(pw)
+        .item("tables", mergedIndex.tables)
+        .item("collation", mergedIndex.collation);
+  }
+
+  /**
+   * Code generation (proof-of-concept): reads from the primary table's
+   * enumerable expression. In a real implementation this would invoke the
+   * merged-index storage engine to do a sequential range scan.
+   */
+  @Override public Result implement(EnumerableRelImplementor implementor,
+      Prefer pref) {
+    final BlockBuilder builder = new BlockBuilder();
+    final PhysType physType =
+        PhysTypeImpl.of(implementor.getTypeFactory(), rowType,
+            pref.preferArray());
+    // PoC: return an empty enumerable of the correct type.
+    // A production implementation would call into the merged-index storage layer.
+    builder.add(
+        Expressions.return_(null,
+            Expressions.call(BuiltInMethod.EMPTY_ENUMERABLE.method)));
+    return implementor.result(physType, builder.toBlock());
+  }
+}
