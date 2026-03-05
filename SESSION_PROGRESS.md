@@ -2,6 +2,8 @@
 
 ## Status
 
+Note to Claude: include full relative paths here next time.
+
 | Item                                     | Status  |
 |------------------------------------------|---------|
 | CLAUDE.md + main.tex                     | Done    |
@@ -13,6 +15,14 @@
 | Compilation fix (.replace vs .replaceIf) | Done    |
 | PipelineToMergedIndexScanRuleTest.java   | Done ✓  |
 | TPC-H plan observation test              | Done ✓  |
+
+## Commands
+
+```
+./gradlew :plus:cleanTest :plus:test --tests "*.MergedIndexTpchPlanTest" --info
+```
+
+And search for `=== BEFORE (order-based pipeline) ===`.
 
 ---
 
@@ -157,3 +167,11 @@ because it requires explicit EnumerableSort nodes.
 The fix: add a second operand pattern to the rule that matches
 EnumerableMergeJoin over bare table scans with the right collation trait.
 ```
+
+## Next steps
+
+`EnumerableMergedIndexScan`'s infomation is too crowded. Emulate `EnumerableTableScan` and only include table names (no columns), but, on top of that, include the sort key of each relation.
+
+EnumerableMergedIndexScan(tables=[[RelOptTableImpl{schema=org.apache.calcite.prepare.CalciteCatalogReader@40996771, names= [TPCH, ORDERS], table=org.apache.calcite.adapter.tpch.TpchSchema$TpchQueryableTable@58295ffd, rowType=RecordType(JavaType(class java.lang.Long) O_ORDERKEY, JavaType(class java.lang.Long) O_CUSTKEY, JavaType(class java.lang.String) O_ORDERSTATUS, JavaType(class java.lang.Double) O_TOTALPRICE, JavaType(class java.sql.Date) O_ORDERDATE, JavaType(class java.lang.String) O_ORDERPRIORITY, JavaType(class java.lang.String) O_CLERK, JavaType(class java.lang.Integer) O_SHIPPRIORITY, JavaType(class java.lang.String) O_COMMENT)}, RelOptTableImpl{schema=org.apache.calcite.prepare.CalciteCatalogReader@40996771, names= [TPCH, LINEITEM], table=org.apache.calcite.adapter.tpch.TpchSchema$TpchQueryableTable@6315f28e, rowType=RecordType(JavaType(class java.lang.Long) L_ORDERKEY, JavaType(class java.lang.Long) L_PARTKEY, JavaType(class java.lang.Long) L_SUPPKEY, JavaType(class java.lang.Integer) L_LINENUMBER, JavaType(class java.lang.Double) L_QUANTITY, JavaType(class java.lang.Double) L_EXTENDEDPRICE, JavaType(class java.lang.Double) L_DISCOUNT, JavaType(class java.lang.Double) L_TAX, JavaType(class java.lang.String) L_RETURNFLAG, JavaType(class java.lang.String) L_LINESTATUS, JavaType(class java.sql.Date) L_SHIPDATE, JavaType(class java.sql.Date) L_COMMITDATE, JavaType(class java.sql.Date) L_RECEIPTDATE, JavaType(class java.lang.String) L_SHIPINSTRUCT, JavaType(class java.lang.String) L_SHIPMODE, JavaType(class java.lang.String) L_COMMENT)}]], collation=[[0]])
+
+Implement the plan for other TPC-H queries, right now only Q3 is implemented. Why do you simplify Q3? Please keep to the original structure of the query as much as possible.
