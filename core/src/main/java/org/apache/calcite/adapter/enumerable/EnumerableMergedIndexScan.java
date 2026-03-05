@@ -22,12 +22,17 @@ import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptPlanner;
+import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.AbstractRelNode;
+import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.util.BuiltInMethod;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Physical relational operator that reads a {@link MergedIndex} —
@@ -108,8 +113,16 @@ public class EnumerableMergedIndexScan extends AbstractRelNode
   }
 
   @Override public RelWriter explainTerms(RelWriter pw) {
+    List<String> tableDescriptions = new ArrayList<>();
+    for (int i = 0; i < mergedIndex.tables.size(); i++) {
+      RelOptTable t = mergedIndex.tables.get(i);
+      RelCollation tc = mergedIndex.tableCollations.get(i);
+      int keyIdx = tc.getFieldCollations().get(0).getFieldIndex();
+      String keyName = t.getRowType().getFieldList().get(keyIdx).getName();
+      tableDescriptions.add(t.getQualifiedName() + ":" + keyName);
+    }
     return super.explainTerms(pw)
-        .item("tables", mergedIndex.tables)
+        .item("tables", tableDescriptions)
         .item("collation", mergedIndex.collation);
   }
 

@@ -153,7 +153,9 @@ public class PipelineToMergedIndexScanRuleTest {
     RelCollation collation = leftSort.getCollation();
     double rowCount = join.estimateRowCount(join.getCluster().getMetadataQuery());
     MergedIndexRegistry.register(
-        new MergedIndex(List.of(tableA, tableB), collation, rowCount));
+        new MergedIndex(List.of(tableA, tableB),
+            List.of(leftSort.getCollation(), rightSort.getCollation()),
+            collation, rowCount));
 
     // ── Phase 2 ────────────────────────────────────────────────────────────
     // Use a HEP planner so the rule fires directly on the matched subtree

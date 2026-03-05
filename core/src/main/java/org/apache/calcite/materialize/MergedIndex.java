@@ -42,6 +42,13 @@ public class MergedIndex {
   public final ImmutableList<RelOptTable> tables;
 
   /**
+   * Per-table sort collation: {@code tableCollations.get(i)} is the collation
+   * of the {@link org.apache.calcite.adapter.enumerable.EnumerableSort} that
+   * feeds table {@code i} into the pipeline.
+   */
+  public final ImmutableList<RelCollation> tableCollations;
+
+  /**
    * The shared sort key used by all operators in the pipeline
    * (merge joins and sorted aggregations).
    */
@@ -53,9 +60,11 @@ public class MergedIndex {
    */
   public final double rowCount;
 
-  public MergedIndex(List<RelOptTable> tables, RelCollation collation,
-      double rowCount) {
+  public MergedIndex(List<RelOptTable> tables,
+      List<RelCollation> tableCollations,
+      RelCollation collation, double rowCount) {
     this.tables = ImmutableList.copyOf(tables);
+    this.tableCollations = ImmutableList.copyOf(tableCollations);
     this.collation = collation;
     this.rowCount = rowCount;
   }

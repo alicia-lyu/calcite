@@ -4,25 +4,56 @@
 
 Note to Claude: include full relative paths here next time.
 
-| Item                                     | Status  |
-|------------------------------------------|---------|
-| CLAUDE.md + main.tex                     | Done    |
-| MergedIndex.java                         | Done    |
-| MergedIndexRegistry.java                 | Done    |
-| EnumerableMergedIndexScan.java           | Done    |
-| PipelineToMergedIndexScanRule.java       | Done    |
-| EnumerableRules.java (constant)          | Done    |
-| Compilation fix (.replace vs .replaceIf) | Done    |
-| PipelineToMergedIndexScanRuleTest.java   | Done ✓  |
-| TPC-H plan observation test              | Done ✓  |
+| Item                                                                    | Status  |
+|-------------------------------------------------------------------------|---------|
+| `CLAUDE.md` + `main.tex`                                                | Done    |
+| `core/.../materialize/MergedIndex.java`                                 | Done    |
+| `core/.../materialize/MergedIndexRegistry.java`                         | Done    |
+| `core/.../adapter/enumerable/EnumerableMergedIndexScan.java`            | Done    |
+| `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java`        | Done    |
+| `core/.../adapter/enumerable/EnumerableRules.java` (constant)           | Done    |
+| Compilation fix (`.replace` vs `.replaceIf`)                            | Done    |
+| `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
+| `plus/.../adapter/tpch/MergedIndexTpchPlanTest.java`                    | Done ✓  |
+| `explainTerms` display fix (table names + key column, not raw toString) | Done ✓  |
+| TPC-H Q3 (3-table: CUSTOMER ⋈ ORDERS ⋈ LINEITEM, partial substitution) | Done ✓  |
+| TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓  |
 
 ## Commands
 
-```
+```bash
+# Run TPC-H plan tests
 ./gradlew :plus:cleanTest :plus:test --tests "*.MergedIndexTpchPlanTest" --info
+
+# Run core rule test
+./gradlew :core:test --tests "*.PipelineToMergedIndexScanRuleTest"
 ```
 
-And search for `=== BEFORE (order-based pipeline) ===`.
+Search for `=== Q3 BEFORE`, `=== Q3 AFTER`, `=== Q12 BEFORE`, `=== Q12 AFTER` in output.
+
+### Sample AFTER output
+
+**Q3** (partial substitution — inner join replaced, outer join remains):
+```
+EnumerableLimitSort(...)
+  EnumerableAggregate(...)
+    EnumerableMergeJoin(condition=[=($8, $17)])          ← outer join REMAINS
+      EnumerableSort(sort0=[$8])
+        EnumerableMergedIndexScan(
+          tables=[[[TPCH, CUSTOMER]:C_CUSTKEY, [TPCH, ORDERS]:O_CUSTKEY]],
+          collation=[[0]])
+      EnumerableSort(sort0=[$0])
+        EnumerableTableScan(table=[[TPCH, LINEITEM]])
+```
+
+**Q12** (full substitution):
+```
+EnumerableSort(...)
+  EnumerableAggregate(...)
+    EnumerableMergedIndexScan(
+      tables=[[[TPCH, ORDERS]:O_ORDERKEY, [TPCH, LINEITEM]:L_ORDERKEY]],
+      collation=[[0]])
+```
 
 ---
 
