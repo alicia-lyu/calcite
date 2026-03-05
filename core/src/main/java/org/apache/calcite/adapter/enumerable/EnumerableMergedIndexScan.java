@@ -24,7 +24,6 @@ import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.AbstractRelNode;
-import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
@@ -86,8 +85,7 @@ public class EnumerableMergedIndexScan extends AbstractRelNode
       RelDataType rowType) {
     final RelTraitSet traitSet =
         cluster.traitSetOf(EnumerableConvention.INSTANCE)
-            .replaceIf(RelCollationTraitDef.INSTANCE,
-                () -> com.google.common.collect.ImmutableList.of(mergedIndex.collation));
+            .replace(mergedIndex.collation);
     return new EnumerableMergedIndexScan(cluster, traitSet, mergedIndex, rowType);
   }
 
