@@ -1,64 +1,159 @@
 # Session Progress: Merged Index Feature
 
-## What Was Completed
+## Status
 
-### Commits
-1. `32635df48` — Added `CLAUDE.md` (research context) and `main.tex` (paper draft)
-2. `0025c1f86` — Core merged index implementation (5 files, 459 insertions)
+| Item                                     | Status  |
+|------------------------------------------|---------|
+| CLAUDE.md + main.tex                     | Done    |
+| MergedIndex.java                         | Done    |
+| MergedIndexRegistry.java                 | Done    |
+| EnumerableMergedIndexScan.java           | Done    |
+| PipelineToMergedIndexScanRule.java       | Done    |
+| EnumerableRules.java (constant)          | Done    |
+| Compilation fix (.replace vs .replaceIf) | Done    |
+| PipelineToMergedIndexScanRuleTest.java   | Done ✓  |
+| TPC-H plan observation test              | Done ✓  |
 
-### Files Created
-| File | Status |
-|------|--------|
-| `core/.../materialize/MergedIndex.java` | Done |
-| `core/.../materialize/MergedIndexRegistry.java` | Done |
-| `core/.../enumerable/EnumerableMergedIndexScan.java` | Done |
-| `core/.../enumerable/PipelineToMergedIndexScanRule.java` | Done |
-| `core/.../enumerable/EnumerableRules.java` | Done (constant added) |
+---
 
-### What Each File Does
-- **MergedIndex**: Descriptor holding `List<RelOptTable> tables`, `RelCollation collation`, `double rowCount`. Key method: `satisfies(RelCollation)` for prefix-match.
-- **MergedIndexRegistry**: Static singleton; `register(MergedIndex)`, `findFor(tables, collation)`, `clear()`. Matches by qualified table name.
-- **EnumerableMergedIndexScan**: Leaf `AbstractRelNode` + `EnumerableRel`. Takes `MergedIndex` + joined `rowType`. Cost: `(rc, rc*0.1, rc)`. `implement()` returns empty enumerable (PoC stub).
-- **PipelineToMergedIndexScanRule**: Matches `EnumerableMergeJoin(EnumerableSort(TableScan), EnumerableSort(TableScan))`. Looks up registry by collation from left sort. Creates `EnumerableMergedIndexScan` with the merge join's row type.
-- **EnumerableRules**: Added `ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE` constant (NOT in `ENUMERABLE_RULES` list).
+## Flow Chart A — Calcite's Normal Planning Workflow
 
-## What Remains
+```text
+SQL String
+    │
+    ▼
+[SqlParser]                         → SqlNode  (AST)
+    │
+    ▼
+[SqlValidator]                      → SqlNode  (type-annotated)
+    │
+    ▼
+[SqlToRelConverter]                 → LogicalPlan  (convention = NONE)
+    │                                 e.g.  LogicalProject
+    │                                         └─ LogicalJoin
+    │                                              ├─ LogicalTableScan(A)
+    │                                              └─ LogicalTableScan(B)
+    │
+    ▼  Volcano planner (EnumerableRules)
+[Phase 1: logical → physical]       → Physical Pipeline  (convention = ENUMERABLE)
+    ENUMERABLE_TABLE_SCAN_RULE          e.g.  EnumerableProject
+    ENUMERABLE_MERGE_JOIN_RULE                  └─ EnumerableMergeJoin
+    ENUMERABLE_SORT_RULE                             ├─ EnumerableSort
+    ENUMERABLE_PROJECT_RULE                          │    └─ EnumerableTableScan(A)
+                                                     └─ EnumerableSort
+                                                          └─ EnumerableTableScan(B)
+    │
+    ▼  (code generation via Janino)
+[EnumerableRel.implement()]         → Java bytecode → execution
+```
 
-### 1. Integration Test (highest priority)
-File to create: `core/src/test/java/org/apache/calcite/adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`
+---
 
-Test plan:
-- Create a custom schema (`s`) with two `PkClusteredTable`-style tables:
-  - `A(k INT, x INT)` clustered on column 0 (`k`)
-  - `B(k INT, y INT)` clustered on column 0 (`k`)
-- Use a two-phase planner (like `SortRemoveRuleTest.Fixture`):
-  - Phase 1 rules: `ENUMERABLE_MERGE_JOIN_RULE`, `ENUMERABLE_SORT_RULE`, `ENUMERABLE_TABLE_SCAN_RULE`
-  - Between phases: walk the plan to extract `RelOptTable` refs from the two `EnumerableTableScan` nodes, then call `MergedIndexRegistry.register(new MergedIndex(tables, collation, rowCount))`
-  - Phase 2 rules: `ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE`
-- SQL: `SELECT "a"."x", "b"."y" FROM "s"."A" "a" JOIN "s"."B" "b" ON "a"."k" = "b"."k"`
-- Assert:
-  - Plan string contains `"EnumerableMergedIndexScan"`
-  - Plan string does NOT contain `"EnumerableSort"`
-  - Plan string does NOT contain `"EnumerableMergeJoin"`
-- Call `MergedIndexRegistry.clear()` in `@AfterEach`
+## Flow Chart B — Merged Index Substitution on Top of Normal Planning
 
-Key pattern to copy from: `SortRemoveRuleTest` + `HrClusteredSchema`
-Key challenge: need to extract `RelOptTable` from the intermediate plan to register the index before phase 2.
+```text
+          ┌─────────────────────────────────────────────┐
+          │  (same physical pipeline from Flow A)       │
+          │   EnumerableMergeJoin                       │
+          │     ├─ EnumerableSort → EnumerableTableScan │
+          │     └─ EnumerableSort → EnumerableTableScan │
+          └───────────────┬─────────────────────────────┘
+                          │
+    ┌─────────────────────┼──────────────────────────┐
+    │  Between phases:    │                           │
+    │  walk plan tree     │                           │
+    │  extract RelOptTable refs + collation           │
+    │  MergedIndexRegistry.register(                  │
+    │    new MergedIndex(tables, collation, rc))      │
+    └─────────────────────┼──────────────────────────┘
+                          │
+                          ▼  HEP planner
+          [PipelineToMergedIndexScanRule]
+          Matches: EnumerableMergeJoin
+                     ├─ EnumerableSort → EnumerableTableScan(A)
+                     └─ EnumerableSort → EnumerableTableScan(B)
+          Checks:  MergedIndexRegistry.findFor(tables, collation) != empty
+          Fires:   call.transformTo(EnumerableMergedIndexScan)
+                          │
+                          ▼
+          [Merged Index Plan]
+          EnumerableProject
+            └─ EnumerableMergedIndexScan
+               tables=[A, B], collation=[k ASC]
+               (one sequential pass; join assembled on-the-fly)
+```
 
-### 2. Verify Compilation
-Run `./gradlew :core:compileJava` to check that:
-- Immutables annotation processor generates `ImmutablePipelineToMergedIndexScanRule`
-- No missing imports in `EnumerableMergedIndexScan` (`BuiltInMethod.EMPTY_ENUMERABLE`)
-- `List.of(...)` works (Java 9+; project uses Java 11+)
+---
 
-### 3. Known Risks / Likely Issues
-- `BuiltInMethod.EMPTY_ENUMERABLE` — verify this method name exists; may need to use `Expressions.call(Linq4j.class, "emptyEnumerable")` instead
-- `List.of(...)` in `PipelineToMergedIndexScanRule.onMatch` — confirm Java version compatibility (should be fine for Java 11+)
-- The `@Value.Immutable` on `PipelineToMergedIndexScanRule.Config` generates `ImmutablePipelineToMergedIndexScanRule` — confirm annotation processor runs on this new file
-- `EnumerableMergedIndexScan.implement()` cast to `EnumerableRel` in context — the empty enumerable return type may need explicit generic type parameter
+## Flow Chart C — Merged Index Concept (Why It Matters)
 
-### 4. Optional Extensions (per paper)
-- Extend rule to also match `EnumerableSortedAggregate` on top of the join pattern
-- Add `MergedIndex` entries to `Lattice` / `MaterializationService` for schema-level registration
-- Implement a real `implement()` body that reads from a mock sorted data source
-- Add negative test: no registered index → rule does not fire
+```
+TRADITIONAL QUERY EXECUTION                  WITH MERGED INDEX
+────────────────────────────────────         ──────────────────────────────────
+At query time:                               At update time (like a B-tree):
+  Scan(ORDERS)  ──sort(orderkey)──┐            Insert into merged index:
+  Scan(LINEITEM)──sort(orderkey)──┴►MergeJoin  k=1, tag=ORDERS,  row=(...)
+                                               k=1, tag=LINEITEM, row=(...)
+  Cost: O(N log N) sorts + O(N) join           k=2, tag=ORDERS,  row=(...)
+                                               k=2, tag=LINEITEM, row=(...)
+
+                                               At query time:
+                                               Scan merged index (one pass)
+                                               → assemble join on the fly
+
+                                               Cost: O(N) sequential read only
+                                               Space: same as two separate indexes
+                                               Update: 1 base insert → 1 index insert
+```
+
+---
+
+## Known Lessons / Gotchas
+
+- `ENUMERABLE_SORT_RULE` converts existing `LogicalSort` nodes — does NOT create
+  sorts from scratch. Inject `LogicalSort` nodes manually before joins when you want
+  explicit sorts in the enumerable plan.
+- Use `HepPlanner` for phase 2 (not Volcano's `Programs.ofRules`) when applying a
+  single transformation rule to an already-physical plan.
+
+---
+
+## Architectural Note: Two Production Paths for Merged Index Optimization
+
+There are two distinct scenarios, and the current rule only handles one:
+
+```
+PATH A — Substitution (current PoC, what the test demonstrates)
+────────────────────────────────────────────────────────────────
+Tables do NOT report collation (getStatistic() = Statistics.UNKNOWN).
+At planning time, Volcano adds EnumerableSort nodes before the join.
+PipelineToMergedIndexScanRule matches:
+  EnumerableMergeJoin
+    ├─ EnumerableSort → EnumerableTableScan(A)   ← explicit sort present
+    └─ EnumerableSort → EnumerableTableScan(B)
+Then replaces the whole pipeline with EnumerableMergedIndexScan.
+
+injectSortsBeforeJoin() in the test simulates this path:
+it forces LogicalSort nodes into the plan so ENUMERABLE_SORT_RULE
+has something to convert. Without injection, the Volcano planner
+cannot satisfy the merge-join's collation requirement.
+
+PATH B — Native (production-correct design)
+────────────────────────────────────────────────────────────────
+Tables backed by a merged index report their collation via
+  getStatistic().getCollations()  →  Statistics.of(n, keys, collations)
+This makes EnumerableTableScan carry the collation in its trait set.
+Volcano's trait enforcement checks fromTrait.satisfies(toTrait) first;
+if the scan already has the required collation, RelCollationTraitDef
+.convert() is NEVER called → no EnumerableSort node is added.
+
+The plan becomes:
+  EnumerableMergeJoin
+    ├─ EnumerableTableScan(A)[collation=[0]]   ← sort-free scan
+    └─ EnumerableTableScan(B)[collation=[0]]
+PipelineToMergedIndexScanRule currently does NOT match this pattern
+because it requires explicit EnumerableSort nodes.
+
+The fix: add a second operand pattern to the rule that matches
+EnumerableMergeJoin over bare table scans with the right collation trait.
+```
