@@ -51,7 +51,7 @@ An order-based query plan pipeline:
   Sort(B) ──→/
 
 is structurally identical to an incremental maintenance plan when each Sort is
-replaced by a B-tree (merged) index. The merged index stores A and B interleaved
+replaced by a B-tree (merged) index. Both sorts here uses the merged index that stores A and B interleaved
 by their shared key, so one sequential scan replaces the entire pipeline.
 
 **For each pipeline, only ONE scan over the merged index is needed** — not one
