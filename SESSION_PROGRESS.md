@@ -365,6 +365,12 @@ each dashed edge as an incremental-update rule triggered by base-table inserts/d
 
 ## Next Steps
 
+### Short Term (next session)
+
+1. Work out two or three more TPC-H queries that teach Claude to generate and test plans for any complex queries.
+
+### Medium Term
+
 1. **PATH B: Native merged index support** — extend `PipelineToMergedIndexScanRule`
    with a second operand pattern matching `EnumerableMergeJoin` over bare
    `EnumerableTableScan` nodes that already carry the correct collation trait (no
@@ -386,4 +392,5 @@ each dashed edge as an incremental-update rule triggered by base-table inserts/d
 
 5. **`implement()` stub** — `EnumerableMergedIndexScan.implement()` returns an empty
    enumerable. A real implementation drives a sequential B-tree scan over interleaved
-   records and assembles join outputs and computes aggregations on-the-fly.
+   records and assembles join outputs and computes aggregations on-the-fly. 
+   Explore feasibility to hook my leanstore repo here.

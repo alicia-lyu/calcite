@@ -146,12 +146,13 @@ eliminated and performed internally by the scan operator.
 At the end of every session (or whenever asked to wrap up / update notes):
 
 1. **Refresh `## Next Steps` in `SESSION_PROGRESS.md`** — replace the old next-steps
-   section with specific, actionable items based on what was just implemented. Each
-   item should name the file/class/rule to change and describe the concrete goal.
+   section with specific, actionable items based on what was just implemented. 
+   Group these into short-term (next session) and medium-term (later sessions) buckets.
+   Short-term next step should name the file/class/rule to change and describe the concrete goal.
 
 2. **Compact verbose notes** — move long plan output dumps, old TODO prose, and
    exploration logs out of `SESSION_PROGRESS.md`. Keep only concise lessons and
-   reference diagrams (DOT, ASCII). Use sub-sections with clear headings.
+   reference diagrams (DOT, ASCII). Use sub-sections with clear headings. Old next-steps may include notes that should be reorgnized elsewhere in @SESSION_PROGRESS.md, in the Javadoc of the test methods, or in CLAUDE.md.
 
 3. **Expected plans near test code** — paste plan output snippets (BEFORE/AFTER
    structure) as Javadoc comments in the test method they belong to, not in
