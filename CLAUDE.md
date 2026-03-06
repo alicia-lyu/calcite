@@ -15,6 +15,8 @@ This project accompanies the VLDB 2026 paper:
   "Storing and Indexing Multiple Tables by Interesting Orderings"
   Wenhui Lyu, Goetz Graefe — University of Wisconsin–Madison / Google
 
+The full paper is @main.tex and is very important context for this project.
+
 ### Merged Indexes (the key concept)
 
 A **merged index** is a B-tree (or LSM-tree) that stores records from multiple
@@ -224,6 +226,11 @@ WHERE) so that `splitJoinCondition` can extract equi-join keys from each join no
 **Phase 2 planner** — always use `HepPlanner` (not Volcano `Programs.ofRules`) when
 applying `PipelineToMergedIndexScanRule` to an already-physical plan. Volcano cannot
 build a complete optimal plan from a single transformation rule.
+
+## Style of coding and documentation
+
+- Prepend `[MergedIndex]` to all commit messages.
+- If staged changes are large and consist different objectives, break them into multiple commits with clear messages. Even consider breaking changes in a single file into multiple commits if they are logically distinct.
 
 ## Session Discipline
 
