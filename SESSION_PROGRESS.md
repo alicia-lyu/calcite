@@ -2,8 +2,6 @@
 
 ## Status
 
-Note to Claude: include full relative paths here next time.
-
 | Item                                                                    | Status  |
 |-------------------------------------------------------------------------|---------|
 | `CLAUDE.md` + `main.tex`                                                | Done    |
@@ -149,103 +147,6 @@ At query time:                               At update time (like a B-tree):
                                                Space: same as two separate indexes
                                                Update: 1 base insert → 1 index insert
 ```
-
----
-
-## Known Lessons / Gotchas
-
-- `ENUMERABLE_SORT_RULE` converts existing `LogicalSort` nodes — does NOT create
-  sorts from scratch. Inject `LogicalSort` nodes manually before joins when you want
-  explicit sorts in the enumerable plan.
-- Use `HepPlanner` for phase 2 (not Volcano's `Programs.ofRules`) when applying a
-  single transformation rule to an already-physical plan.
-
----
-
-## Architectural Note: Two Production Paths for Merged Index Optimization
-
-There are two distinct scenarios, and the current rule only handles one:
-
-```
-PATH A — Substitution (current PoC, what the test demonstrates)
-────────────────────────────────────────────────────────────────
-Tables do NOT report collation (getStatistic() = Statistics.UNKNOWN).
-At planning time, Volcano adds EnumerableSort nodes before the join.
-PipelineToMergedIndexScanRule matches:
-  EnumerableMergeJoin
-    ├─ EnumerableSort → EnumerableTableScan(A)   ← explicit sort present
-    └─ EnumerableSort → EnumerableTableScan(B)
-Then replaces the whole pipeline with EnumerableMergedIndexScan.
-
-injectSortsBeforeJoin() in the test simulates this path:
-it forces LogicalSort nodes into the plan so ENUMERABLE_SORT_RULE
-has something to convert. Without injection, the Volcano planner
-cannot satisfy the merge-join's collation requirement.
-
-PATH B — Native (production-correct design)
-────────────────────────────────────────────────────────────────
-Tables backed by a merged index report their collation via
-  getStatistic().getCollations()  →  Statistics.of(n, keys, collations)
-This makes EnumerableTableScan carry the collation in its trait set.
-Volcano's trait enforcement checks fromTrait.satisfies(toTrait) first;
-if the scan already has the required collation, RelCollationTraitDef
-.convert() is NEVER called → no EnumerableSort node is added.
-
-The plan becomes:
-  EnumerableMergeJoin
-    ├─ EnumerableTableScan(A)[collation=[0]]   ← sort-free scan
-    └─ EnumerableTableScan(B)[collation=[0]]
-PipelineToMergedIndexScanRule currently does NOT match this pattern
-because it requires explicit EnumerableSort nodes.
-
-The fix: add a second operand pattern to the rule that matches
-EnumerableMergeJoin over bare table scans with the right collation trait.
-```
-
----
-
-## Calcite Interesting Orderings Research
-
-### How Calcite implements interesting orderings (verified from source)
-
-Calcite implements Selinger's interesting ordering technique via two complementary
-mechanisms in `EnumerableMergeJoin` (no extra configuration needed):
-
-- **`deriveTraits()` + `DeriveMode.BOTH`** (lines 311–354): propagates collation
-  *upward* — if an input is sorted on the join key, the join output is tagged with
-  that collation. Downstream operators can consume it without an extra sort.
-- **`passThroughTraits()`** (lines 228–309): propagates collation *downward* — if a
-  downstream operator (e.g., `EnumerableSortedAggregate`) requires sorted input, this
-  pushes that requirement through the join to its inputs.
-- **`EnumerableSortedAggregate.passThroughTraits()`** (lines 74–108): similarly pushes
-  sort requirements down from the aggregate to its input.
-- **`RelCollationTraitDef.convert()`** (lines 64–84): inserts a `LogicalSort` *only
-  when* the required collation is NOT already satisfied.
-
-### Config requirements for order-based testing
-
-- `traitDefs(ConventionTraitDef.INSTANCE, RelCollationTraitDef.INSTANCE)` and
-  `ENUMERABLE_SORTED_AGGREGATE_RULE` must both be registered.
-- **`ENUMERABLE_AGGREGATE_RULE` must also be present** — without it, the Volcano planner
-  fails with `CannotPlanException` because `EnumerableSortedAggregate.passThroughTraits`
-  cannot be resolved when the sort requirement propagates through a `LogicalProject`
-  (there is no enforcer rule to insert a sort through the project conversion chain).
-  The planner picks between hash and sorted aggregate by cost; to observe sorted
-  aggregate in a plan, the input must already be sorted on the group keys.
-
-### `injectSortsBeforeJoin` improvements
-
-- Guards against **empty key lists** (non-equi joins, cross joins): skips sort injection
-  rather than crashing with `IndexOutOfBoundsException`.
-- Builds **multi-column collations** from all equi-join keys (e.g., PARTSUPP joined on
-  both suppkey and partkey), not just the first key.
-
-### Q9 SQL form
-
-Use explicit `JOIN … ON …` syntax (not comma-separated FROM with WHERE) so that
-`splitJoinCondition` can extract equi-join keys from each join node. The LIKE filter
-(`p.p_name LIKE '%green%'`) goes in a WHERE clause and requires `ENUMERABLE_FILTER_RULE`
-in the rule set.
 
 ---
 

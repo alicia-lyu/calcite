@@ -43,6 +43,22 @@ output is already sorted.
 This technique naturally divides complex queries into **order-based pipelines**:
 groups of operators (joins, aggregations) that all share a common key/sort order.
 
+### How Calcite Implements Interesting Orderings (verified from source)
+
+Calcite implements Selinger's interesting ordering technique via two complementary
+mechanisms in `EnumerableMergeJoin` (no extra configuration needed):
+
+- **`deriveTraits()` + `DeriveMode.BOTH`** (lines 311–354): propagates collation
+  *upward* — if an input is sorted on the join key, the join output is tagged with
+  that collation. Downstream operators can consume it without an extra sort.
+- **`passThroughTraits()`** (lines 228–309): propagates collation *downward* — if a
+  downstream operator (e.g., `EnumerableSortedAggregate`) requires sorted input, this
+  pushes that requirement through the join to its inputs.
+- **`EnumerableSortedAggregate.passThroughTraits()`** (lines 74–108): similarly pushes
+  sort requirements down from the aggregate to its input.
+- **`RelCollationTraitDef.convert()`** (lines 64–84): inserts a `LogicalSort` *only
+  when* the required collation is NOT already satisfied.
+
 ### The Core Insight This Implementation Demonstrates
 
 An order-based query plan pipeline:
@@ -107,6 +123,8 @@ system — it has no storage engine. It provides:
 | `materialize/MergedIndexRegistry.java` | Static singleton registry mapping table sets to indexes |
 | `adapter/enumerable/EnumerableMergedIndexScan.java` | Physical operator replacing the entire pipeline |
 | `adapter/enumerable/PipelineToMergedIndexScanRule.java` | Planner rule matching the pipeline pattern |
+| `core/src/test/java/org/apache/calcite/adapter/enumerable/PipelineToMergedIndexScanRuleTest.java` | Unit tests for the rule (2-table, simple schema) |
+| `plus/src/test/java/org/apache/calcite/adapter/tpch/MergedIndexTpchPlanTest.java` | TPC-H plan tests: Q3 (partial), Q12 (full), Q3-OL variant, Q9 (6-table) |
 
 ## Implementation Notes
 
@@ -141,7 +159,75 @@ The merged index stores records from ALL participating tables interleaved, so
 This is not just replacing the sort leaves — the join and aggregation are also
 eliminated and performed internally by the scan operator.
 
+### Two Production Paths for Merged Index Optimization
+
+There are two distinct scenarios; the current rule only handles PATH A:
+
+```
+PATH A — Substitution (current PoC, what the tests demonstrate)
+────────────────────────────────────────────────────────────────
+Tables do NOT report collation (getStatistic() = Statistics.UNKNOWN).
+Volcano adds EnumerableSort nodes before the join at planning time.
+PipelineToMergedIndexScanRule matches:
+  EnumerableMergeJoin
+    ├─ EnumerableSort → EnumerableTableScan(A)   ← explicit sort present
+    └─ EnumerableSort → EnumerableTableScan(B)
+Then replaces the whole pipeline with EnumerableMergedIndexScan.
+
+injectSortsBeforeJoin() in the test simulates this path: it forces
+LogicalSort nodes into the plan so ENUMERABLE_SORT_RULE has something
+to convert. Without injection, Volcano cannot satisfy the merge-join's
+collation requirement (AbstractConverter nodes are left unresolved).
+
+PATH B — Native (production-correct design, not yet implemented)
+────────────────────────────────────────────────────────────────
+Tables backed by a merged index report collation via
+  getStatistic().getCollations() → Statistics.of(n, keys, collations)
+EnumerableTableScan carries the collation in its trait set.
+Volcano's trait enforcement skips RelCollationTraitDef.convert() →
+no EnumerableSort is added. The plan becomes:
+  EnumerableMergeJoin
+    ├─ EnumerableTableScan(A)[collation=[0]]   ← sort-free scan
+    └─ EnumerableTableScan(B)[collation=[0]]
+Fix needed: add a second operand pattern to PipelineToMergedIndexScanRule
+matching EnumerableMergeJoin over bare scans with the correct collation trait.
+```
+
+### Config requirements for order-based testing
+
+- `traitDefs(ConventionTraitDef.INSTANCE, RelCollationTraitDef.INSTANCE)` and
+  `ENUMERABLE_SORTED_AGGREGATE_RULE` must both be registered.
+- **`ENUMERABLE_AGGREGATE_RULE` must also be present** — without it, the Volcano
+  planner throws `CannotPlanException` because `EnumerableSortedAggregate
+  .passThroughTraits` cannot resolve when sort requirements propagate through a
+  `LogicalProject`. The planner picks between hash and sorted aggregate by cost.
+- **`ENUMERABLE_FILTER_RULE`** is required for queries with WHERE predicates (e.g.,
+  Q9's `p_name LIKE '%green%'`).
+
+### Test infrastructure patterns
+
+**`injectSortsBeforeJoin(RelNode)`** — recursive helper used in tests. Wraps each
+`Join` input in a `LogicalSort` so `ENUMERABLE_SORT_RULE` has nodes to convert.
+- Uses `RelOptUtil.splitJoinCondition` to extract per-join equi-keys automatically.
+- Guards against empty key lists (non-equi / cross joins): skips injection rather
+  than crashing with `IndexOutOfBoundsException`.
+- Builds multi-column collations from all equi-join keys (e.g., PARTSUPP on both
+  suppkey and partkey), not just the first key.
+
+**`findLeafMergeJoin(RelNode)`** — locates the `EnumerableMergeJoin` whose both
+inputs are `Sort → TableScan`. Used in Q3 to target the inner (leaf) join for
+partial substitution while leaving the outer join intact.
+
+**Q9 SQL form** — use explicit `JOIN … ON …` syntax (not comma-separated FROM with
+WHERE) so that `splitJoinCondition` can extract equi-join keys from each join node.
+
+**Phase 2 planner** — always use `HepPlanner` (not Volcano `Programs.ofRules`) when
+applying `PipelineToMergedIndexScanRule` to an already-physical plan. Volcano cannot
+build a complete optimal plan from a single transformation rule.
+
 ## Session Discipline
+
+User instructions across the files are explicitly marked by `lwh` (my initials). It should be deleted once the instruction is executed. If a problem is encountered, follow up with your comment while keeping mine.
 
 At the end of every session (or whenever asked to wrap up / update notes):
 
