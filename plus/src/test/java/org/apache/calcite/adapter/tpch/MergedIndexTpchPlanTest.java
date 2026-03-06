@@ -33,6 +33,7 @@ import org.apache.calcite.plan.hep.HepProgram;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelCollations;
+import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
 import org.apache.calcite.rel.core.Join;
@@ -60,6 +61,7 @@ import java.util.stream.Collectors;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.lessThan;
 
 /**
  * TPC-H plan observation test for {@link EnumerableMergedIndexScan}.
@@ -310,6 +312,262 @@ class MergedIndexTpchPlanTest {
     assertThat(planStr, not(containsString("EnumerableMergeJoin")));
   }
 
+  /**
+   * TPC-H Q3 variant: ORDERS⋈LINEITEM as the leaf join (on orderkey);
+   * CUSTOMER as the outer join (on custkey). Order-based algorithms only
+   * ({@code ENUMERABLE_AGGREGATE_RULE} intentionally omitted).
+   *
+   * <p>Demonstrates that the choice of which pipeline to substitute with a
+   * merged index is determined by which join is the leaf join in the plan.
+   * Here ORDERS+LINEITEM are interleaved by orderkey in the merged index, while
+   * the outer join with CUSTOMER on custkey remains an explicit merge join.
+   *
+   * <p>Expected AFTER structure:
+   * <pre>
+   *   (LimitSort / Project / SortedAggregate ...)
+   *     EnumerableMergeJoin(o_custkey = c_custkey)   ← outer join REMAINS
+   *       EnumerableSort(custkey)
+   *         EnumerableMergedIndexScan([TPCH, ORDERS]:O_ORDERKEY,
+   *                                   [TPCH, LINEITEM]:L_ORDERKEY)
+   *       EnumerableSort(custkey)
+   *         EnumerableTableScan(CUSTOMER)
+   * </pre>
+   */
+  @Test void tpchQ3OrdersLineitem() throws Exception {
+    final String sql = "SELECT l.l_orderkey,"
+        + " SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue,"
+        + " o.o_orderdate, o.o_shippriority"
+        + " FROM tpch.orders o"
+        + " JOIN tpch.lineitem l ON l.l_orderkey = o.o_orderkey"
+        + " JOIN tpch.customer c ON o.o_custkey = c.c_custkey"
+        + " GROUP BY l.l_orderkey, o.o_orderdate, o.o_shippriority"
+        + " ORDER BY revenue DESC, o.o_orderdate"
+        + " LIMIT 10";
+
+    final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
+    rootSchema.add("TPCH", new TpchSchema(0.01, 0, 1, false));
+
+    final FrameworkConfig config = Frameworks.newConfigBuilder()
+        .parserConfig(SqlParser.Config.DEFAULT)
+        .defaultSchema(rootSchema)
+        .traitDefs(ConventionTraitDef.INSTANCE, RelCollationTraitDef.INSTANCE)
+        .programs(
+            Programs.of(RuleSets.ofList(
+                EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
+                EnumerableRules.ENUMERABLE_PROJECT_RULE,
+                EnumerableRules.ENUMERABLE_SORT_RULE,
+                EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
+                EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
+                EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE,
+                EnumerableRules.ENUMERABLE_LIMIT_RULE,
+                EnumerableRules.ENUMERABLE_LIMIT_SORT_RULE)))
+        .build();
+
+    final Planner planner = Frameworks.getPlanner(config);
+    final SqlNode parsed = planner.parse(sql);
+    final SqlNode validated = planner.validate(parsed);
+    final RelRoot root = planner.rel(validated);
+
+    final RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel);
+    final RelTraitSet desiredTraits =
+        root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
+
+    // ── Phase 1: logical → physical pipeline ──────────────────────────────
+    final RelNode phase1Plan =
+        planner.transform(0, desiredTraits, logicalWithSorts);
+
+    final String beforeStr = dumpText(phase1Plan);
+    System.out.println("=== Q3 OL BEFORE (order-based pipeline) ===");
+    System.out.println(beforeStr);
+    System.out.println("=== Q3 OL DOT ===");
+    System.out.println(dumpDot(phase1Plan));
+
+    // Find the leaf merge join (ORDERS ⋈ LINEITEM): both inputs are
+    // EnumerableSort → EnumerableTableScan.
+    final EnumerableMergeJoin innerJoin = Objects.requireNonNull(
+        findLeafMergeJoin(phase1Plan),
+        "Phase 1 plan has no leaf EnumerableMergeJoin:\n" + beforeStr);
+
+    // ── Register merged index for (ORDERS, LINEITEM) ───────────────────────
+    final EnumerableSort leftSort = (EnumerableSort) innerJoin.getLeft();
+    final EnumerableSort rightSort = (EnumerableSort) innerJoin.getRight();
+    final RelOptTable tableLeft =
+        ((EnumerableTableScan) leftSort.getInput()).getTable();
+    final RelOptTable tableRight =
+        ((EnumerableTableScan) rightSort.getInput()).getTable();
+    final RelCollation collationLeft = leftSort.getCollation();
+    final RelCollation collationRight = rightSort.getCollation();
+    final double rowCount =
+        innerJoin.estimateRowCount(innerJoin.getCluster().getMetadataQuery());
+
+    MergedIndexRegistry.register(new MergedIndex(
+        List.of(tableLeft, tableRight),
+        List.of(collationLeft, collationRight),
+        collationLeft,
+        rowCount));
+
+    // ── Phase 2: HEP planner fires PipelineToMergedIndexScanRule ──────────
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleInstance(
+            EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
+        .build();
+    final HepPlanner hepPlanner = new HepPlanner(hepProgram);
+    hepPlanner.setRoot(phase1Plan);
+    final RelNode phase2Plan = hepPlanner.findBestExp();
+
+    final String afterStr = dumpText(phase2Plan);
+    System.out.println("=== Q3 OL AFTER (merged index plan) ===");
+    System.out.println(afterStr);
+    System.out.println("=== Q3 OL AFTER DOT ===");
+    System.out.println(dumpDot(phase2Plan));
+
+    // ── Assert ────────────────────────────────────────────────────────────
+    assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
+    assertThat(afterStr, containsString("O_ORDERKEY"));
+    assertThat(afterStr, containsString("L_ORDERKEY"));
+    // Outer join (CUSTOMER on custkey) remains
+    assertThat(afterStr, containsString("EnumerableMergeJoin"));
+    // ORDERS + LINEITEM sorts are replaced; fewer sorts after substitution
+    final int sortsBefore = countOccurrences(beforeStr, "EnumerableSort");
+    final int sortsAfter  = countOccurrences(afterStr,  "EnumerableSort");
+    assertThat(sortsAfter, lessThan(sortsBefore));
+  }
+
+  /**
+   * TPC-H Q9 (color = 'green'): 6-table join with merged-index substitution
+   * at each leaf join pair detected dynamically in the Phase 1 plan.
+   *
+   * <p>After Phase 2, each {@code Sort+Sort+MergeJoin} leaf triple is replaced
+   * by a single {@code EnumerableMergedIndexScan}, reducing the total number of
+   * {@code EnumerableSort} nodes in the plan.
+   *
+   * <h3>Ideal BEFORE structure (order-based pipelines)</h3>
+   * <pre>
+   *   Pipeline 1 — (suppkey / nationkey):
+   *     MergeJoin(nationkey)
+   *       Sort(nationkey) → MergeJoin(suppkey)
+   *                           Sort(suppkey) → TableScan(SUPPLIER)
+   *                           Sort(suppkey) → TableScan(PARTSUPP)
+   *       TableScan(NATION)
+   *
+   *   Pipeline 2 — (orderkey / partkey / suppkey+partkey):
+   *     MergeJoin(suppkey,partkey)
+   *       [Pipeline 1 result]
+   *       Sort(suppkey,partkey) → SemiJoin(partkey)
+   *                                 Sort(partkey) → MergeJoin(orderkey)
+   *                                                   Sort(orderkey) → TableScan(ORDERS)
+   *                                                   Sort(orderkey) → TableScan(LINEITEM)
+   *                                 Filter(LIKE) → TableScan(PART)
+   *   Sort(nation,o_year) → Aggregate(nation,o_year)
+   * </pre>
+   *
+   * <h3>Ideal AFTER structure (merged indexes substituted)</h3>
+   * <pre>
+   *   Each Sort→Sort→MergeJoin leaf replaced by MergedIndexScan.
+   *   E.g.:  Sort(suppkey)→SUPPLIER + Sort(suppkey)→PARTSUPP + MergeJoin(suppkey)
+   *          → MergedIndexScan(SUPPLIER+PARTSUPP, collation=[suppkey])
+   *
+   *   Remaining structure (inter-pipeline joins, filter, aggregate) unchanged.
+   * </pre>
+   *
+   * <p>Full DOT diagrams for the ideal plans are in {@code SESSION_PROGRESS.md}
+   * under "Q9 Reference Plans".
+   */
+  @Test void tpchQ9() throws Exception {
+    // Use explicit JOIN ... ON ... syntax so all join conditions are equi-joins
+    // and injectSortsBeforeJoin can extract keys via splitJoinCondition.
+    // The LIKE filter stays in WHERE and becomes a LogicalFilter on PART.
+    final String sql = "SELECT n.n_name AS nation,"
+        + " EXTRACT(YEAR FROM o.o_orderdate) AS o_year,"
+        + " SUM(l.l_extendedprice * (1 - l.l_discount)"
+        + "     - ps.ps_supplycost * l.l_quantity) AS sum_profit"
+        + " FROM tpch.lineitem l"
+        + " JOIN tpch.orders o ON o.o_orderkey = l.l_orderkey"
+        + " JOIN tpch.partsupp ps ON ps.ps_suppkey = l.l_suppkey"
+        + "   AND ps.ps_partkey = l.l_partkey"
+        + " JOIN tpch.supplier s ON s.s_suppkey = l.l_suppkey"
+        + " JOIN tpch.nation n ON s.s_nationkey = n.n_nationkey"
+        + " JOIN tpch.part p ON p.p_partkey = l.l_partkey"
+        + " WHERE p.p_name LIKE '%green%'"
+        + " GROUP BY n.n_name, EXTRACT(YEAR FROM o.o_orderdate)"
+        + " ORDER BY n.n_name, o_year DESC";
+
+    final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
+    rootSchema.add("TPCH", new TpchSchema(0.01, 0, 1, false));
+
+    final FrameworkConfig config = Frameworks.newConfigBuilder()
+        .parserConfig(SqlParser.Config.DEFAULT)
+        .defaultSchema(rootSchema)
+        .traitDefs(ConventionTraitDef.INSTANCE, RelCollationTraitDef.INSTANCE)
+        .programs(
+            Programs.of(RuleSets.ofList(
+                EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
+                EnumerableRules.ENUMERABLE_PROJECT_RULE,
+                EnumerableRules.ENUMERABLE_FILTER_RULE,
+                EnumerableRules.ENUMERABLE_SORT_RULE,
+                EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
+                EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
+                EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE,
+                EnumerableRules.ENUMERABLE_LIMIT_RULE,
+                EnumerableRules.ENUMERABLE_LIMIT_SORT_RULE)))
+        .build();
+
+    final Planner planner = Frameworks.getPlanner(config);
+    final SqlNode parsed = planner.parse(sql);
+    final SqlNode validated = planner.validate(parsed);
+    final RelRoot root = planner.rel(validated);
+
+    final RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel);
+    final RelTraitSet desiredTraits =
+        root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
+
+    // ── Phase 1: logical → physical pipeline ──────────────────────────────
+    final RelNode phase1Plan =
+        planner.transform(0, desiredTraits, logicalWithSorts);
+
+    final String beforeStr = dumpText(phase1Plan);
+    System.out.println("=== Q9 BEFORE (order-based pipeline) ===");
+    System.out.println(beforeStr);
+    System.out.println("=== Q9 DOT ===");
+    System.out.println(dumpDot(phase1Plan));
+
+    // Dynamically find and register all leaf merge joins (Sort→Scan on both sides).
+    final List<EnumerableMergeJoin> leafJoins = findAllLeafMergeJoins(phase1Plan);
+    for (EnumerableMergeJoin lj : leafJoins) {
+      final EnumerableSort ls = (EnumerableSort) lj.getLeft();
+      final EnumerableSort rs = (EnumerableSort) lj.getRight();
+      final RelOptTable tl = ((EnumerableTableScan) ls.getInput()).getTable();
+      final RelOptTable tr = ((EnumerableTableScan) rs.getInput()).getTable();
+      final double rc = lj.estimateRowCount(lj.getCluster().getMetadataQuery());
+      MergedIndexRegistry.register(new MergedIndex(
+          List.of(tl, tr),
+          List.of(ls.getCollation(), rs.getCollation()),
+          ls.getCollation(), rc));
+    }
+
+    // ── Phase 2: HEP planner fires PipelineToMergedIndexScanRule ──────────
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleInstance(
+            EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
+        .build();
+    final HepPlanner hepPlanner = new HepPlanner(hepProgram);
+    hepPlanner.setRoot(phase1Plan);
+    final RelNode phase2Plan = hepPlanner.findBestExp();
+
+    final String afterStr = dumpText(phase2Plan);
+    System.out.println("=== Q9 AFTER (merged index plan) ===");
+    System.out.println(afterStr);
+    System.out.println("=== Q9 AFTER DOT ===");
+    System.out.println(dumpDot(phase2Plan));
+
+    // ── Assert ────────────────────────────────────────────────────────────
+    assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
+    // Each substituted leaf join pair removes 2 sorts; at least one substitution
+    final int sortsBefore = countOccurrences(beforeStr, "EnumerableSort");
+    final int sortsAfter  = countOccurrences(afterStr,  "EnumerableSort");
+    assertThat(sortsAfter, lessThan(sortsBefore));
+  }
+
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   /**
@@ -330,10 +588,21 @@ class MergedIndexTpchPlanTest {
       final List<Integer> rightKeys = new ArrayList<>();
       RelOptUtil.splitJoinCondition(join.getLeft(), join.getRight(),
           join.getCondition(), leftKeys, rightKeys, new ArrayList<>());
-      final RelCollation leftCollation = RelCollations.of(leftKeys.get(0));
-      final RelCollation rightCollation = RelCollations.of(rightKeys.get(0));
       final RelNode newLeft = injectSortsBeforeJoin(join.getLeft());
       final RelNode newRight = injectSortsBeforeJoin(join.getRight());
+      if (leftKeys.isEmpty()) {
+        // Non-equi join or cross join — recurse but do not inject sorts.
+        return join.copy(join.getTraitSet(), List.of(newLeft, newRight));
+      }
+      // Build multi-column collations from all equi-join keys.
+      final RelCollation leftCollation = RelCollations.of(
+          leftKeys.stream()
+              .map(RelFieldCollation::new)
+              .collect(Collectors.toList()));
+      final RelCollation rightCollation = RelCollations.of(
+          rightKeys.stream()
+              .map(RelFieldCollation::new)
+              .collect(Collectors.toList()));
       return join.copy(join.getTraitSet(), List.of(
           LogicalSort.create(newLeft, leftCollation, null, null),
           LogicalSort.create(newRight, rightCollation, null, null)));
@@ -383,6 +652,42 @@ class MergedIndexTpchPlanTest {
       }
     }
     return null;
+  }
+
+  /**
+   * Finds ALL leaf {@link EnumerableMergeJoin} nodes in the plan tree —
+   * joins whose two inputs are both {@code EnumerableSort → EnumerableTableScan}.
+   *
+   * <p>Used for multi-join plans (e.g., TPC-H Q9) to register a merged index
+   * for every leaf join pair discovered dynamically.
+   */
+  private static List<EnumerableMergeJoin> findAllLeafMergeJoins(RelNode node) {
+    final List<EnumerableMergeJoin> result = new ArrayList<>();
+    if (node instanceof EnumerableMergeJoin) {
+      final EnumerableMergeJoin j = (EnumerableMergeJoin) node;
+      if (j.getLeft() instanceof EnumerableSort
+          && j.getRight() instanceof EnumerableSort
+          && ((EnumerableSort) j.getLeft()).getInput() instanceof EnumerableTableScan
+          && ((EnumerableSort) j.getRight()).getInput() instanceof EnumerableTableScan) {
+        result.add(j);
+        return result; // don't recurse into a leaf join's inputs
+      }
+    }
+    for (RelNode input : node.getInputs()) {
+      result.addAll(findAllLeafMergeJoins(input));
+    }
+    return result;
+  }
+
+  /** Counts non-overlapping occurrences of {@code sub} in {@code text}. */
+  private static int countOccurrences(String text, String sub) {
+    int count = 0;
+    int idx = 0;
+    while ((idx = text.indexOf(sub, idx)) != -1) {
+      count++;
+      idx += sub.length();
+    }
+    return count;
   }
 
   private static String dumpText(RelNode rel) {

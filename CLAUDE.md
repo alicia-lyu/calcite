@@ -140,3 +140,22 @@ The merged index stores records from ALL participating tables interleaved, so
 **the entire pipeline (sort + merge join + sorted agg) collapses into ONE scan**.
 This is not just replacing the sort leaves — the join and aggregation are also
 eliminated and performed internally by the scan operator.
+
+## Session Discipline
+
+At the end of every session (or whenever asked to wrap up / update notes):
+
+1. **Refresh `## Next Steps` in `SESSION_PROGRESS.md`** — replace the old next-steps
+   section with specific, actionable items based on what was just implemented. Each
+   item should name the file/class/rule to change and describe the concrete goal.
+
+2. **Compact verbose notes** — move long plan output dumps, old TODO prose, and
+   exploration logs out of `SESSION_PROGRESS.md`. Keep only concise lessons and
+   reference diagrams (DOT, ASCII). Use sub-sections with clear headings.
+
+3. **Expected plans near test code** — paste plan output snippets (BEFORE/AFTER
+   structure) as Javadoc comments in the test method they belong to, not in
+   `SESSION_PROGRESS.md`. Reference the full DOT diagrams in `SESSION_PROGRESS.md`
+   from the Javadoc with a short note.
+
+4. **Commit** all documentation and code changes together after the cleanup.

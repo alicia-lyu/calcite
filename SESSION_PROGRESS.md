@@ -18,6 +18,9 @@ Note to Claude: include full relative paths here next time.
 | `explainTerms` display fix (table names + key column, not raw toString) | Done ✓  |
 | TPC-H Q3 (3-table: CUSTOMER ⋈ ORDERS ⋈ LINEITEM, partial substitution) | Done ✓  |
 | TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓  |
+| TPC-H Q3 variant: ORDERS⋈LINEITEM leaf, CUSTOMER outer — `tpchQ3OrdersLineitem()` | Done ✓ |
+| TPC-H Q9 (6-table, all leaf joins substituted) — `tpchQ9()`            | Done ✓  |
+| Calcite interesting-ordering research documented in SESSION_PROGRESS    | Done ✓  |
 
 ## Commands
 
@@ -199,252 +202,188 @@ The fix: add a second operand pattern to the rule that matches
 EnumerableMergeJoin over bare table scans with the right collation trait.
 ```
 
-## Next steps
+---
 
-Current output for Q3-before (with merge joins):
+## Calcite Interesting Orderings Research
 
-```
-EnumerableLimitSort(sort0=[$1], sort1=[$2], dir0=[DESC], dir1=[ASC], fetch=[10])
-      EnumerableProject(L_ORDERKEY=[$0], REVENUE=[$3], O_ORDERDATE=[$1], O_SHIPPRIORITY=[$2])
-        EnumerableAggregate(group=[{0, 1, 2}], REVENUE=[SUM($3)])
-          EnumerableProject(L_ORDERKEY=[$17], O_ORDERDATE=[$12], O_SHIPPRIORITY=[$15], $f3=[*($22, -(1, $23))])
-            EnumerableMergeJoin(condition=[=($8, $17)], joinType=[inner])
-              EnumerableSort(sort0=[$8], dir0=[ASC])
-                EnumerableMergeJoin(condition=[=($0, $9)], joinType=[inner])
-                  EnumerableSort(sort0=[$0], dir0=[ASC])
-                    EnumerableTableScan(table=[[TPCH, CUSTOMER]])
-                  EnumerableSort(sort0=[$1], dir0=[ASC])
-                    EnumerableTableScan(table=[[TPCH, ORDERS]])
-              EnumerableSort(sort0=[$0], dir0=[ASC])
-                EnumerableTableScan(table=[[TPCH, LINEITEM]])
-```
+### How Calcite implements interesting orderings (verified from source)
 
-Current output for Q3-after (with merged index scan):
+Calcite implements Selinger's interesting ordering technique via two complementary
+mechanisms in `EnumerableMergeJoin` (no extra configuration needed):
 
-```
-EnumerableLimitSort(sort0=[$1], sort1=[$2], dir0=[DESC], dir1=[ASC], fetch=[10])
-      EnumerableProject(L_ORDERKEY=[$0], REVENUE=[$3], O_ORDERDATE=[$1], O_SHIPPRIORITY=[$2])
-        EnumerableAggregate(group=[{0, 1, 2}], REVENUE=[SUM($3)])
-          EnumerableProject(L_ORDERKEY=[$17], O_ORDERDATE=[$12], O_SHIPPRIORITY=[$15], $f3=[*($22, -(1, $23))])
-            EnumerableMergeJoin(condition=[=($8, $17)], joinType=[inner])
-              EnumerableSort(sort0=[$8], dir0=[ASC])
-                EnumerableMergedIndexScan(tables=[[[TPCH, CUSTOMER]:C_CUSTKEY, [TPCH, ORDERS]:O_CUSTKEY]], collation=[[0]])
-              EnumerableSort(sort0=[$0], dir0=[ASC])
-                EnumerableTableScan(table=[[TPCH, LINEITEM]])
-```
+- **`deriveTraits()` + `DeriveMode.BOTH`** (lines 311–354): propagates collation
+  *upward* — if an input is sorted on the join key, the join output is tagged with
+  that collation. Downstream operators can consume it without an extra sort.
+- **`passThroughTraits()`** (lines 228–309): propagates collation *downward* — if a
+  downstream operator (e.g., `EnumerableSortedAggregate`) requires sorted input, this
+  pushes that requirement through the join to its inputs.
+- **`EnumerableSortedAggregate.passThroughTraits()`** (lines 74–108): similarly pushes
+  sort requirements down from the aggregate to its input.
+- **`RelCollationTraitDef.convert()`** (lines 64–84): inserts a `LogicalSort` *only
+  when* the required collation is NOT already satisfied.
 
-Our code made the choice to substitute the join between orders and customers on `custkey`. Their result is joined with lineitem on `orderkey` on the fly (not as a merged index). 
-Even if we limit ourselves to one merged index for this query (please see after Q9 for two merged indexes for this query), this is not the best way to use merged indexes.
-This implementation is not as good as the following, which groups the join and groupby on orderkey into a single scan over a merged index. The current implementation has the groupby at the top and didn't conduct aggregate pushdown. Can Calcite support this kind of transformation? If not, we need to force this choice in our test class, manually if necessary, since we are only working on TPC-H queries and, in the future, JOB queries.
+### Config requirements for order-based testing
 
-```tex
-\subsection{Execution of Complex Queries}\label{subsec:complex_queries}
+- `traitDefs(ConventionTraitDef.INSTANCE, RelCollationTraitDef.INSTANCE)` and
+  `ENUMERABLE_SORTED_AGGREGATE_RULE` must both be registered.
+- **`ENUMERABLE_AGGREGATE_RULE` must also be present** — without it, the Volcano planner
+  fails with `CannotPlanException` because `EnumerableSortedAggregate.passThroughTraits`
+  cannot be resolved when the sort requirement propagates through a `LogicalProject`
+  (there is no enforcer rule to insert a sort through the project conversion chain).
+  The planner picks between hash and sorted aggregate by cost; to observe sorted
+  aggregate in a plan, the input must already be sorted on the group keys.
 
-In the execution plan of a complex query, some joins and aggregations may share a sort order within the context of a larger plan.
-Though the full scope of complex queries is left to future work, we briefly discuss how execution of such a query pipeline fits into the execution of a more complex query.
+### `injectSortsBeforeJoin` improvements
 
-Consider, for example, Q3 in the TPC-H Benchmark~\cite{tpch2017spec}, in which \texttt{orderkey} appears both in join predicates and in grouping attributes.
-In many possible execution plans, e.g., the one shown in Figure~\ref{fig:tpch_q3_plan}, the merge join and the grouping operator share the same sort order on \texttt{orderkey}.
-In a database with a merged index storing the primary indexes of the Orders and Lineitem tables interleaved by \texttt{orderkey},
-these two operators require only a single-pass scan over the merged index.
-In fact, this single-pass scan covers the part of the execution plan marked by a dashed red line in Figure~\ref{fig:tpch_q3_plan}.
-The rest of the query, such as the selection on \texttt{mktsegment} and the final ordering, can be executed as the system usually processes queries without merged indexes.
+- Guards against **empty key lists** (non-equi joins, cross joins): skips sort injection
+  rather than crashing with `IndexOutOfBoundsException`.
+- Builds **multi-column collations** from all equi-join keys (e.g., PARTSUPP joined on
+  both suppkey and partkey), not just the first key.
 
-\begin{figure}[htbp]
-    \resizebox{\linewidth}{!}{
-    \begin{tikzpicture}[thick, >=stealth, node distance=1cm]
-        \node (scan_lineitem) {Lineitem};
-        \node[anchor=south, above=0.3 of scan_lineitem] (select_lineitem) {$\sigma_{\texttt{l\_shipdate} > \text{date '[DATE]'}}$};
-            \draw (scan_lineitem) -- (select_lineitem);
-        \node[anchor=south, above=0.3 of select_lineitem] (sort_lineitem) {$\text{Sort}_{\texttt{l\_orderkey}}$};
-            \draw (select_lineitem) -- (sort_lineitem);
-        \node[anchor=south, above=0.3 of sort_lineitem] (group_lineitem) {$\gamma_{\texttt{l\_orderkey}}$};
-            \draw (sort_lineitem) -- (group_lineitem);
-        \node[anchor=south, above=0.3 of group_lineitem] (proj_lineitem) {$\pi_{\begin{subarray}{l}
-            \texttt{l\_orderkey},\\
-            \texttt{sum(l\_extendedprice}\\
-            \quad\texttt{*(1-l\_discount)) as}\\
-            \quad\texttt{revenue}
-            \end{subarray}
-        }$};
-        \draw (group_lineitem) -- (proj_lineitem);
+### Q9 SQL form
 
-        \node (scan_order)[right=2 of select_lineitem] {Orders};
-        \node[anchor=south, above=0.3 of scan_order] (select_order) {$\sigma_{\texttt{o\_orderdate} < \text{date `[DATE]'}}$};
-            \draw (scan_order) -- (select_order);
-        \node[anchor=south, above=0.3 of select_order] (sort_order) {$\text{Sort}_{\texttt{o\_orderkey}}$};
-            \draw (select_order) -- (sort_order);
+Use explicit `JOIN … ON …` syntax (not comma-separated FROM with WHERE) so that
+`splitJoinCondition` can extract equi-join keys from each join node. The LIKE filter
+(`p.p_name LIKE '%green%'`) goes in a WHERE clause and requires `ENUMERABLE_FILTER_RULE`
+in the rule set.
 
-        \node[anchor=south, above=0.3 of proj_lineitem, xshift=1cm] (mergejoin) {$\text{Merge Join}_{\texttt{o\_orderkey}}$};
-            \draw (proj_lineitem) -- (mergejoin);
-            \draw (sort_order) -- (mergejoin);
+---
 
-        \node (scan_cust)[right=2 of mergejoin, yshift=-1cm] {Customer};
-        \node (select_cust)[anchor=south, above=0.3 of scan_cust] {$\sigma_{\texttt{mktsegment} = \text{`[SEGMENT]'}}$};
-            \draw (scan_cust) -- (select_cust);
-        
-        \node (semi_join)[above=0.3 of mergejoin, xshift=1cm] {$\ltimes_{\texttt{custkey}}$};
-            \draw (mergejoin) -- (semi_join);
-            \draw (select_cust) -- (semi_join);
+## Q9 Reference Plans
 
-        \node (ordering)[above=0.3 of semi_join] {$\text{Sort}_{\texttt{revenue desc,o\_orderdate}}$};
-            \draw (semi_join) -- (ordering);
+These represent the target ideal plans for TPC-H Q9, not necessarily what Calcite
+currently produces (the planner picks its own join order and cost-based choices).
+Paste into https://dreampuf.github.io/GraphvizOnline/ to visualize.
 
-        \node (final_proj)[above=0.3 of ordering] {$\pi_{\texttt{o\_orderkey,revenue,o\_orderdate,o\_shippriority}}$};
-            \draw (ordering) -- (final_proj);
-        
-        % the part that can be executed via a single-pass scan over a merged index
-        \draw[thick, dashed, red, rounded corners] 
-        (scan_lineitem.south east) -- (scan_lineitem.south west) -- 
-        (select_lineitem.south west) -- (proj_lineitem.north west) --
-        (mergejoin.north west) -- (mergejoin.north east) --
-        (select_order.north east) -- (select_order.south east) --
-        (scan_order.south east) -- cycle;
-        
-    \end{tikzpicture}
-    }
-    \caption{A possible execution plan for TPC-H Q3. \textnormal{
-        The part marked by the dashed red line can be executed via a single-pass scan over a merged index storing the primary indexes of the Orders and Lineitem tables interleaved by \texttt{orderkey}.
-    }}\label{fig:tpch_q3_plan}
-    \Description{A query plan for TPC-H Q3. It shows a series of operations: scans on Lineitem, Orders, and Customer tables; selections on dates and market segment; sorts on order keys; a grouping on the line items; a merge join between orders and line items; a semi-join with customers; and a final sort and projection. A red dashed box highlights the part of the plan involving the join and aggregation of Orders and Lineitem, which can be optimized with a merged index.}
-\end{figure}
+### Q9 Ideal Order-Based Plan (BEFORE merged indexes)
 
-In summary, the execution of a complex query can be seen as a combination of operators that can be executed via merged indexes and operators that cannot, assuming that the query optimizer can correctly bundle the right operators.
-The former are executed via single-pass scans over merged indexes, while the latter are executed as the system usually processes queries without merged indexes.
-Our ongoing work investigates complex queries where multiple pipelines of multi-table joins and aggregations, each with a different sort order, coexist---analogous to multiple sets of interesting orderings in the query plan---and how to execute them with multiple merged indexes.
-```
-
-Another optimization for this case specifically, lineitem can simply be extended with `custkey` and included in the merged index with order and customer. This is because (orderkey, lineitem) has a functional dependency on custkey (there must be a unique customer for this lineitem).
-Implementation of this Q3 plan requires recognizing functional dependencies---is this supported by Calcite? Please make a note of this in this file and leave it for future implementation.
-
-More generally, i.e., when functional dependencies are not present, consider the following query, TPC-H Q9:
-
-```SQL
-select nation, o_year, sum(amount) as sum_profit
-from (
-select n_name as nation, extract(year from o_orderdate) as o_year,
-l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
-From part, supplier, lineitem, partsupp, orders, nation
-where s_suppkey = l_suppkey and ps_suppkey = l_suppkey
-and ps_partkey = l_partkey and p_partkey = l_partkey
-and o_orderkey = l_orderkey and s_nationkey = n_nationkey
-and p_name like '%[COLOR]%'
-) as profit
-group by nation, o_year
-order by nation, o_year desc;
-```
-
-A possible plan with order-based operators is shown below.
+Two independent merge-join pipelines joined at the end on (suppkey, partkey):
 
 ```DOT
 digraph G {
-    // Bottom-to-top data flow
     rankdir=BT;
     node [shape=rect, fontname="Helvetica,Arial,sans-serif", fontsize=12, style=filled, fillcolor="#f9f9f9"];
     edge [fontname="Helvetica,Arial,sans-serif", fontsize=10];
-    label = "TPC-H Q9";
+    label = "TPC-H Q9 — ideal order-based plan";
     labelloc = "t";
 
-    // --- Subtree 1: Supplier & Nation Hierarchy ---
-    ScanN   [label="Scan: Nation", shape=folder, fillcolor="#e2e3e5"];
+    ScanN   [label="Scan: Nation",   shape=folder, fillcolor="#e2e3e5"];
     ScanS   [label="Scan: Supplier", shape=folder, fillcolor="#e2e3e5"];
     ScanPS  [label="Scan: PartSupp", shape=folder, fillcolor="#e2e3e5"];
-    
-    SortPS  [label="Sort: (suppkey)"];
-    MJ1     [label="Merge Join: (suppkey)", fillcolor="#cfe2ff"];
-    SortS   [label="Sort: (nationkey)"];
-    MJ2     [label="Merge Join: (nationkey)", fillcolor="#cfe2ff"];
-
-    // --- Subtree 2: Order, Lineitem & Part Hierarchy ---
-    ScanO   [label="Scan: Orders", shape=folder, fillcolor="#e2e3e5"];
+    ScanO   [label="Scan: Orders",   shape=folder, fillcolor="#e2e3e5"];
     ScanL   [label="Scan: Lineitem", shape=folder, fillcolor="#e2e3e5"];
-    ScanP   [label="Scan: Part", shape=folder, fillcolor="#e2e3e5"];
-    
-    MJ3     [label="Merge Join: (orderkey)\nextract(year from o_orderdate) as o_year", fillcolor="#cfe2ff"];
-    SortL   [label="Sort: (partkey)"];
-    SelectP [label="Filter: p_name like '%[COLOR]%'", fillcolor="#f8d7da"];
-    MJ4     [label="Merge Semi Join: (partkey)", fillcolor="#cfe2ff"];
+    ScanP   [label="Scan: Part",     shape=folder, fillcolor="#e2e3e5"];
+
+    SortPS   [label="Sort: (suppkey)"];
+    MJ1      [label="Merge Join: (suppkey)",   fillcolor="#cfe2ff"];
+    SortS    [label="Sort: (nationkey)"];
+    MJ2      [label="Merge Join: (nationkey)", fillcolor="#cfe2ff"];
+    MJ3      [label="Merge Join: (orderkey)\nextract(year from o_orderdate) as o_year", fillcolor="#cfe2ff"];
+    SortL    [label="Sort: (partkey)"];
+    SelectP  [label="Filter: p_name LIKE '%[COLOR]%'", fillcolor="#f8d7da"];
+    MJ4      [label="Merge Semi Join: (partkey)", fillcolor="#cfe2ff"];
     SortSub2 [label="Sort: (suppkey, partkey)", penwidth=2];
+    MJ_Final [label="Merge Join: (suppkey, partkey)\nn_name, o_year, amount", fillcolor="#cfe2ff", penwidth=2];
+    SortFinal [label="Sort: (nation, o_year)"];
+    Agg      [label="Groupby: (nation, o_year)\nSUM(amount)", fillcolor="#fff3cd"];
 
-    // --- Global Operations ---
-    MJ_Final [label="Merge Join: (suppkey, partkey)\n\
-        n_name, o_year,\n\
-        l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount\
-        ", fillcolor="#cfe2ff", penwidth=2];
-    Sort_Final [label="Sort: (nationkey, o_year)"]
-    Agg      [label="Groupby: (nationkey, o_year)\nn_name, o_year, SUM(amount)", fillcolor="#fff3cd"];
-
-    // --- Edges (Flowing Upwards) ---
-    // Subtree 1
-    ScanS  -> MJ1;
-    ScanPS -> SortPS;
-    SortPS -> MJ1;
-    MJ1    -> SortS;
-    SortS  -> MJ2;
-    ScanN  -> MJ2;
-
-    // Subtree 2
-    ScanO  -> MJ3;
-    ScanL  -> MJ3;
-    MJ3    -> SortL;
-    ScanP  -> SelectP;
-    SelectP -> MJ4;
-    SortL  -> MJ4;
+    ScanS  -> MJ1;  ScanPS -> SortPS -> MJ1;
+    MJ1    -> SortS -> MJ2;  ScanN -> MJ2;
+    ScanO  -> MJ3;  ScanL -> MJ3;
+    MJ3    -> SortL -> MJ4;  ScanP -> SelectP -> MJ4;
     MJ4    -> SortSub2;
-
-    // Final
-    MJ2      -> MJ_Final [headlabel="Sorted on\n(nk, sk, pk)"];
+    MJ2    -> MJ_Final [headlabel="Sorted on\n(nk,sk,pk)"];
     SortSub2 -> MJ_Final;
-    MJ_Final -> Sort_Final -> Agg;
+    MJ_Final -> SortFinal -> Agg;
 }
 ```
 
-Substituting the sorts in this plan with merged indexes, merging those with the same sort key in one b-tree, we get the following plan:
+### Q9 With Merged Indexes (AFTER)
+
+Each sort replaced by a merged index. Dashed arrows = update-time resort (maintenance).
+**At query time only `Agg` runs** (scanning `MgIdxGroup`); everything else is maintenance.
 
 ```DOT
 digraph G {
-    // Bottom-to-top data flow
     rankdir=BT;
     node [shape=rect, fontname="Helvetica,Arial,sans-serif", fontsize=12, style=filled, fillcolor="#f9f9f9"];
     edge [fontname="Helvetica,Arial,sans-serif", fontsize=10];
-    label = "TPC-H Q9: All included non-key columns are marked out. All keys are by default included in the result of any operator.";
+    label = "TPC-H Q9 — merged-index plan (dashed = update time)";
     labelloc = "t";
-    
 
-    MgIdxSPS [label="Merged Index: Supplier + PartSupp\n(suppkey, partkey)"]
-    MJ1     [label="Merge Join 1: (suppkey)\nps_supplycost", fillcolor="#cfe2ff"];
-    
-    MJ3     [label="Merge Join 3: (orderkey)\nl_extendedprice, l_discount, l_quantity,\nextract(year from o_orderdate) as o_year", fillcolor="#cfe2ff"];
-    MgIdxOL [label="Merged Index: Orders + Lineitem\n(orderkey, line number)"];
-    MgIdxPOL [label="Merged Index: Part + Merge Join 3 Result\n(partkey, suppkey, orderkey, line number)"];
-    MJ4     [label="Merge Semi Join 4: (partkey)\nFilter: p_name like '%[COLOR]%'\nl_extendedprice, l_discount, l_quantity,o_year", fillcolor="#cfe2ff"];
+    MgIdxSPS  [label="MergedIdx: Supplier+PartSupp\n(suppkey,partkey)"];
+    MJ1       [label="Merge Join 1: (suppkey)\nps_supplycost", fillcolor="#cfe2ff"];
+    MgIdxOL   [label="MergedIdx: Orders+Lineitem\n(orderkey)"];
+    MJ3       [label="Merge Join 3: (orderkey)\nl_extendedprice,l_discount,l_quantity,o_year", fillcolor="#cfe2ff"];
+    MgIdxPOL  [label="MergedIdx: Part+MJ3 Result\n(partkey,suppkey,orderkey)"];
+    MJ4       [label="Merge Semi Join 4: (partkey)\nFilter: LIKE '%[COLOR]%'", fillcolor="#cfe2ff"];
+    MgIdxAll  [label="MergedIdx: Nation+MJ1 Result+MJ4 Result\n(nationkey,suppkey,partkey)"];
+    MJ_Final  [label="Merge Join 5: (suppkey,partkey)\nn_name,o_year,amount", fillcolor="#cfe2ff", penwidth=2];
+    MgIdxGroup [label="MergedIdx: MJ5 Result\n(nation,o_year)"];
+    Agg       [label="Groupby: (nation,o_year)\nSUM(amount)", fillcolor="#fff3cd"];
 
-    // --- Global Operations ---
-    MgIdxAll [label="Merged Index: Nation + Merge Join 1\nResult +Merge Join 4 Result\n(nationkey, suppkey, partkey)"]
-    MJ_Final [label="Merge Join 5: (suppkey, partkey)\n\
-        n_name, o_year, l_extendedprice\n\
-         * (1 - l_discount) - ps_supplycost * l_quantity as amount\
-        ", fillcolor="#cfe2ff", penwidth=2];
-    MgIdxGroup [label="Merged Index: Merge Join 5 Result\n(nationkey, o_year)"]
-    Agg      [label="Groupby: (nationkey, o_year)\nn_name, o_year, SUM(amount)", fillcolor="#fff3cd"];
-
-    // --- Edges (Flowing Upwards) ---
-    MgIdxSPS  -> MJ1;
-    MJ1    -> MgIdxAll [style="dashed", headlabel="Resort by\nnationkey, suppkey, partkey"]
-
-    // Subtree 2
+    MgIdxSPS -> MJ1;
+    MJ1      -> MgIdxAll  [style=dashed, label="resort by (nk,sk,pk)"];
     MgIdxOL  -> MJ3;
-    MJ3 -> MgIdxPOL [style="dashed", label="Resort by\n(partkey, suppkey)"];
+    MJ3      -> MgIdxPOL  [style=dashed, label="resort by (pk,sk)"];
     MgIdxPOL -> MJ4;
-    MJ4 -> MgIdxAll  [style="dashed", label="Resort by\n(suppkey, partkey, orderkey)"];
-
-    // Final
+    MJ4      -> MgIdxAll  [style=dashed, label="resort by (sk,pk,ok)"];
     MgIdxAll -> MJ_Final;
-    MJ_Final -> MgIdxGroup [style="dashed", label="Resort by\n(nationkey, o_year)"];
+    MJ_Final -> MgIdxGroup [style=dashed, label="resort by (nation,o_year)"];
     MgIdxGroup -> Agg;
 }
 ```
 
-Technically, the only operations needed at query time is those after the final scan of `MgIdxGroup`. Namely, any dashed arrows represent a break between query time and update time. A resort is needed at every dashed arrow, which is shifted to update time (with index creation and maintenance). The rest of the plan is mainly maintenance plan for this final merged index and many intermediate merged indexes. For now, we are only working on query plans, not maintenance plans, so the required code should be moderate. However, update this file to save the plan for maintenance plans.
+---
 
-Back to Q3, the merge join result between order and lineitem is finally sorted on custkey and join with customer. This should create another merged index like Q9. Next step is to implement tests for both Q3 and Q9 and ensure their plans are same as or very close to the ones above.
+## Research Notes
+
+### Functional Dependencies and 3-Table Q3
+
+`ORDERS.o_orderkey → ORDERS.o_custkey` (PK) combined with `LINEITEM.l_orderkey`
+referencing `ORDERS.o_orderkey` (FK) means a merged index on (ORDERS, LINEITEM) by
+orderkey implicitly groups lineitem rows by custkey. This could enable a 3-table
+merged index (CUSTOMER + ORDERS + LINEITEM) stored by custkey if the optimizer
+recognizes the functional dependency.
+
+- **Calcite API**: `RelMdFunctionalDependencies`, `UniqueKeys`, and
+  `RelOptTable.toRel()` may expose FK→PK paths. Worth investigating.
+- If not natively available, assert the FD manually in the test by registering a
+  3-table `MergedIndex` and extending `PipelineToMergedIndexScanRule` to match
+  3-table pipelines (Sort→MergeJoin(Sort→Scan, Sort→Scan) pattern).
+
+### Q9 Maintenance Plan
+
+The Q9 merged-index DOT shows two tiers:
+- **Query tier**: only the final `Agg` (one sequential scan of `MgIdxGroup`)
+- **Maintenance tier**: all dashed-arrow resorts — index creation and incremental update
+
+Current implementation covers query plans only. Maintenance plan work would model
+each dashed edge as an incremental-update rule triggered by base-table inserts/deletes.
+
+---
+
+## Next Steps
+
+1. **PATH B: Native merged index support** — extend `PipelineToMergedIndexScanRule`
+   with a second operand pattern matching `EnumerableMergeJoin` over bare
+   `EnumerableTableScan` nodes that already carry the correct collation trait (no
+   explicit `EnumerableSort` needed when tables advertise collations via `getStatistic()`).
+   See "Architectural Note: Two Production Paths" above.
+
+2. **3-table Q3 merged index** — register a 3-table `MergedIndex` for
+   (CUSTOMER, ORDERS, LINEITEM) stored by custkey and write a test that replaces
+   the entire outer join pipeline in one substitution. Two sub-options:
+   (a) extend `PipelineToMergedIndexScanRule` to match a 3-table chain, or
+   (b) two sequential HEP passes (inner leaf first, then outer leaf).
+
+3. **Functional dependency metadata** — investigate whether `RelMdFunctionalDependencies`
+   can expose ORDERKEY→CUSTKEY so the planner can recognize 3-table merged index
+   opportunities automatically rather than requiring manual registration.
+
+4. **JOB (Join Order Benchmark)** — add tests for representative JOB queries to
+   show merged index substitution generalizes beyond TPC-H star schemas.
+
+5. **`implement()` stub** — `EnumerableMergedIndexScan.implement()` returns an empty
+   enumerable. A real implementation drives a sequential B-tree scan over interleaved
+   records and assembles join outputs and computes aggregations on-the-fly.
