@@ -193,7 +193,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q3 AFTER (merged index plan) ===");
     System.out.println(dumpText(phase2Plan));
-    System.out.println("=== Q3 AFTER DOT ===");
+    System.out.println("=== Q3 AFTER DOT (paste into https://dreampuf.github.io/GraphvizOnline/) ===");
     System.out.println(dumpDot(phase2Plan));
 
     // ── Assert ────────────────────────────────────────────────────────────
@@ -301,7 +301,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q12 AFTER (merged index plan) ===");
     System.out.println(dumpText(phase2Plan));
-    System.out.println("=== Q12 AFTER DOT ===");
+    System.out.println("=== Q12 AFTER DOT (paste into https://dreampuf.github.io/GraphvizOnline/) ===");
     System.out.println(dumpDot(phase2Plan));
 
     // ── Assert ────────────────────────────────────────────────────────────
