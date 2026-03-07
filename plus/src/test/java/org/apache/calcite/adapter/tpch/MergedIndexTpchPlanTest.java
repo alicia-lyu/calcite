@@ -640,6 +640,7 @@ class MergedIndexTpchPlanTest {
 // }
 // private static @Nullable list<EnumerableInterestingOrderingPipeline> findAllPipelines(RelNode node) {
     // Do findPipeline for the entire plan, and it should be segregated into multiple pipelines with EnumerableSorts as the dividers.
+    // The inputs to each pipeline is all EnumerableSorts on the same key, and a merged index should be created on all those inputs. An input may be a table or a view (i.e., query result) of another pipeline.                                              
 // }
 
   /** Recursively finds the first {@link EnumerableMergeJoin} in the plan tree. */
