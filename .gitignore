@@ -66,3 +66,6 @@ local.properties
 
 # jenv
 .java-version
+
+# Generated DOT plan files from MergedIndexTpchPlanTest
+plus/test-dot-output/

@@ -157,8 +157,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q3 BEFORE (order-based pipeline) ===");
     System.out.println(dumpText(phase1Plan));
-    System.out.println("=== Q3 DOT (paste into https://dreampuf.github.io/GraphvizOnline/) ===");
-    System.out.println(dumpDot(phase1Plan));
+    writeDotFile("q3_before", phase1Plan);
 
     // Find the leaf merge join (CUSTOMER ⋈ ORDERS): its two inputs are
     // EnumerableSort → EnumerableTableScan (no nested join).
@@ -195,8 +194,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q3 AFTER (merged index plan) ===");
     System.out.println(dumpText(phase2Plan));
-    System.out.println("=== Q3 AFTER DOT (paste into https://dreampuf.github.io/GraphvizOnline/) ===");
-    System.out.println(dumpDot(phase2Plan));
+    writeDotFile("q3_after", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
     final String planStr = dumpText(phase2Plan);
@@ -266,8 +264,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q12 BEFORE (order-based pipeline) ===");
     System.out.println(dumpText(phase1Plan));
-    System.out.println("=== Q12 DOT (paste into https://dreampuf.github.io/GraphvizOnline/) ===");
-    System.out.println(dumpDot(phase1Plan));
+    writeDotFile("q12_before", phase1Plan);
 
     final EnumerableMergeJoin join = Objects.requireNonNull(
         findMergeJoin(phase1Plan),
@@ -303,8 +300,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q12 AFTER (merged index plan) ===");
     System.out.println(dumpText(phase2Plan));
-    System.out.println("=== Q12 AFTER DOT (paste into https://dreampuf.github.io/GraphvizOnline/) ===");
-    System.out.println(dumpDot(phase2Plan));
+    writeDotFile("q12_after", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
     final String planStr = dumpText(phase2Plan);
@@ -379,8 +375,7 @@ class MergedIndexTpchPlanTest {
     final String beforeStr = dumpText(phase1Plan);
     System.out.println("=== Q3 OL BEFORE (order-based pipeline) ===");
     System.out.println(beforeStr);
-    System.out.println("=== Q3 OL DOT ===");
-    System.out.println(dumpDot(phase1Plan));
+    writeDotFile("q3ol_before", phase1Plan);
 
     // Find the leaf merge join (ORDERS ⋈ LINEITEM): both inputs are
     // EnumerableSort → EnumerableTableScan.
@@ -418,8 +413,7 @@ class MergedIndexTpchPlanTest {
     final String afterStr = dumpText(phase2Plan);
     System.out.println("=== Q3 OL AFTER (merged index plan) ===");
     System.out.println(afterStr);
-    System.out.println("=== Q3 OL AFTER DOT ===");
-    System.out.println(dumpDot(phase2Plan));
+    writeDotFile("q3ol_after", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
@@ -528,8 +522,7 @@ class MergedIndexTpchPlanTest {
     final String beforeStr = dumpText(phase1Plan);
     System.out.println("=== Q9 BEFORE (order-based pipeline) ===");
     System.out.println(beforeStr);
-    System.out.println("=== Q9 DOT ===");
-    System.out.println(dumpDot(phase1Plan));
+    writeDotFile("q9_before", phase1Plan);
 
     // Dynamically find and register all leaf merge joins (Sort→Scan on both sides).
     final List<EnumerableMergeJoin> leafJoins = findAllLeafMergeJoins(phase1Plan);
@@ -557,8 +550,7 @@ class MergedIndexTpchPlanTest {
     final String afterStr = dumpText(phase2Plan);
     System.out.println("=== Q9 AFTER (merged index plan) ===");
     System.out.println(afterStr);
-    System.out.println("=== Q9 AFTER DOT ===");
-    System.out.println(dumpDot(phase2Plan));
+    writeDotFile("q9_after", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
@@ -688,6 +680,24 @@ class MergedIndexTpchPlanTest {
       idx += sub.length();
     }
     return count;
+  }
+
+  /**
+   * Writes a Graphviz DOT plan to {@code test-dot-output/<name>.dot}, relative
+   * to the Gradle test working directory ({@code plus/test-dot-output/}).
+   * Open with the VSCode Graphviz extension for visual plan inspection.
+   */
+  private static void writeDotFile(String name, RelNode rel) {
+    final String dot = dumpDot(rel);
+    final java.nio.file.Path dir = java.nio.file.Paths.get("test-dot-output");
+    try {
+      java.nio.file.Files.createDirectories(dir);
+      final java.nio.file.Path file = dir.resolve(name + ".dot");
+      java.nio.file.Files.writeString(file, dot);
+      System.out.println("DOT written → " + file.toAbsolutePath());
+    } catch (java.io.IOException e) {
+      System.err.println("Failed to write DOT file " + name + ": " + e.getMessage());
+    }
   }
 
   private static String dumpText(RelNode rel) {

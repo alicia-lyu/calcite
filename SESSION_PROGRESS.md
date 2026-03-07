@@ -268,7 +268,7 @@ each dashed edge as an incremental-update rule triggered by base-table inserts/d
 
 ### Short Term (next session)
 
-1. Claude should create .dot files in appropriate places (include the address in the log) so I can view them with VSCode Graphviz extension.
+1. ✓ Tests now write DOT files to `plus/test-dot-output/` (gitignored). Run the TPC-H tests and open the generated `.dot` files with the VSCode Graphviz extension.
 2. Verify implemented queries, esp. Q9.
 3. Work out two or three more TPC-H queries that teach Claude to generate and test plans for any complex queries.
 
