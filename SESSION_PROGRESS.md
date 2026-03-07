@@ -35,6 +35,7 @@ Search for `=== Q3 BEFORE`, `=== Q3 AFTER`, `=== Q12 BEFORE`, `=== Q12 AFTER` in
 ### Sample AFTER output
 
 **Q3** (partial substitution — inner join replaced, outer join remains):
+
 ```
 EnumerableLimitSort(...)
   EnumerableAggregate(...)
@@ -48,6 +49,7 @@ EnumerableLimitSort(...)
 ```
 
 **Q12** (full substitution):
+
 ```
 EnumerableSort(...)
   EnumerableAggregate(...)
@@ -154,7 +156,7 @@ At query time:                               At update time (like a B-tree):
 
 These represent the target ideal plans for TPC-H Q9, not necessarily what Calcite
 currently produces (the planner picks its own join order and cost-based choices).
-Paste into https://dreampuf.github.io/GraphvizOnline/ to visualize.
+Paste into <https://dreampuf.github.io/GraphvizOnline/> to visualize.
 
 ### Q9 Ideal Order-Based Plan (BEFORE merged indexes)
 
@@ -256,6 +258,7 @@ recognizes the functional dependency.
 ### Q9 Maintenance Plan
 
 The Q9 merged-index DOT shows two tiers:
+
 - **Query tier**: only the final `Agg` (one sequential scan of `MgIdxGroup`)
 - **Maintenance tier**: all dashed-arrow resorts — index creation and incremental update
 
@@ -295,5 +298,5 @@ each dashed edge as an incremental-update rule triggered by base-table inserts/d
 
 5. **`implement()` stub** — `EnumerableMergedIndexScan.implement()` returns an empty
    enumerable. A real implementation drives a sequential B-tree scan over interleaved
-   records and assembles join outputs and computes aggregations on-the-fly. 
+   records and assembles join outputs and computes aggregations on-the-fly.
    Explore feasibility to hook my leanstore repo here.
