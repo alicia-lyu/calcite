@@ -322,12 +322,10 @@ class MergedIndexTpchPlanTest {
    * <pre>
    *   (LimitSort / Project / SortedAggregate ...)
    *     EnumerableMergeJoin(o_custkey = c_custkey)   ← outer join REMAINS
-   *       EnumerableSort(custkey)
-   *         EnumerableMergedIndexScan([TPCH, ORDERS]:O_ORDERKEY,
-   *                                   [TPCH, LINEITEM]:L_ORDERKEY)
-   *       EnumerableSort(custkey)
-   *         EnumerableTableScan(CUSTOMER)
+   *         EnumerableMergedIndexScan([TPCH, CUSTOMER]:C_CUSTKEY, View of the join between ORDERS and LINEITEM on orderkey)
    * </pre>
+   * EnumerableMergedIndexScan([TPCH, ORDERS]:O_ORDERKEY,
+   *                                   [TPCH, LINEITEM]:L_ORDERKEY) does not appear in the query plan at all, but only in the maintenance plan (similar to Q9). As a rule of thumb, any steps before the last sort is shifted to update time.
    */
   @Test void tpchQ3OrdersLineitem() throws Exception {
     final String sql = "SELECT l.l_orderkey,"
@@ -457,11 +455,8 @@ class MergedIndexTpchPlanTest {
    *
    * <h3>Ideal AFTER structure (merged indexes substituted)</h3>
    * <pre>
-   *   Each Sort→Sort→MergeJoin leaf replaced by MergedIndexScan.
-   *   E.g.:  Sort(suppkey)→SUPPLIER + Sort(suppkey)→PARTSUPP + MergeJoin(suppkey)
-   *          → MergedIndexScan(SUPPLIER+PARTSUPP, collation=[suppkey])
+   *       Only Sort(nation,o_year) → Aggregate(nation,o_year) appear in the query plan, with the sort replaced by the indexed join view produced by the last merge join.
    *
-   *   Remaining structure (inter-pipeline joins, filter, aggregate) unchanged.
    * </pre>
    *
    * <p>Full DOT diagrams for the ideal plans are in {@code SESSION_PROGRESS.md}
@@ -705,8 +700,42 @@ class MergedIndexTpchPlanTest {
         SqlExplainLevel.EXPPLAN_ATTRIBUTES);
   }
 
-  private static String dumpDot(RelNode rel) {
-    return RelOptUtil.dumpPlan("", rel, SqlExplainFormat.DOT,
-        SqlExplainLevel.EXPPLAN_ATTRIBUTES);
+  /**
+   * Generates a Graphviz DOT representation of the plan tree where every node
+   * gets a unique integer ID (based on object identity). This prevents visually
+   * identical nodes — e.g., multiple {@code EnumerableSort(sort0=$0, dir0=ASC)}
+   * siblings — from being merged into a single DOT node, which is what happens
+   * when Calcite's built-in DOT serializer uses the label string as the node ID.
+   */
+  private static String dumpDot(RelNode root) {
+    final StringBuilder sb = new StringBuilder("digraph {\n  rankdir=BT;\n");
+    final java.util.IdentityHashMap<RelNode, Integer> ids = new java.util.IdentityHashMap<>();
+    final int[] counter = {0};
+    dumpDotNode(root, sb, ids, counter);
+    sb.append("}\n");
+    return sb.toString();
+  }
+
+  private static int dumpDotNode(RelNode node, StringBuilder sb,
+      java.util.IdentityHashMap<RelNode, Integer> ids, int[] counter) {
+    if (ids.containsKey(node)) {
+      return ids.get(node);
+    }
+    final int id = counter[0]++;
+    ids.put(node, id);
+    // Use the first line of the text explain for a concise label.
+    final String explain = RelOptUtil.dumpPlan("", node,
+        SqlExplainFormat.TEXT, SqlExplainLevel.EXPPLAN_ATTRIBUTES).trim();
+    final String firstLine = explain.lines().findFirst()
+        .orElse(node.getClass().getSimpleName()).trim();
+    final String label = firstLine.replace("\"", "'");
+    sb.append("  n").append(id).append(" [label=\"").append(label).append("\"];\n");
+    final List<RelNode> inputs = node.getInputs();
+    for (int i = 0; i < inputs.size(); i++) {
+      final int childId = dumpDotNode(inputs.get(i), sb, ids, counter);
+      sb.append("  n").append(childId).append(" -> n").append(id)
+          .append(" [label=\"").append(i).append("\"];\n");
+    }
+    return id;
   }
 }
