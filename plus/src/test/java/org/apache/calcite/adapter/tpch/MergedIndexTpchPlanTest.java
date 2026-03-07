@@ -338,6 +338,14 @@ class MergedIndexTpchPlanTest {
         + " ORDER BY revenue DESC, o.o_orderdate"
         + " LIMIT 10"; // manual rewrite to force join order
 
+        // SELECT v.l_orderkey, v.l_revenue, o.o_orderdate, o.o_shippriority
+        // FROM (
+        //   SELECT l.l_orderkey,
+        //     SUM(l.l_extendedprice * (1 - l.l_discount)) AS l_revenue
+        //   FROM tpch.lineitem l ON l.l_orderkey = o.o_orderkey
+        //   GROUP BY l.l_orderkey ) as v JOIN tpch.orders o ON v.l_orderkey = o.o_orderkey JOIN tpch.customer c ON o.o_custkey = c.c_custkey
+        // ORDER BY v.l_revenue DESC, o.o_orderdate // manual rewrite to force aggregate pushdown and join order
+
     final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
     rootSchema.add("TPCH", new TpchSchema(0.01, 0, 1, false));
 
@@ -375,8 +383,7 @@ class MergedIndexTpchPlanTest {
     System.out.println(beforeStr);
     writeDotFile("q3ol_before", phase1Plan);
 
-    // Find the leaf merge join (ORDERS ⋈ LINEITEM): both inputs are
-    // EnumerableSort → EnumerableTableScan.
+    // You're wrong to find the leaf merge join and replace the inputs with one merged index. I understand the temptation to do so, since these inputs are required to sort on the same key (the join key). However, there may be some operator more than this join or other than this join that participate in this interesting ordering, thus the input(s) of it are also required to be sorted on this key. One example is my query rewrite above, the first group by and the first merge join all require input sorted on orderkey, so the inputs to this whole pipeline are all required to be sorted on orderkey. The right approach is recorded as findPipeline and findAllPipelines in the code comments below.
     final EnumerableMergeJoin innerJoin = Objects.requireNonNull(
         findLeafMergeJoin(phase1Plan),
         "Phase 1 plan has no leaf EnumerableMergeJoin:\n" + beforeStr);
@@ -626,6 +633,14 @@ class MergedIndexTpchPlanTest {
     }
     return null;
   }
+
+//   private static @Nullable EnumerableInterestingOrderingPipeline findPipeline(RelNode node) {
+    // 1. implement EnumerableInterestingOrderingPipeline which include one or multiple operators which require EnumerableSorts all on the same key. The EnumerableSorts are not included in EnumerableInterestingOrderingPipeline but reside just before this pipeline
+    // 2. Identify a pipeline as large as possible, which the search only cut off when it reaches a different EnumerableSort. 
+// }
+// private static @Nullable list<EnumerableInterestingOrderingPipeline> findAllPipelines(RelNode node) {
+    // Do findPipeline for the entire plan, and it should be segregated into multiple pipelines with EnumerableSorts as the dividers.
+// }
 
   /** Recursively finds the first {@link EnumerableMergeJoin} in the plan tree. */
   private static @Nullable EnumerableMergeJoin findMergeJoin(RelNode node) {
