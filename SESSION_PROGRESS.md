@@ -4,7 +4,7 @@
 
 | Item                                                                    | Status  |
 |-------------------------------------------------------------------------|---------|
-| `CLAUDE.md` + `main.tex`                                                | Done    |
+| `CLAUDE.md` + `main.md`                                                 | Done    |
 | `core/.../materialize/MergedIndex.java`                                 | Done    |
 | `core/.../materialize/MergedIndexRegistry.java`                         | Done    |
 | `core/.../adapter/enumerable/EnumerableMergedIndexScan.java`            | Done    |

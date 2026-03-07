@@ -15,7 +15,7 @@ This project accompanies the VLDB 2026 paper:
   "Storing and Indexing Multiple Tables by Interesting Orderings"
   Wenhui Lyu, Goetz Graefe — University of Wisconsin–Madison / Google
 
-The full paper is @main.tex and is very important context for this project.
+The full paper is @main.md and is very important context for this project.
 
 ### Merged Indexes (the key concept)
 
