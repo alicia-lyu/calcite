@@ -338,7 +338,7 @@ class MergedIndexTpchPlanTest {
         + " JOIN tpch.customer c ON o.o_custkey = c.c_custkey"
         + " GROUP BY l.l_orderkey, o.o_orderdate, o.o_shippriority"
         + " ORDER BY revenue DESC, o.o_orderdate"
-        + " LIMIT 10";
+        + " LIMIT 10"; // manual rewrite to force join order
 
     final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
     rootSchema.add("TPCH", new TpchSchema(0.01, 0, 1, false));

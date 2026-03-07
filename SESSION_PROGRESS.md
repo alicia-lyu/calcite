@@ -12,7 +12,7 @@
 | `core/.../adapter/enumerable/EnumerableRules.java` (constant)           | Done    |
 | Compilation fix (`.replace` vs `.replaceIf`)                            | Done    |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
-| `plus/.../adapter/tpch/MergedIndexTpchPlanTest.java`                    | Done ✓  |
+| `plus/src/test/java/org/apache/calcite/adapter/tpch/MergedIndexTpchPlanTest.java`                    | Done ✓  |
 | `explainTerms` display fix (table names + key column, not raw toString) | Done ✓  |
 | TPC-H Q3 (3-table: CUSTOMER ⋈ ORDERS ⋈ LINEITEM, partial substitution) | Done ✓  |
 | TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓  |
@@ -240,6 +240,21 @@ digraph G {
 ---
 
 ## Research Notes
+
+### Join Order: Why `tpchQ3OrdersLineitem` Uses a Manually Rewritten SQL
+
+`tpchQ3OrdersLineitem` tests the scenario where ORDERS ⋈ LINEITEM is the leaf join
+and CUSTOMER is the outer join — the reverse of Q3. Using the same SQL as Q3
+(`FROM customer JOIN orders JOIN lineitem`) always produces the same left-deep tree
+`(CUSTOMER ⋈ ORDERS) ⋈ LINEITEM`, so the leaf join is always CUSTOMER ⋈ ORDERS on
+`custkey` and the assertion on `O_ORDERKEY` fails.
+
+Calcite's Volcano planner preserves SQL join order because no join-reordering rules
+(`JoinCommuteRule`, `JoinAssociateRule`, etc.) are registered. Adding them would not
+reliably produce the desired order — with no real statistics at scale 0.01 the planner
+picks arbitrarily among equal-cost permutations — and would conflate "what the planner
+chose" with "what the test intends to demonstrate". The manual SQL rewrite is therefore
+intentional test design, not a workaround.
 
 ### Functional Dependencies and 3-Table Q3
 
