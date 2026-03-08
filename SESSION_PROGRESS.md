@@ -5,20 +5,17 @@
 | Item                                                                    | Status  |
 |-------------------------------------------------------------------------|---------|
 | `CLAUDE.md` + `main.md`                                                 | Done    |
-| `core/.../materialize/MergedIndex.java`                                 | Done    |
-| `core/.../materialize/MergedIndexRegistry.java`                         | Done    |
+| `core/.../materialize/MergedIndex.java` (+ `sources` field, `of()` factory) | Done |
+| `core/.../materialize/MergedIndexRegistry.java` (`findFor(List<Object>, ...)`) | Done |
 | `core/.../adapter/enumerable/EnumerableMergedIndexScan.java`            | Done    |
-| `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java`        | Done    |
+| `core/.../adapter/enumerable/EnumerableMergedIndexJoin.java` (NEW)      | Done    |
+| `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java` (outer pipeline support) | Done |
 | `core/.../adapter/enumerable/EnumerableRules.java` (constant)           | Done    |
-| Compilation fix (`.replace` vs `.replaceIf`)                            | Done    |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
-| `plus/src/test/java/org/apache/calcite/adapter/tpch/MergedIndexTpchPlanTest.java`                    | Done ✓  |
-| `explainTerms` display fix (table names + key column, not raw toString) | Done ✓  |
-| TPC-H Q3 (3-table: CUSTOMER ⋈ ORDERS ⋈ LINEITEM, partial substitution) | Done ✓  |
-| TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓  |
-| TPC-H Q3 variant: ORDERS⋈LINEITEM leaf, CUSTOMER outer — `tpchQ3OrdersLineitem()` | Done ✓ |
-| TPC-H Q9 (6-table, all leaf joins substituted) — `tpchQ9()`            | Done ✓  |
-| Calcite interesting-ordering research documented in SESSION_PROGRESS    | Done ✓  |
+| TPC-H Q3 (CUSTOMER ⋈ ORDERS ⋈ LINEITEM, partial substitution)          | **BROKEN** ⚠ |
+| TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | **BROKEN** ⚠ |
+| TPC-H Q3-OL full 3-table substitution — `tpchQ3OrdersLineitem()`        | **WIP** (untested) |
+| TPC-H Q9 (6-table, all leaf joins substituted)                          | **BROKEN** ⚠ |
 
 ## Commands
 
@@ -256,19 +253,34 @@ picks arbitrarily among equal-cost permutations — and would conflate "what the
 chose" with "what the test intends to demonstrate". The manual SQL rewrite is therefore
 intentional test design, not a workaround.
 
-### Functional Dependencies and 3-Table Q3
+### Hierarchical Merged Indexes: When They Apply and Why Q3OL Does Not Qualify
 
-`ORDERS.o_orderkey → ORDERS.o_custkey` (PK) combined with `LINEITEM.l_orderkey`
-referencing `ORDERS.o_orderkey` (FK) means a merged index on (ORDERS, LINEITEM) by
-orderkey implicitly groups lineitem rows by custkey. This could enable a 3-table
-merged index (CUSTOMER + ORDERS + LINEITEM) stored by custkey if the optimizer
-recognizes the functional dependency.
+**Hierarchical merged indexes** (paper §3.2) store tables with hierarchically structured keys
+as one merged index. The prototypical example is geography:
 
-- **Calcite API**: `RelMdFunctionalDependencies`, `UniqueKeys`, and
-  `RelOptTable.toRel()` may expose FK→PK paths. Worth investigating.
-- If not natively available, assert the FD manually in the test by registering a
-  3-table `MergedIndex` and extending `PipelineToMergedIndexScanRule` to match
-  3-table pipelines (Sort→MergeJoin(Sort→Scan, Sort→Scan) pattern).
+- Nation: key = `(nationkey)`
+- State: key = `(nationkey, statekey)` — `statekey` is a LOCAL identifier within a nation
+- County: key = `(nationkey, statekey, countykey)` — `countykey` is LOCAL within a state
+
+A single merged index sorted on `(nationkey, statekey, countykey)` satisfies all three merge
+join requirements because each shorter key is a **prefix** of the longer one. This works because
+`statekey` is scoped within its nation — it is NOT a globally unique surrogate.
+
+**Q3OL does NOT qualify.** `o_orderkey` and `o_custkey` are independent global surrogate keys.
+Even though `o_orderkey → o_custkey` (FK), `orderkey` is NOT structured as `(custkey, local_id)`.
+A sort by `(custkey, orderkey)` would co-locate ORDERS by customer, but `orderkey` values within
+a customer group are arbitrary integers — there is no prefix-chain structure. Therefore:
+
+- The outer join (CUSTOMER ⋈ inner_result on `custkey`) and inner join (LINEITEM ⋈ ORDERS on
+  `orderkey`) have **incompatible sort keys** — one cannot be a prefix of the other.
+- Q3OL requires **two separate merged indexes**: inner (LINEITEM+ORDERS by `orderkey`) and outer
+  (inner_view+CUSTOMER by `custkey`).
+- The outer merged index stores the **pre-computed inner join result** + CUSTOMER, sorted by
+  `custkey`, built at maintenance time. At query time, only the outer scan is needed.
+
+**FD and collation equivalence**: `sort(orderkey)` ≡ `sort(orderkey, orderdate)` because
+`o_orderkey → o_orderdate` (each order has a unique date). `MergedIndex.satisfies()` currently
+uses exact prefix matching; FD-based equivalence is deferred as future work.
 
 ### Q9 Maintenance Plan
 
@@ -284,11 +296,50 @@ each dashed edge as an incremental-update rule triggered by base-table inserts/d
 
 ## Next Steps
 
-### Short Term (next session)
+### Short Term (next session) — Fix Regression + Verify tpchQ3OrdersLineitem
+
+**WIP — all 4 tests currently broken.**
+
+#### Bug 1: Regression in tpchQ3, tpchQ12, tpchQ9
+
+Changing `PipelineToMergedIndexScanRule.Config` from a specific
+`Sort → TableScan` operand pattern to `anyInputs()` caused all three
+previously-passing tests to fail. The `EnumerableMergedIndexScan` no longer
+appears in the plan; the rule appears not to fire.
+
+**What changed:**
+
+- Config changed: `b0.operand(EnumerableMergeJoin.class).inputs(b1..Sort, b2..Sort)`
+  → `b0.operand(EnumerableMergeJoin.class).anyInputs()`
+- `onMatch`: now uses `unwrap(join.getLeft())` + `extractSource(node)` with
+  `findLeafTableScan` instead of `call.rel(1)` and `call.rel(2)`
+
+**Investigation needed in `PipelineToMergedIndexScanRule.java`:**
+Verify that `extractSource` and `findLeafTableScan` correctly return the same
+`RelOptTable` that was registered by the test. Try adding debug prints or
+a conditional breakpoint in `findFor` to see if the lookup is called and what
+`sources` are compared. Check whether `HepRelVertex` unwrapping in `extractSource`
+is happening correctly for `sort.getInput()` (the `unwrap` call in `extractSource`
+applies to `sort.getInput()` but does NOT apply recursively when `findLeafTableScan`
+calls `n.getInputs().get(0)` — that child IS unwrapped at next call via entry `unwrap(node)`).
+
+One possible root cause: with the old config, HEP only queued the rule when
+both inputs matched `EnumerableSort`. With `anyInputs()`, the rule matches
+earlier (e.g., before inner sorts are resolved) and `extractSource` returns null,
+causing an early return. When HEP then fires on the inner join, the node may
+already be marked as "tried and failed" and not re-queued.
+
+**Simplest fix to try:** Keep `anyInputs()` config but add a `System.err.println`
+inside `onMatch` to confirm the rule fires and what `leftSource`/`rightSource` are.
+
+#### Bug 2: tpchQ3OrdersLineitem — not yet verified
+
+The two-pass HEP approach was just implemented and not yet tested. After fixing
+Bug 1, run this test in isolation to check if it passes.
 
 ### Medium Term
 
-Work out two or three more TPC-H queries that teach Claude to generate and test plans for any complex queries.
+- Add 2–3 more TPC-H queries exercising the outer pipeline substitution path.
 
 ### Long Term
 

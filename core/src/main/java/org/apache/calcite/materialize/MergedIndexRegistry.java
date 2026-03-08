@@ -51,22 +51,21 @@ public final class MergedIndexRegistry {
   }
 
   /**
-   * Finds a registered {@link MergedIndex} that covers exactly the given
-   * tables (in any order) and whose collation satisfies {@code required}.
+   * Finds a registered {@link MergedIndex} whose sources match exactly
+   * {@code sources} (in any order) and whose collation satisfies
+   * {@code required}.
    *
-   * @param tables   the tables participating in the pipeline
+   * <p>Sources may be {@link RelOptTable} (matched by qualified name) or
+   * {@link MergedIndex} (matched by object identity).
+   *
+   * @param sources  the sources participating in the pipeline
    * @param required the collation that the pipeline requires
    * @return the first matching index, or empty if none
    */
   public static synchronized Optional<MergedIndex> findFor(
-      List<RelOptTable> tables, RelCollation required) {
-    List<String> requestedNames = qualifiedNames(tables);
+      List<Object> sources, RelCollation required) {
     for (MergedIndex index : INDEXES) {
-      List<String> indexNames = qualifiedNames(index.tables);
-      if (indexNames.size() == requestedNames.size()
-          && indexNames.containsAll(requestedNames)
-          && requestedNames.containsAll(indexNames)
-          && index.satisfies(required)) {
+      if (sourcesMatch(index.sources, sources) && index.satisfies(required)) {
         return Optional.of(index);
       }
     }
@@ -78,9 +77,30 @@ public final class MergedIndexRegistry {
     INDEXES.clear();
   }
 
-  private static List<String> qualifiedNames(List<RelOptTable> tables) {
-    return tables.stream()
-        .map(t -> String.join(".", t.getQualifiedName()))
-        .collect(Collectors.toList());
+  private static boolean sourcesMatch(List<Object> a, List<Object> b) {
+    if (a.size() != b.size()) {
+      return false;
+    }
+    outer:
+    for (Object ai : a) {
+      for (Object bi : b) {
+        if (sourceEquals(ai, bi)) {
+          continue outer;
+        }
+      }
+      return false;
+    }
+    return true;
+  }
+
+  private static boolean sourceEquals(Object a, Object b) {
+    if (a instanceof RelOptTable && b instanceof RelOptTable) {
+      return ((RelOptTable) a).getQualifiedName()
+          .equals(((RelOptTable) b).getQualifiedName());
+    }
+    if (a instanceof MergedIndex && b instanceof MergedIndex) {
+      return a == b; // identity: same Java object
+    }
+    return false;
   }
 }

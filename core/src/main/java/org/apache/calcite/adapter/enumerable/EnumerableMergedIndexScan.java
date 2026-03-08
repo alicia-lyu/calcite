@@ -113,16 +113,22 @@ public class EnumerableMergedIndexScan extends AbstractRelNode
   }
 
   @Override public RelWriter explainTerms(RelWriter pw) {
-    List<String> tableDescriptions = new ArrayList<>();
-    for (int i = 0; i < mergedIndex.tables.size(); i++) {
-      RelOptTable t = mergedIndex.tables.get(i);
+    List<String> sourceDescriptions = new ArrayList<>();
+    for (int i = 0; i < mergedIndex.sources.size(); i++) {
+      Object src = mergedIndex.sources.get(i);
       RelCollation tc = mergedIndex.tableCollations.get(i);
-      int keyIdx = tc.getFieldCollations().get(0).getFieldIndex();
-      String keyName = t.getRowType().getFieldList().get(keyIdx).getName();
-      tableDescriptions.add(t.getQualifiedName() + ":" + keyName);
+      if (src instanceof RelOptTable) {
+        RelOptTable t = (RelOptTable) src;
+        int keyIdx = tc.getFieldCollations().get(0).getFieldIndex();
+        String keyName = t.getRowType().getFieldList().get(keyIdx).getName();
+        sourceDescriptions.add(t.getQualifiedName() + ":" + keyName);
+      } else {
+        MergedIndex inner = (MergedIndex) src;
+        sourceDescriptions.add("view(" + inner.collation + ")");
+      }
     }
     return super.explainTerms(pw)
-        .item("tables", tableDescriptions)
+        .item("tables", sourceDescriptions)
         .item("collation", mergedIndex.collation);
   }
 

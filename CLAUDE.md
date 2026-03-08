@@ -100,6 +100,22 @@ system — it has no storage engine. It provides:
 - Adapter modules: `cassandra/`, `druid/`, `elasticsearch/`, `mongodb/`, etc.
 - `server/`, `babel/`, `pig/`, `spark/`, etc. — non-core adapters
 
+## Technical Notes 
+
+### Functional Dependencies and 3-Table Q3
+
+`ORDERS.o_orderkey → ORDERS.o_custkey` (PK) combined with `LINEITEM.l_orderkey`
+referencing `ORDERS.o_orderkey` (FK) means a merged index on (ORDERS, LINEITEM) by
+orderkey implicitly groups lineitem rows by custkey. This could enable a 3-table
+merged index (CUSTOMER + ORDERS + LINEITEM) stored by custkey if the optimizer
+recognizes the functional dependency.
+
+- **Calcite API**: `RelMdFunctionalDependencies`, `UniqueKeys`, and
+  `RelOptTable.toRel()` may expose FK→PK paths. Worth investigating.
+- If not natively available, assert the FD manually in the test by registering a
+  3-table `MergedIndex` and extending `PipelineToMergedIndexScanRule` to match
+  3-table pipelines (Sort→MergeJoin(Sort→Scan, Sort→Scan) pattern).
+
 ## Key Files for the Merged Index Feature
 
 | File | Purpose |
@@ -121,30 +137,99 @@ system — it has no storage engine. It provides:
 
 | File | Purpose |
 |------|---------|
-| `materialize/MergedIndex.java` | Descriptor for one merged index (tables + shared collation) |
-| `materialize/MergedIndexRegistry.java` | Static singleton registry mapping table sets to indexes |
-| `adapter/enumerable/EnumerableMergedIndexScan.java` | Physical operator replacing the entire pipeline |
-| `adapter/enumerable/PipelineToMergedIndexScanRule.java` | Planner rule matching the pipeline pattern |
+| `materialize/MergedIndex.java` | Descriptor for one merged index; `sources` field holds `RelOptTable` or inner `MergedIndex` |
+| `materialize/MergedIndexRegistry.java` | Static singleton registry; `findFor(List<Object>, RelCollation)` with name/identity matching |
+| `adapter/enumerable/EnumerableMergedIndexScan.java` | Leaf scan replacing the entire inner pipeline |
+| `adapter/enumerable/EnumerableMergedIndexJoin.java` | Query-time assembly operator for outer pipeline (wraps a scan) |
+| `adapter/enumerable/PipelineToMergedIndexScanRule.java` | Planner rule: inner pipeline → scan; outer pipeline → join+scan |
 | `core/src/test/java/org/apache/calcite/adapter/enumerable/PipelineToMergedIndexScanRuleTest.java` | Unit tests for the rule (2-table, simple schema) |
-| `plus/src/test/java/org/apache/calcite/adapter/tpch/MergedIndexTpchPlanTest.java` | TPC-H plan tests: Q3 (partial), Q12 (full), Q3-OL variant, Q9 (6-table) |
+| `plus/src/test/java/org/apache/calcite/adapter/tpch/MergedIndexTpchPlanTest.java` | TPC-H plan tests: Q3 (partial), Q12 (full), Q3-OL (full 3-table), Q9 (6-table) |
 
 ## Implementation Notes
 
-### Pattern matched by PipelineToMergedIndexScanRule
+### Two cases in PipelineToMergedIndexScanRule
 
-```
+**Inner pipeline** — both sources are base tables (`RelOptTable`):
+
+```text
 EnumerableMergeJoin
-  EnumerableSort
-    EnumerableTableScan [table A]
-  EnumerableSort
-    EnumerableTableScan [table B]
+  EnumerableSort → (aggregate/project chain →) EnumerableTableScan [A]
+  EnumerableSort → EnumerableTableScan [B]
 ```
 
-Optionally wrapped by `EnumerableSortedAggregate`.
+Replaced by a single leaf `EnumerableMergedIndexScan`. Join assembly + aggregation
+are pre-computed at maintenance time; no assembly needed at query time.
+
+**Outer pipeline** — left source is an inner `MergedIndex` view:
+
+```text
+EnumerableMergeJoin
+  EnumerableSort → EnumerableMergedIndexScan [inner view]
+  EnumerableSort → EnumerableTableScan [C]
+```
+
+Replaced by `EnumerableMergedIndexJoin → EnumerableMergedIndexScan(outer)`. The
+outer scan reads co-located (inner join result + C) records by the shared key; the
+join operator assembles the Cartesian product at query time.
+
+### MergedIndex.of() — mixed sources factory
+
+Use `MergedIndex.of(List<Object>, ...)` when any source is an inner `MergedIndex`
+view. The `sources` field holds `RelOptTable` (base table) or `MergedIndex` (inner
+view). The flat `tables` field expands all views to base tables for display.
+
+```java
+// Inner pipeline (base tables only):
+new MergedIndex(List.of(tableA, tableB), collations, collation, rowCount)
+
+// Outer pipeline (inner view + base table):
+MergedIndex.of(List.of(innerMergedIndex, tableC), collations, collation, rowCount)
+```
+
+### HepRelVertex unwrapping in PipelineToMergedIndexScanRule
+
+In HEP, all nodes are wrapped in `HepRelVertex`. `join.getLeft()` returns a
+`HepRelVertex`, not the actual `EnumerableSort`. The rule uses a private helper:
+
+```java
+private static RelNode unwrap(RelNode node) {
+  return node instanceof HepRelVertex
+      ? ((HepRelVertex) node).getCurrentRel() : node;
+}
+```
+
+Every access to `join.getLeft()`, `join.getRight()`, and `sort.getInput()` must
+call `unwrap()` first to get the actual rel node.
+
+### Two-pass HEP for multi-level pipelines (tpchQ3OrdersLineitem)
+
+When an outer pipeline depends on replacing an inner pipeline first, a **single**
+HEP pass is unreliable: HEP may process the outer join before firing the inner
+replacement, leaving the outer join unmatched. Fix: use **two separate `HepPlanner`
+instances** — pass 1 replaces inner joins (producing `MergedIndexScan`), pass 2
+replaces the outer join (which now sees `Sort → MergedIndexScan`).
+
+```java
+HepPlanner pass1 = new HepPlanner(hepPass);
+pass1.setRoot(phase1Plan);
+RelNode afterPass1 = pass1.findBestExp();
+
+HepPlanner pass2 = new HepPlanner(hepPass);
+pass2.setRoot(afterPass1);
+RelNode phase2Plan = pass2.findBestExp();
+```
+
+### findAllPipelines — test helper for multi-level discovery
+
+For tests with nested pipelines, `findAllPipelines(RelNode)` does a post-order
+walk and collects each `EnumerableMergeJoin` that can be resolved. Inner pipelines
+are collected before outer ones because of post-order traversal. Sources are stored
+as `RelOptTable` or `Pipeline` (resolved to `MergedIndex` during registration).
 
 ### Cost model for EnumerableMergedIndexScan
 
 The scan is always cheaper than the pipeline it replaces because:
+
 - Sorts (O(N log N)) are eliminated — data is pre-sorted in the index
 - N table scans collapse into one sequential pass
 - Cost: `rowCount=ΣTᵢ, cpu=ΣTᵢ*0.1, io=ΣTᵢ`
@@ -165,7 +250,7 @@ eliminated and performed internally by the scan operator.
 
 There are two distinct scenarios; the current rule only handles PATH A:
 
-```
+```text
 PATH A — Substitution (current PoC, what the tests demonstrate)
 ────────────────────────────────────────────────────────────────
 Tables do NOT report collation (getStatistic() = Statistics.UNKNOWN).
@@ -210,6 +295,7 @@ matching EnumerableMergeJoin over bare scans with the correct collation trait.
 
 **`injectSortsBeforeJoin(RelNode)`** — recursive helper used in tests. Wraps each
 `Join` input in a `LogicalSort` so `ENUMERABLE_SORT_RULE` has nodes to convert.
+
 - Uses `RelOptUtil.splitJoinCondition` to extract per-join equi-keys automatically.
 - Guards against empty key lists (non-equi / cross joins): skips injection rather
   than crashing with `IndexOutOfBoundsException`.
@@ -239,17 +325,21 @@ User instructions across the files are explicitly marked by `lwh` (my initials).
 At the end of every session (or whenever asked to wrap up / update notes):
 
 1. **Refresh `## Next Steps` in `SESSION_PROGRESS.md`** — replace the old next-steps
-   section with specific, actionable items based on what was just implemented. 
+   section with specific, actionable items based on what was just implemented.
    Group these into short-term (next session) and medium-term (later sessions) buckets.
    Short-term next step should name the file/class/rule to change and describe the concrete goal.
 
-2. **Compact verbose notes** — move long plan output dumps, old TODO prose, and
+2. Take note of any confusion that led to plan reiterations, dead-ends, design changes, and implementation bugs. Especially record useful user inputs.
+
+3. If a session ends with half-implemented code or a plan that is not fully tested, add a "Work in Progress" note to the next steps with a clear description of what is incomplete and what the next session should focus on to finish it. Be specific and comprehensive with the conversation history of this session.
+
+4. **Compact verbose notes** — move long plan output dumps, old TODO prose, and
    exploration logs out of `SESSION_PROGRESS.md`. Keep only concise lessons and
    reference diagrams (DOT, ASCII). Use sub-sections with clear headings. Old next-steps may include notes that should be reorgnized elsewhere in @SESSION_PROGRESS.md, in the Javadoc of the test methods, or in CLAUDE.md.
 
-3. **Expected plans near test code** — paste plan output snippets (BEFORE/AFTER
+5. **Expected plans near test code** — paste plan output snippets (BEFORE/AFTER
    structure) as Javadoc comments in the test method they belong to, not in
    `SESSION_PROGRESS.md`. Reference the full DOT diagrams in `SESSION_PROGRESS.md`
    from the Javadoc with a short note.
 
-4. **Commit** all documentation and code changes together after the cleanup.
+6. **Commit** all documentation and code changes together after the cleanup.
