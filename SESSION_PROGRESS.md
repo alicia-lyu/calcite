@@ -12,10 +12,10 @@
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java` (outer pipeline support) | Done |
 | `core/.../adapter/enumerable/EnumerableRules.java` (constant)           | Done    |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
-| TPC-H Q3 (CUSTOMER ⋈ ORDERS ⋈ LINEITEM, partial substitution)          | **BROKEN** ⚠ |
-| TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | **BROKEN** ⚠ |
-| TPC-H Q3-OL full 3-table substitution — `tpchQ3OrdersLineitem()`        | **WIP** (untested) |
-| TPC-H Q9 (6-table, all leaf joins substituted)                          | **BROKEN** ⚠ |
+| TPC-H Q3 (CUSTOMER ⋈ ORDERS ⋈ LINEITEM, partial substitution)          | Done ✓      |
+| TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓      |
+| TPC-H Q3-OL full 3-table substitution — `tpchQ3OrdersLineitem()`        | Done ✓      |
+| TPC-H Q9 (6-table, all leaf joins substituted)                          | Done ✓      |
 
 ## Commands
 
@@ -296,46 +296,27 @@ each dashed edge as an incremental-update rule triggered by base-table inserts/d
 
 ## Next Steps
 
-### Short Term (next session) — Fix Regression + Verify tpchQ3OrdersLineitem
+### Short Term (next session)
 
-**WIP — all 4 tests currently broken.**
+All 5 tests pass. Focus on medium-term items below.
 
-#### Bug 1: Regression in tpchQ3, tpchQ12, tpchQ9
+#### Bugs fixed this session
 
-Changing `PipelineToMergedIndexScanRule.Config` from a specific
-`Sort → TableScan` operand pattern to `anyInputs()` caused all three
-previously-passing tests to fail. The `EnumerableMergedIndexScan` no longer
-appears in the plan; the rule appears not to fire.
+**Bug: `tpchQ3OrdersLineitem` NPE in `MergedIndex.of()`**
+`findAllPipelines` returned `new ArrayList<>(byJoin.values())` where
+`IdentityHashMap.values()` has no guaranteed order. Outer pipeline was
+processed before inner pipeline's `mergedIndex` was set → `null` in
+`resolved` → NPE at `ImmutableList.Builder.add()`.
+Fix (`MergedIndexTpchPlanTest`): pass `List<Pipeline> ordered` into
+`collectPipelines` and `ordered.add(p)` immediately after creation;
+return `ordered` (post-order insertion = inner before outer).
 
-**What changed:**
-
-- Config changed: `b0.operand(EnumerableMergeJoin.class).inputs(b1..Sort, b2..Sort)`
-  → `b0.operand(EnumerableMergeJoin.class).anyInputs()`
-- `onMatch`: now uses `unwrap(join.getLeft())` + `extractSource(node)` with
-  `findLeafTableScan` instead of `call.rel(1)` and `call.rel(2)`
-
-**Investigation needed in `PipelineToMergedIndexScanRule.java`:**
-Verify that `extractSource` and `findLeafTableScan` correctly return the same
-`RelOptTable` that was registered by the test. Try adding debug prints or
-a conditional breakpoint in `findFor` to see if the lookup is called and what
-`sources` are compared. Check whether `HepRelVertex` unwrapping in `extractSource`
-is happening correctly for `sort.getInput()` (the `unwrap` call in `extractSource`
-applies to `sort.getInput()` but does NOT apply recursively when `findLeafTableScan`
-calls `n.getInputs().get(0)` — that child IS unwrapped at next call via entry `unwrap(node)`).
-
-One possible root cause: with the old config, HEP only queued the rule when
-both inputs matched `EnumerableSort`. With `anyInputs()`, the rule matches
-earlier (e.g., before inner sorts are resolved) and `extractSource` returns null,
-causing an early return. When HEP then fires on the inner join, the node may
-already be marked as "tried and failed" and not re-queued.
-
-**Simplest fix to try:** Keep `anyInputs()` config but add a `System.err.println`
-inside `onMatch` to confirm the rule fires and what `leftSource`/`rightSource` are.
-
-#### Bug 2: tpchQ3OrdersLineitem — not yet verified
-
-The two-pass HEP approach was just implemented and not yet tested. After fixing
-Bug 1, run this test in isolation to check if it passes.
+**Bug: `tpchQ3OrdersLineitem` fails only in parallel suite run**
+`MergedIndexRegistry` is a static singleton; qualified-name matching in
+`sourcesMatch` means Q9's `(ORDERS, LINEITEM)` entry is found by Q3OL's
+inner HEP pass when tests run concurrently. Scan then carries Q9's
+`MergedIndex` object; identity-based outer lookup fails → outer join not replaced.
+Fix (`MergedIndexTpchPlanTest`): `@Execution(ExecutionMode.SAME_THREAD)`.
 
 ### Medium Term
 

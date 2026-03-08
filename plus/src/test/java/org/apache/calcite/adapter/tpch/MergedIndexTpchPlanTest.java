@@ -54,6 +54,8 @@ import org.apache.calcite.tools.RuleSets;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
 
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
@@ -70,6 +72,12 @@ import static org.hamcrest.Matchers.lessThan;
 /**
  * TPC-H plan observation test for {@link EnumerableMergedIndexScan}.
  *
+ * <p>Tests run sequentially ({@link ExecutionMode#SAME_THREAD}) because
+ * {@link MergedIndexRegistry} is a static singleton: parallel execution
+ * causes cross-test registry pollution where one test's registered indexes
+ * (identified by qualified table name) are found by another test's HEP pass,
+ * producing the wrong {@link MergedIndex} object for identity-based lookups.
+ *
  * <p>Demonstrates BEFORE/AFTER query plans for TPC-H Q3 (3-table: CUSTOMER,
  * ORDERS, LINEITEM — partial substitution) and Q12 (2-table: ORDERS, LINEITEM
  * — full substitution) to show merged index plan transformation.
@@ -83,6 +91,7 @@ import static org.hamcrest.Matchers.lessThan;
  *   or: https://dreampuf.github.io/GraphvizOnline/
  * </pre>
  */
+@Execution(ExecutionMode.SAME_THREAD)
 class MergedIndexTpchPlanTest {
 
   @AfterEach
@@ -484,15 +493,18 @@ class MergedIndexTpchPlanTest {
    */
   private static List<Pipeline> findAllPipelines(RelNode root) {
     final IdentityHashMap<RelNode, Pipeline> byJoin = new IdentityHashMap<>();
-    collectPipelines(root, byJoin);
-    return new ArrayList<>(byJoin.values());
+    final List<Pipeline> ordered = new ArrayList<>();
+    collectPipelines(root, byJoin, ordered);
+    // ordered preserves post-order insertion, guaranteeing inner pipelines
+    // appear before outer ones regardless of IdentityHashMap iteration order.
+    return ordered;
   }
 
   private static void collectPipelines(RelNode node,
-      IdentityHashMap<RelNode, Pipeline> byJoin) {
+      IdentityHashMap<RelNode, Pipeline> byJoin, List<Pipeline> ordered) {
     // Post-order: recurse into inputs first so inner joins are processed before outer
     for (RelNode input : node.getInputs()) {
-      collectPipelines(input, byJoin);
+      collectPipelines(input, byJoin, ordered);
     }
     if (!(node instanceof EnumerableMergeJoin)) {
       return;
@@ -507,7 +519,10 @@ class MergedIndexTpchPlanTest {
     final RelCollation rc = ((EnumerableSort) join.getRight()).getCollation();
     final double rowCount =
         join.estimateRowCount(join.getCluster().getMetadataQuery());
-    byJoin.put(join, new Pipeline(List.of(leftSrc, rightSrc), List.of(lc, rc), lc, rowCount));
+    final Pipeline p =
+        new Pipeline(List.of(leftSrc, rightSrc), List.of(lc, rc), lc, rowCount);
+    byJoin.put(join, p);
+    ordered.add(p);
   }
 
   /**
