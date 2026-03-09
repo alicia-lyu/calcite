@@ -969,8 +969,12 @@ class MergedIndexTpchPlanTest {
     final List<RelNode> inputs = node.getInputs();
     for (int i = 0; i < inputs.size(); i++) {
       final int childId = dumpDotColorNode(inputs.get(i), sb, ids, counter);
-      sb.append("  n").append(childId).append(" -> n").append(id)
-          .append(" [label=\"").append(i).append("\"];\n");
+      final String edgeLabel = inputs.size() > 1 ? (i == 0 ? "left" : "right") : "";
+      sb.append("  n").append(childId).append(" -> n").append(id);
+      if (!edgeLabel.isEmpty()) {
+        sb.append(" [label=\"").append(edgeLabel).append("\"]");
+      }
+      sb.append(";\n");
     }
     return id;
   }

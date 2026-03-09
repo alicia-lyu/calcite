@@ -149,67 +149,86 @@ At query time:                               At update time (like a B-tree):
 
 ---
 
-## Q9 Reference Plans
+## Test Plan Summaries
 
-CHANGES PENDING, refer to MergedIndexTpchPlanTest.java for up-to-date plans.
+Full DOT diagrams in `plus/test-dot-output/`. Plans are accurate as of the last test run.
 
----
+### Q12 — 2-table full substitution (`tpchQ12`)
 
-## Research Notes
+Key: `o_orderkey = l_orderkey`. One HEP pass.
 
-### Join Order: Why `tpchQ3OrdersLineitem` Uses a Manually Rewritten SQL
+```text
+BEFORE                                     AFTER
+EnumerableSort                             EnumerableSort
+  EnumerableAggregate                        EnumerableAggregate
+    EnumerableMergeJoin(orderkey)              EnumerableMergedIndexScan
+      EnumerableSort → Scan(ORDERS)              [ORDERS]:O_ORDERKEY
+      EnumerableSort → Scan(LINEITEM)            [LINEITEM]:L_ORDERKEY
+```
 
-`tpchQ3OrdersLineitem` tests the scenario where ORDERS ⋈ LINEITEM is the leaf join
-and CUSTOMER is the outer join — the reverse of Q3. Using the same SQL as Q3
-(`FROM customer JOIN orders JOIN lineitem`) always produces the same left-deep tree
-`(CUSTOMER ⋈ ORDERS) ⋈ LINEITEM`, so the leaf join is always CUSTOMER ⋈ ORDERS on
-`custkey` and the assertion on `O_ORDERKEY` fails.
+### Q3 — 3-table partial substitution (`tpchQ3`)
 
-Calcite's Volcano planner preserves SQL join order because no join-reordering rules
-(`JoinCommuteRule`, `JoinAssociateRule`, etc.) are registered. Adding them would not
-reliably produce the desired order — with no real statistics at scale 0.01 the planner
-picks arbitrarily among equal-cost permutations — and would conflate "what the planner
-chose" with "what the test intends to demonstrate". The manual SQL rewrite is therefore
-intentional test design, not a workaround.
+Key: `c_custkey = o_custkey` (leaf), `o_orderkey = l_orderkey` (outer, stays). One HEP pass.
 
-### Hierarchical Merged Indexes: When They Apply and Why Q3OL Does Not Qualify
+```text
+BEFORE                                     AFTER
+EnumerableLimitSort                        EnumerableLimitSort
+  EnumerableAggregate                        EnumerableAggregate
+    EnumerableMergeJoin(orderkey) ←outer       EnumerableMergeJoin(orderkey) ← REMAINS
+      EnumerableSort(orderkey)                   EnumerableSort(orderkey)
+        EnumerableMergeJoin(custkey) ←leaf           EnumerableMergedIndexScan
+          EnumerableSort → Scan(CUSTOMER)               [CUSTOMER]:C_CUSTKEY
+          EnumerableSort → Scan(ORDERS)                 [ORDERS]:O_CUSTKEY
+      EnumerableSort → Scan(LINEITEM)            EnumerableSort → Scan(LINEITEM)
+```
 
-**Hierarchical merged indexes** (paper §3.2) store tables with hierarchically structured keys
-as one merged index. The prototypical example is geography:
+### Q3-OL — 3-table full substitution (`tpchQ3OrdersLineitem`)
 
-- Nation: key = `(nationkey)`
-- State: key = `(nationkey, statekey)` — `statekey` is a LOCAL identifier within a nation
-- County: key = `(nationkey, statekey, countykey)` — `countykey` is LOCAL within a state
+Keys: `l_orderkey = o_orderkey` (inner), `o_custkey = c_custkey` (outer). Two HEP passes.
 
-A single merged index sorted on `(nationkey, statekey, countykey)` satisfies all three merge
-join requirements because each shorter key is a **prefix** of the longer one. This works because
-`statekey` is scoped within its nation — it is NOT a globally unique surrogate.
+```text
+BEFORE                                     AFTER
+EnumerableLimitSort                        EnumerableLimitSort
+  EnumerableProject                          EnumerableProject
+    EnumerableMergeJoin(custkey) ←outer        EnumerableMergedIndexJoin(custkey, INNER)
+      EnumerableSort(custkey)                    EnumerableMergedIndexScan
+        EnumerableMergeJoin(orderkey) ←inner       [view(OL)]:O_CUSTKEY
+          EnumerableSort                            [CUSTOMER]:C_CUSTKEY
+            EnumerableAggregate → Scan(LINEITEM)
+          EnumerableSort → Scan(ORDERS)
+      EnumerableSort → Scan(CUSTOMER)
+```
 
-**Q3OL does NOT qualify.** `o_orderkey` and `o_custkey` are independent global surrogate keys.
-Even though `o_orderkey → o_custkey` (FK), `orderkey` is NOT structured as `(custkey, local_id)`.
-A sort by `(custkey, orderkey)` would co-locate ORDERS by customer, but `orderkey` values within
-a customer group are arbitrary integers — there is no prefix-chain structure. Therefore:
+### Q9 — 6-table full substitution (`tpchQ9`)
 
-- The outer join (CUSTOMER ⋈ inner_result on `custkey`) and inner join (LINEITEM ⋈ ORDERS on
-  `orderkey`) have **incompatible sort keys** — one cannot be a prefix of the other.
-- Q3OL requires **two separate merged indexes**: inner (LINEITEM+ORDERS by `orderkey`) and outer
-  (inner_view+CUSTOMER by `custkey`).
-- The outer merged index stores the **pre-computed inner join result** + CUSTOMER, sorted by
-  `custkey`, built at maintenance time. At query time, only the outer scan is needed.
+Keys: orderkey → partkey → (partkey,suppkey) → suppkey → nationkey. Five HEP passes.
+`findAllPipelines` discovers 5 nested `Pipeline` objects post-order; `MergedIndex.of()`
+builds OL → OLP → OLPS → OLPPS → OLPPSS+NATION bottom-up.
 
-**FD and collation equivalence**: `sort(orderkey)` ≡ `sort(orderkey, orderdate)` because
-`o_orderkey → o_orderdate` (each order has a unique date). `MergedIndex.satisfies()` currently
-uses exact prefix matching; FD-based equivalence is deferred as future work.
+```text
+BEFORE                                     AFTER
+EnumerableSort(n_name, o_year DESC)        EnumerableSort(n_name, o_year DESC) ← ORDER BY only
+  EnumerableAggregate(n_name, o_year)        EnumerableAggregate(n_name, o_year)
+    EnumerableFilter(p_name LIKE ...)          EnumerableProject
+      EnumerableMergeJoin(nationkey)             EnumerableFilter(p_name LIKE ...)
+        EnumerableSort                             EnumerableMergedIndexJoin(nationkey, INNER)
+          EnumerableMergeJoin(suppkey)               EnumerableMergedIndexScan
+            EnumerableSort                             [view(OLPPS)]:N_NATIONKEY
+              EnumerableMergeJoin(partkey,suppkey)     [NATION]:N_NATIONKEY
+                EnumerableSort → Scan(PARTSUPP)
+                EnumerableSort
+                  EnumerableMergeJoin(partkey)
+                    EnumerableSort → Scan(PART)
+                    EnumerableSort
+                      EnumerableMergeJoin(orderkey)
+                        EnumerableSort → Scan(ORDERS)
+                        EnumerableSort → Scan(LINEITEM)
+            EnumerableSort → Scan(SUPPLIER)
+        EnumerableSort → Scan(NATION)
+```
 
-### Q9 Maintenance Plan
-
-The Q9 merged-index DOT shows two tiers:
-
-- **Query tier**: only the final `Agg` (one sequential scan of `MgIdxGroup`)
-- **Maintenance tier**: all dashed-arrow resorts — index creation and incremental update
-
-Current implementation covers query plans only. Maintenance plan work would model
-each dashed edge as an incremental-update rule triggered by base-table inserts/deletes.
+Note: `EnumerableFilter(p_name LIKE '%green%')` remains because PART is absorbed into
+the merged index but the filter cannot be pushed below the assembled join result.
 
 ---
 
@@ -217,33 +236,34 @@ each dashed edge as an incremental-update rule triggered by base-table inserts/d
 
 ### Short Term (next session)
 
+- **Tag Q9 milestone** — `git tag v0.4-q9-full-substitution` now that all 4 TPC-H tests pass.
+- **Add Javadoc BEFORE/AFTER snippets to `tpchQ9()`** — matching the style of `tpchQ3OrdersLineitem()`;
+  reference the DOT files (`q9_before.dot`, `q9_after.dot`).
 
 ### Medium Term
 
-- Add 2–3 more TPC-H queries exercising the outer pipeline substitution path.
+- **More TPC-H queries** — Q5, Q7, Q10 have similar multi-table join patterns; add tests
+  exercising the outer pipeline substitution path.
+- **`extractTestSource` cleanup** — `collectPipelines` in the test directly casts `join.getLeft()`
+  to `EnumerableSort` (line 518); add an `unwrap`-style guard in case a future Calcite version
+  wraps inputs differently.
 
 ### Long Term
 
-1. **PATH B: Native merged index support** — extend `PipelineToMergedIndexScanRule`
-   with a second operand pattern matching `EnumerableMergeJoin` over bare
-   `EnumerableTableScan` nodes that already carry the correct collation trait (no
-   explicit `EnumerableSort` needed when tables advertise collations via `getStatistic()`).
-   See "Architectural Note: Two Production Paths" above.
+1. **PATH B: Native merged index support** — add a second operand pattern to
+   `PipelineToMergedIndexScanRule` matching `EnumerableMergeJoin` over bare
+   `EnumerableTableScan` nodes that already carry the correct collation trait (no explicit
+   `EnumerableSort`). Requires modifying `TpchSchema` to report collations via
+   `getStatistic() → Statistics.of(n, keys, collations)`.
 
-2. **3-table Q3 merged index** — register a 3-table `MergedIndex` for
-   (CUSTOMER, ORDERS, LINEITEM) stored by custkey and write a test that replaces
-   the entire outer join pipeline in one substitution. Two sub-options:
-   (a) extend `PipelineToMergedIndexScanRule` to match a 3-table chain, or
-   (b) two sequential HEP passes (inner leaf first, then outer leaf).
+2. **Functional dependency metadata** — investigate `RelMdFunctionalDependencies` to
+   expose ORDERKEY→CUSTKEY automatically, enabling 3-table merged index recognition
+   without manual registration.
 
-3. **Functional dependency metadata** — investigate whether `RelMdFunctionalDependencies`
-   can expose ORDERKEY→CUSTKEY so the planner can recognize 3-table merged index
-   opportunities automatically rather than requiring manual registration.
+3. **JOB (Join Order Benchmark)** — representative JOB queries to show generalization
+   beyond TPC-H star schemas.
 
-4. **JOB (Join Order Benchmark)** — add tests for representative JOB queries to
-   show merged index substitution generalizes beyond TPC-H star schemas.
-
-5. **`implement()` stub** — `EnumerableMergedIndexScan.implement()` returns an empty
-   enumerable. A real implementation drives a sequential B-tree scan over interleaved
-   records and assembles join outputs and computes aggregations on-the-fly.
-   Explore feasibility to hook my leanstore repo here.
+4. **`implement()` stub** — `EnumerableMergedIndexScan.implement()` returns an empty
+   enumerable stub. A real implementation would drive a sequential B-tree scan over
+   interleaved records, assembling joins and aggregations on-the-fly.
+   Explore hooking into the LeanStore repo.

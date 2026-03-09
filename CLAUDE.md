@@ -147,6 +147,27 @@ The PARTSUPP condition must be written `ps_partkey = l_partkey AND ps_suppkey = 
 (partkey first) to match PARTSUPP's PK order and get the correct compound collation from
 `splitJoinCondition`.
 
+### Design Decisions
+
+**Join order in `tpchQ3OrdersLineitem`** — uses manually rewritten SQL to force
+ORDERS ⋈ LINEITEM as the leaf join (reverse of Q3). Calcite's Volcano planner preserves
+SQL join order because no join-reorder rules are registered; adding them would not
+reliably produce the desired order at scale 0.01. The manual rewrite is intentional
+test design, not a workaround.
+
+**Hierarchical vs. independent keys** — hierarchical merged indexes (§3.2) apply when
+join keys form a prefix chain (e.g., `(nationkey)` ⊂ `(nationkey, statekey)`). Q3-OL
+does **not** qualify: `o_orderkey` and `o_custkey` are independent global surrogates.
+Even though `o_orderkey → o_custkey` (FK), orderkey is NOT structured as
+`(custkey, local_id)`. Q3-OL therefore requires two separate merged indexes: inner
+(LINEITEM+ORDERS by orderkey), outer (inner_view+CUSTOMER by custkey). `MergedIndex
+.satisfies()` uses exact prefix matching; FD-based equivalence is future work.
+
+**Q9 two-tier plan** — the AFTER plan has a query tier (one `EnumerableMergedIndexJoin`
+backed by one scan) and a maintenance tier (the 5 intermediate joins, absorbed into the
+nested merged indexes at update time). `EnumerableFilter(p_name LIKE '%green%')` remains
+in the query tier because the PART filter cannot be pushed below the assembled join result.
+
 ## Key Files for the Merged Index Feature
 
 | File | Purpose |
