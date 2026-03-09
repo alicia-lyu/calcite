@@ -320,7 +320,9 @@ build a complete optimal plan from a single transformation rule.
 
 ## Session Discipline
 
-User instructions across the files are explicitly marked by `lwh` (my initials). It should be deleted once the instruction is executed. If a problem is encountered, follow up with your comment while keeping mine.
+User instructions across the files. Some are explicitly marked by `lwh` (my initials), some are not so just use your best judgment. They should be deleted once the instruction is executed. If a problem is encountered, follow up with your comment while keeping mine.
+
+Commit early and often with meaningful commit messages, not necessarily when a feature is fully implemented, not necessarily when the program is bug-free. Don't wait for my explicit request. After any fully implemented feature with all tests passed, it should be properly tagged, like a snapshot.
 
 At the end of every session (or whenever asked to wrap up / update notes):
 

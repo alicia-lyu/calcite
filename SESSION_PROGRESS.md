@@ -298,7 +298,7 @@ each dashed edge as an incremental-update rule triggered by base-table inserts/d
 
 ### Short Term (next session)
 
-All 5 tests pass. Focus on medium-term items below.
+1. The DOT output has the text in each cell without any line breaks, please add line breaks to make it more readable.
 
 #### Bugs fixed this session
 
