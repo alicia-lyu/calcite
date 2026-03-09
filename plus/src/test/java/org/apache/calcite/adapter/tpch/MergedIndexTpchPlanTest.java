@@ -684,28 +684,32 @@ class MergedIndexTpchPlanTest {
     System.out.println(beforeStr);
     writeDotFile("q9_before", phase1Plan);
 
-    // Dynamically find and register all leaf merge joins (Sort→Scan on both sides).
-    final List<EnumerableMergeJoin> leafJoins = findAllLeafMergeJoins(phase1Plan);
-    for (EnumerableMergeJoin lj : leafJoins) {
-      final EnumerableSort ls = (EnumerableSort) lj.getLeft();
-      final EnumerableSort rs = (EnumerableSort) lj.getRight();
-      final RelOptTable tl = ((EnumerableTableScan) ls.getInput()).getTable();
-      final RelOptTable tr = ((EnumerableTableScan) rs.getInput()).getTable();
-      final double rc = lj.estimateRowCount(lj.getCluster().getMetadataQuery());
-      MergedIndexRegistry.register(new MergedIndex(
-          List.of(tl, tr),
-          List.of(ls.getCollation(), rs.getCollation()),
-          ls.getCollation(), rc));
+    // Discover all 5 pipelines bottom-up (inner first) and register nested MergedIndexes.
+    final List<Pipeline> pipelines = findAllPipelines(phase1Plan);
+    assertThat("Expected 5 pipelines for Q9", pipelines.size(), is(5));
+    for (Pipeline p : pipelines) {
+      final List<Object> resolved = p.sources.stream()
+          .map(s -> s instanceof Pipeline ? ((Pipeline) s).mergedIndex : s)
+          .collect(Collectors.toList());
+      p.mergedIndex = MergedIndex.of(resolved, p.sourceCollations,
+          p.sharedCollation, p.rowCount);
+      MergedIndexRegistry.register(p.mergedIndex);
     }
 
-    // ── Phase 2: HEP planner fires PipelineToMergedIndexScanRule ──────────
-    final HepProgram hepProgram = HepProgram.builder()
+    // ── Phase 2: N HEP passes, one per pipeline level ─────────────────────
+    // Each pass replaces one level; a new planner instance is required because
+    // HEP cannot fire the same rule twice on a mutated plan in one pass.
+    final HepProgram hepPass = HepProgram.builder()
         .addRuleInstance(
             EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
         .build();
-    final HepPlanner hepPlanner = new HepPlanner(hepProgram);
-    hepPlanner.setRoot(phase1Plan);
-    final RelNode phase2Plan = hepPlanner.findBestExp();
+    RelNode current = phase1Plan;
+    for (int i = 0; i < pipelines.size(); i++) {
+      final HepPlanner hp = new HepPlanner(hepPass);
+      hp.setRoot(current);
+      current = hp.findBestExp();
+    }
+    final RelNode phase2Plan = current;
 
     final String afterStr = dumpText(phase2Plan);
     System.out.println("=== Q9 AFTER (merged index plan) ===");
@@ -713,11 +717,13 @@ class MergedIndexTpchPlanTest {
     writeDotFile("q9_after", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
+    // All pipeline joins and intermediate sorts must be gone.
+    assertThat(afterStr, not(containsString("EnumerableMergeJoin")));
+    // Only one EnumerableSort remains: the final ORDER BY n_name, o_year DESC.
+    // (Q9 has no LIMIT so Calcite uses a plain sort rather than EnumerableLimitSort.)
+    assertThat(countOccurrences(afterStr, "EnumerableSort("), is(1));
+    assertThat(afterStr, containsString("EnumerableMergedIndexJoin"));
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
-    // Each substituted leaf join pair removes 2 sorts; at least one substitution
-    final int sortsBefore = countOccurrences(beforeStr, "EnumerableSort");
-    final int sortsAfter  = countOccurrences(afterStr,  "EnumerableSort");
-    assertThat(sortsAfter, lessThan(sortsBefore));
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────

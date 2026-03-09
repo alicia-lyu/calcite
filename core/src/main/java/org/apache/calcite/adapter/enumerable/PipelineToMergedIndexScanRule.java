@@ -138,6 +138,9 @@ public class PipelineToMergedIndexScanRule
    *       and projects are maintenance-time and do not affect source identity)
    *   <li>{@code Sort → EnumerableMergedIndexScan} → returns
    *       {@link MergedIndex} (inner pipeline view)
+   *   <li>{@code Sort → EnumerableMergedIndexJoin → EnumerableMergedIndexScan} → returns
+   *       {@link MergedIndex} from the underlying scan (outer pipeline view, produced after
+   *       a prior HEP pass replaced an outer pipeline)
    * </ul>
    *
    * @param sortNode the sort node that is a direct input to the merge join
@@ -150,6 +153,14 @@ public class PipelineToMergedIndexScanRule
     final RelNode below = unwrap(((EnumerableSort) sortNode).getInput());
     if (below instanceof EnumerableMergedIndexScan) {
       return ((EnumerableMergedIndexScan) below).mergedIndex;
+    }
+    // Sort → EnumerableMergedIndexJoin → EnumerableMergedIndexScan:
+    // after an outer pipeline is replaced, its result appears as this pattern.
+    if (below instanceof EnumerableMergedIndexJoin) {
+      final RelNode scanNode = unwrap(((EnumerableMergedIndexJoin) below).getInput(0));
+      if (scanNode instanceof EnumerableMergedIndexScan) {
+        return ((EnumerableMergedIndexScan) scanNode).mergedIndex;
+      }
     }
     // Drill through any chain of single-input operators (aggregate, project, filter, etc.)
     // to reach a base-table scan. These intermediate operators are maintenance-time only.
