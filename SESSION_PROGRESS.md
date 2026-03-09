@@ -184,55 +184,26 @@ digraph G {
     MJ4      [label="Merge Semi Join: (partkey)", fillcolor="#cfe2ff"];
     SortSub2 [label="Sort: (suppkey, partkey)", penwidth=2];
     MJ_Final [label="Merge Join: (suppkey, partkey)\nn_name, o_year, amount", fillcolor="#cfe2ff", penwidth=2];
-    SortFinal [label="Sort: (nation, o_year)"];
-    Agg      [label="Groupby: (nation, o_year)\nSUM(amount)", fillcolor="#fff3cd"];
+    SortFinal [label="Sort: (nationkey, o_year)"];
+    Agg      [label="Groupby: (nationkey, n_name, o_year)\nSUM(amount)", fillcolor="#fff3cd"];
 
     ScanS  -> MJ1;  ScanPS -> SortPS -> MJ1;
-    MJ1    -> SortS -> MJ2;  ScanN -> MJ2;
+    MJ2;  ScanN -> MJ2;
     ScanO  -> MJ3;  ScanL -> MJ3;
     MJ3    -> SortL -> MJ4;  ScanP -> SelectP -> MJ4;
     MJ4    -> SortSub2;
-    MJ2    -> MJ_Final [headlabel="Sorted on\n(nk,sk,pk)"];
     SortSub2 -> MJ_Final;
-    MJ_Final -> SortFinal -> Agg;
+    MJ1 -> MJ_Final;
+    MJ_Final -> SortFinal -> MJ2;
+    MJ2 -> Agg;
 }
 ```
 
 ### Q9 With Merged Indexes (AFTER)
 
+CHANGE PENDING
 Each sort replaced by a merged index. Dashed arrows = update-time resort (maintenance).
 **At query time only `Agg` runs** (scanning `MgIdxGroup`); everything else is maintenance.
-
-```DOT
-digraph G {
-    rankdir=BT;
-    node [shape=rect, fontname="Helvetica,Arial,sans-serif", fontsize=12, style=filled, fillcolor="#f9f9f9"];
-    edge [fontname="Helvetica,Arial,sans-serif", fontsize=10];
-    label = "TPC-H Q9 — merged-index plan (dashed = update time)";
-    labelloc = "t";
-
-    MgIdxSPS  [label="MergedIdx: Supplier+PartSupp\n(suppkey,partkey)"];
-    MJ1       [label="Merge Join 1: (suppkey)\nps_supplycost", fillcolor="#cfe2ff"];
-    MgIdxOL   [label="MergedIdx: Orders+Lineitem\n(orderkey)"];
-    MJ3       [label="Merge Join 3: (orderkey)\nl_extendedprice,l_discount,l_quantity,o_year", fillcolor="#cfe2ff"];
-    MgIdxPOL  [label="MergedIdx: Part+MJ3 Result\n(partkey,suppkey,orderkey)"];
-    MJ4       [label="Merge Semi Join 4: (partkey)\nFilter: LIKE '%[COLOR]%'", fillcolor="#cfe2ff"];
-    MgIdxAll  [label="MergedIdx: Nation+MJ1 Result+MJ4 Result\n(nationkey,suppkey,partkey)"];
-    MJ_Final  [label="Merge Join 5: (suppkey,partkey)\nn_name,o_year,amount", fillcolor="#cfe2ff", penwidth=2];
-    MgIdxGroup [label="MergedIdx: MJ5 Result\n(nation,o_year)"];
-    Agg       [label="Groupby: (nation,o_year)\nSUM(amount)", fillcolor="#fff3cd"];
-
-    MgIdxSPS -> MJ1;
-    MJ1      -> MgIdxAll  [style=dashed, label="resort by (nk,sk,pk)"];
-    MgIdxOL  -> MJ3;
-    MJ3      -> MgIdxPOL  [style=dashed, label="resort by (pk,sk)"];
-    MgIdxPOL -> MJ4;
-    MJ4      -> MgIdxAll  [style=dashed, label="resort by (sk,pk,ok)"];
-    MgIdxAll -> MJ_Final;
-    MJ_Final -> MgIdxGroup [style=dashed, label="resort by (nation,o_year)"];
-    MgIdxGroup -> Agg;
-}
-```
 
 ---
 
@@ -298,7 +269,6 @@ each dashed edge as an incremental-update rule triggered by base-table inserts/d
 
 ### Short Term (next session)
 
-1. Save a separate DOT file for each query before and after, for cleaner visualization (use fewer texts, more colors) for presentations.
 
 ### Medium Term
 
