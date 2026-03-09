@@ -151,59 +151,7 @@ At query time:                               At update time (like a B-tree):
 
 ## Q9 Reference Plans
 
-These represent the target ideal plans for TPC-H Q9, not necessarily what Calcite
-currently produces (the planner picks its own join order and cost-based choices).
-Paste into <https://dreampuf.github.io/GraphvizOnline/> to visualize.
-
-### Q9 Ideal Order-Based Plan (BEFORE merged indexes)
-
-Two independent merge-join pipelines joined at the end on (suppkey, partkey):
-
-```DOT
-digraph G {
-    rankdir=BT;
-    node [shape=rect, fontname="Helvetica,Arial,sans-serif", fontsize=12, style=filled, fillcolor="#f9f9f9"];
-    edge [fontname="Helvetica,Arial,sans-serif", fontsize=10];
-    label = "TPC-H Q9 — ideal order-based plan";
-    labelloc = "t";
-
-    ScanN   [label="Scan: Nation",   shape=folder, fillcolor="#e2e3e5"];
-    ScanS   [label="Scan: Supplier", shape=folder, fillcolor="#e2e3e5"];
-    ScanPS  [label="Scan: PartSupp", shape=folder, fillcolor="#e2e3e5"];
-    ScanO   [label="Scan: Orders",   shape=folder, fillcolor="#e2e3e5"];
-    ScanL   [label="Scan: Lineitem", shape=folder, fillcolor="#e2e3e5"];
-    ScanP   [label="Scan: Part",     shape=folder, fillcolor="#e2e3e5"];
-
-    SortPS   [label="Sort: (suppkey)"];
-    MJ1      [label="Merge Join: (suppkey)",   fillcolor="#cfe2ff"];
-    SortS    [label="Sort: (nationkey)"];
-    MJ2      [label="Merge Join: (nationkey)", fillcolor="#cfe2ff"];
-    MJ3      [label="Merge Join: (orderkey)\nextract(year from o_orderdate) as o_year", fillcolor="#cfe2ff"];
-    SortL    [label="Sort: (partkey)"];
-    SelectP  [label="Filter: p_name LIKE '%[COLOR]%'", fillcolor="#f8d7da"];
-    MJ4      [label="Merge Semi Join: (partkey)", fillcolor="#cfe2ff"];
-    SortSub2 [label="Sort: (suppkey, partkey)", penwidth=2];
-    MJ_Final [label="Merge Join: (suppkey, partkey)\nn_name, o_year, amount", fillcolor="#cfe2ff", penwidth=2];
-    SortFinal [label="Sort: (nationkey, o_year)"];
-    Agg      [label="Groupby: (nationkey, n_name, o_year)\nSUM(amount)", fillcolor="#fff3cd"];
-
-    ScanS  -> MJ1;  ScanPS -> SortPS -> MJ1;
-    MJ2;  ScanN -> MJ2;
-    ScanO  -> MJ3;  ScanL -> MJ3;
-    MJ3    -> SortL -> MJ4;  ScanP -> SelectP -> MJ4;
-    MJ4    -> SortSub2;
-    SortSub2 -> MJ_Final;
-    MJ1 -> MJ_Final;
-    MJ_Final -> SortFinal -> MJ2;
-    MJ2 -> Agg;
-}
-```
-
-### Q9 With Merged Indexes (AFTER)
-
-CHANGE PENDING
-Each sort replaced by a merged index. Dashed arrows = update-time resort (maintenance).
-**At query time only `Agg` runs** (scanning `MgIdxGroup`); everything else is maintenance.
+CHANGES PENDING, refer to MergedIndexTpchPlanTest.java for up-to-date plans.
 
 ---
 
