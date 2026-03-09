@@ -566,7 +566,42 @@ class MergedIndexTpchPlanTest {
     return null;
   }
 
-  /**
+  /** IDEAL BEFORE plan
+   * digraph G {
+    rankdir=BT;
+    node [shape=rect, fontname="Helvetica,Arial,sans-serif", fontsize=12, style=filled, fillcolor="#f9f9f9"];
+    edge [fontname="Helvetica,Arial,sans-serif", fontsize=10];
+    label = "TPC-H Q9 — ideal order-based plan";
+    labelloc = "t";
+
+    ScanN   [label="Scan: Nation",   shape=folder, fillcolor="#e2e3e5"];
+    ScanS   [label="Scan: Supplier", shape=folder, fillcolor="#e2e3e5"];
+    ScanPS  [label="Scan: PartSupp", shape=folder, fillcolor="#e2e3e5"];
+    ScanO   [label="Scan: Orders",   shape=folder, fillcolor="#e2e3e5"];
+    ScanL   [label="Scan: Lineitem", shape=folder, fillcolor="#e2e3e5"];
+    ScanP   [label="Scan: Part",     shape=folder, fillcolor="#e2e3e5"];
+
+    MJ2      [label="Merge Join: (nationkey)", fillcolor="#cfe2ff"];
+    MJ3      [label="Merge Join: (orderkey)\nextract(year from o_orderdate) as o_year", fillcolor="#cfe2ff"];
+    SortL    [label="Sort: (partkey, suppkey)"];
+    SelectP  [label="Filter: p_name LIKE '%[COLOR]%'", fillcolor="#f8d7da"];
+    MJ4      [label="Merge Semi Join: (partkey)", fillcolor="#cfe2ff"];
+    MJ_Final [label="Merge Join: (partkey, suppkey)\nn_name, o_year, amount", fillcolor="#cfe2ff"];
+    Sort_MJonS [label="Sort: (suppkey)"];
+    MJ_addsup [label="Merge Join: (suppkey)", fillcolor="#cfe2ff"];
+    SortFinal [label="Sort: (nationkey, o_year)"];
+    Agg      [label="Groupby: (nationkey, n_name, o_year)\nSUM(amount)", fillcolor="#fff3cd"];
+
+    ScanS  -> MJ_addsup;  
+    ScanPS -> MJ_Final;
+    MJ2;  ScanN -> MJ2;
+    ScanO  -> MJ3;  ScanL -> MJ3;
+    MJ3    -> SortL -> MJ4;  ScanP -> SelectP -> MJ4;
+    MJ4    -> MJ_Final;
+    MJ_addsup -> SortFinal -> MJ2;
+    MJ_Final -> Sort_MJonS -> MJ_addsup;
+    MJ2 -> Agg;
+}
    * <h3>Ideal AFTER structure (merged indexes substituted)</h3>
    * <pre>
    *       Only Sort(nation,o_year) → Aggregate(nation,o_year) appear in the query plan, with the sort replaced by the indexed join view produced by the last merge join.
@@ -592,25 +627,24 @@ class MergedIndexTpchPlanTest {
     //     + " WHERE p.p_name LIKE '%green%'"
     //     + " GROUP BY n.n_name, EXTRACT(YEAR FROM o.o_orderdate)"
     //     + " ORDER BY n.n_name, o_year DESC";
-    // Rewrite SQL query to order joins
-        final String sql = "
-        WITH filtered_ol AS (
-        SELECT l.l_orderkey, l.l_suppkey, l.l_partkey,
-               EXTRACT(YEAR FROM o.o_orderdate) AS o_year,
-               SUM(l.l_extendedprice * (1 - l.l_discount)
-               - ps.ps_supplycost * l.l_quantity) AS sum_profit
-        FROM tpch.orders o JOIN tpch.lineitem l ON o.o_orderkey = l.l_orderkey" + // first join OL because the subsequent steps will destroy the order on orderkey
-        "   JOIN tpch.part ON p.p_partkey = l.l_partkey" // then reduces the number of rows early on
-        +"  JOIN tpch.partsupp ps ON ps.ps_suppkey = l.l_suppkey AND ps.ps_partkey = l.l_partkey
-        WHERE p.p_name LIKE '%green%'
-        ) SELECT n.n_name AS nation, o_year, SUM(sum_profit) AS sum_profit
-        FROM filtered_ol JOIN tpch.supplier s ON filtered_ol.l_suppkey = s.s_suppkey" // first join with supplier because filtered_ol is sorted on partkey, suppkey. Resort is cheaper.
-        + "
-        JOIN tpch.nation n ON s.s_nationkey = n.n_nationkey" // The final join result is sorted on (nationkey, suppkey, partkey, orderkey)
-        + "
-        GROUP BY n.n_name, o_year
-        ORDER BY n.n_name, o_year DESC
-        ";
+    // Rewrite SQL with explicit join order to maximize interesting-ordering pipeline reuse:
+    // ORDERS ⋈ LINEITEM (orderkey) → PART (partkey, filter early) → PARTSUPP (partkey,suppkey)
+    // → SUPPLIER (suppkey prefix reused) → NATION (nationkey).
+    // This left-deep tree lets injectSortsBeforeJoin inject the minimum number of sorts.
+    final String sql = "SELECT n.n_name AS nation,"
+        + " EXTRACT(YEAR FROM o.o_orderdate) AS o_year,"
+        + " SUM(l.l_extendedprice * (1 - l.l_discount)"
+        + "   - ps.ps_supplycost * l.l_quantity) AS sum_profit"
+        + " FROM tpch.orders o"
+        + " JOIN tpch.lineitem l ON o.o_orderkey = l.l_orderkey"
+        + " JOIN tpch.part p ON p.p_partkey = l.l_partkey"
+        + " JOIN tpch.partsupp ps ON ps.ps_partkey = l.l_partkey"
+        + "   AND ps.ps_suppkey = l.l_suppkey"
+        + " JOIN tpch.supplier s ON s.s_suppkey = l.l_suppkey"
+        + " JOIN tpch.nation n ON s.s_nationkey = n.n_nationkey"
+        + " WHERE p.p_name LIKE '%green%'"
+        + " GROUP BY n.n_name, EXTRACT(YEAR FROM o.o_orderdate)"
+        + " ORDER BY n.n_name, o_year DESC";
 
     final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
     rootSchema.add("TPCH", new TpchSchema(0.01, 0, 1, false));

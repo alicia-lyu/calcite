@@ -116,6 +116,37 @@ recognizes the functional dependency.
   3-table `MergedIndex` and extending `PipelineToMergedIndexScanRule` to match
   3-table pipelines (Sort→MergeJoin(Sort→Scan, Sort→Scan) pattern).
 
+### Q9 Interesting Ordering Constraints
+
+Original TPC-H Q9 uses 5 distinct join keys over 6 tables:
+
+| Join | Key |
+|------|-----|
+| LINEITEM ⋈ ORDERS | `l_orderkey = o_orderkey` |
+| LINEITEM ⋈ PARTSUPP | `l_partkey = ps_partkey AND l_suppkey = ps_suppkey` (compound) |
+| LINEITEM ⋈ SUPPLIER | `l_suppkey = s_suppkey` |
+| SUPPLIER ⋈ NATION | `s_nationkey = n_nationkey` |
+| LINEITEM ⋈ PART | `l_partkey = p_partkey` |
+
+These keys form at most **two partial interesting-ordering chains**:
+1. `orderkey` → ORDERS ⋈ LINEITEM (one leaf merged index)
+2. `(partkey, suppkey)` → PARTSUPP; `suppkey` prefix → SUPPLIER (chain; nationkey needs a fresh sort)
+
+PART always requires its own sort on `partkey` — an unavoidable disruption because partkey
+conflicts with both the orderkey and suppkey chains.
+
+**Rewritten join order** in the test (`tpchQ9`) minimizes extra sorts by fixing a
+left-deep tree: ORDERS ⋈ LINEITEM → PART → PARTSUPP → SUPPLIER → NATION.
+- `injectSortsBeforeJoin` injects Sort(orderkey) at the leaf → **one merged index** (ORDERS, LINEITEM)
+- Sort(partkey) before PART (semi-join filter applied early)
+- Sort(partkey, suppkey) before PARTSUPP — matches PARTSUPP PK `(partkey, suppkey)`
+- Sort(suppkey) before SUPPLIER — (partkey, suppkey) prefix does NOT give suppkey alone, so re-sort needed
+- Sort(nationkey) before NATION
+
+The PARTSUPP condition must be written `ps_partkey = l_partkey AND ps_suppkey = l_suppkey`
+(partkey first) to match PARTSUPP's PK order and get the correct compound collation from
+`splitJoinCondition`.
+
 ## Key Files for the Merged Index Feature
 
 | File | Purpose |
