@@ -873,12 +873,23 @@ class MergedIndexTpchPlanTest {
     }
     final int id = counter[0]++;
     ids.put(node, id);
-    // Use the first line of the text explain for a concise label.
+    // Use the first line of the text explain, broken into multiple lines for readability.
     final String explain = RelOptUtil.dumpPlan("", node,
         SqlExplainFormat.TEXT, SqlExplainLevel.EXPPLAN_ATTRIBUTES).trim();
     final String firstLine = explain.lines().findFirst()
         .orElse(node.getClass().getSimpleName()).trim();
-    final String label = firstLine.replace("\"", "'");
+    // Split "ClassName(attr1=[...], attr2=[...])" into one line per attribute.
+    final String label;
+    final int parenIdx = firstLine.indexOf('(');
+    if (parenIdx >= 0 && firstLine.endsWith(")")) {
+      final String cls = firstLine.substring(0, parenIdx);
+      final String inner = firstLine.substring(parenIdx + 1, firstLine.length() - 1);
+      // Split on "], " (between bracketed attributes) and on ", [" (between table entries).
+      final String attrs = inner.replace("], ", "]\\n").replace(", [", "\\n[");
+      label = (cls + "\\n" + attrs).replace("\"", "'");
+    } else {
+      label = firstLine.replace("\"", "'");
+    }
     sb.append("  n").append(id).append(" [label=\"").append(label).append("\"];\n");
     final List<RelNode> inputs = node.getInputs();
     for (int i = 0; i < inputs.size(); i++) {
