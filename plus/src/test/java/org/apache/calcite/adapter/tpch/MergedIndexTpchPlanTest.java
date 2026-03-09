@@ -567,58 +567,12 @@ class MergedIndexTpchPlanTest {
   }
 
   /**
-   * TPC-H Q9 (color = 'green'): 6-table join with merged-index substitution
-   * at each leaf join pair detected dynamically in the Phase 1 plan.
-   *
-   * <p>After Phase 2, each {@code Sort+Sort+MergeJoin} leaf triple is replaced
-   * by a single {@code EnumerableMergedIndexScan}, reducing the total number of
-   * {@code EnumerableSort} nodes in the plan.
-   *
-   * digraph G {
-    rankdir=BT;
-    node [shape=rect, fontname="Helvetica,Arial,sans-serif", fontsize=12, style=filled, fillcolor="#f9f9f9"];
-    edge [fontname="Helvetica,Arial,sans-serif", fontsize=10];
-    label = "TPC-H Q9 — ideal order-based plan";
-    labelloc = "t";
-
-    ScanN   [label="Scan: Nation",   shape=folder, fillcolor="#e2e3e5"];
-    ScanS   [label="Scan: Supplier", shape=folder, fillcolor="#e2e3e5"];
-    ScanPS  [label="Scan: PartSupp", shape=folder, fillcolor="#e2e3e5"];
-    ScanO   [label="Scan: Orders",   shape=folder, fillcolor="#e2e3e5"];
-    ScanL   [label="Scan: Lineitem", shape=folder, fillcolor="#e2e3e5"];
-    ScanP   [label="Scan: Part",     shape=folder, fillcolor="#e2e3e5"];
-
-    SortPS   [label="Sort: (suppkey)"];
-    MJ1      [label="Merge Join: (suppkey)",   fillcolor="#cfe2ff"];
-    MJ2      [label="Merge Join: (nationkey)", fillcolor="#cfe2ff"];
-    MJ3      [label="Merge Join: (orderkey)\nextract(year from o_orderdate) as o_year", fillcolor="#cfe2ff"];
-    SortL    [label="Sort: (partkey)"];
-    SelectP  [label="Filter: p_name LIKE '%[COLOR]%'", fillcolor="#f8d7da"];
-    MJ4      [label="Merge Semi Join: (partkey)", fillcolor="#cfe2ff"];
-    SortSub2 [label="Sort: (suppkey, partkey)", penwidth=2];
-    MJ_Final [label="Merge Join: (suppkey, partkey)\nn_name, o_year, amount", fillcolor="#cfe2ff", penwidth=2];
-    SortFinal [label="Sort: (nationkey, o_year)"];
-    Agg      [label="Groupby: (nationkey, n_name, o_year)\nSUM(amount)", fillcolor="#fff3cd"];
-
-    ScanS  -> MJ1;  ScanPS -> SortPS -> MJ1;
-    MJ2;  ScanN -> MJ2;
-    ScanO  -> MJ3;  ScanL -> MJ3;
-    MJ3    -> SortL -> MJ4;  ScanP -> SelectP -> MJ4;
-    MJ4    -> SortSub2;
-    SortSub2 -> MJ_Final;
-    MJ1 -> MJ_Final;
-    MJ_Final -> SortFinal -> MJ2;
-    MJ2 -> Agg;
-}
-   *
    * <h3>Ideal AFTER structure (merged indexes substituted)</h3>
    * <pre>
    *       Only Sort(nation,o_year) → Aggregate(nation,o_year) appear in the query plan, with the sort replaced by the indexed join view produced by the last merge join.
    *
    * </pre>
    *
-   * <p>Full DOT diagrams for the ideal plans are in {@code SESSION_PROGRESS.md}
-   * under "Q9 Reference Plans".
    */
   @Test void tpchQ9() throws Exception {
     // Use explicit JOIN ... ON ... syntax so all join conditions are equi-joins
