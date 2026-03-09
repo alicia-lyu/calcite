@@ -322,7 +322,8 @@ build a complete optimal plan from a single transformation rule.
 
 User instructions across the files. Some are explicitly marked by `lwh` (my initials), some are not so just use your best judgment. They should be deleted once the instruction is executed. If a problem is encountered, follow up with your comment while keeping mine.
 
-Commit early and often with meaningful commit messages, not necessarily when a feature is fully implemented, not necessarily when the program is bug-free. Don't wait for my explicit request. After any fully implemented feature with all tests passed, it should be properly tagged, like a snapshot.
+Commit early and often with meaningful commit messages, not necessarily when a feature is fully implemented, not necessarily when the program is bug-free. Don't wait for my explicit request. Minor changes by me can also be staged and commited along with your changes, they are usually new notes for you.
+After any fully implemented feature with all tests passed, it should be properly tagged, like a snapshot.
 
 At the end of every session (or whenever asked to wrap up / update notes):
 

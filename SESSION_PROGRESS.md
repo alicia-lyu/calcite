@@ -298,25 +298,7 @@ each dashed edge as an incremental-update rule triggered by base-table inserts/d
 
 ### Short Term (next session)
 
-1. The DOT output has the text in each cell without any line breaks, please add line breaks to make it more readable.
-
-#### Bugs fixed this session
-
-**Bug: `tpchQ3OrdersLineitem` NPE in `MergedIndex.of()`**
-`findAllPipelines` returned `new ArrayList<>(byJoin.values())` where
-`IdentityHashMap.values()` has no guaranteed order. Outer pipeline was
-processed before inner pipeline's `mergedIndex` was set → `null` in
-`resolved` → NPE at `ImmutableList.Builder.add()`.
-Fix (`MergedIndexTpchPlanTest`): pass `List<Pipeline> ordered` into
-`collectPipelines` and `ordered.add(p)` immediately after creation;
-return `ordered` (post-order insertion = inner before outer).
-
-**Bug: `tpchQ3OrdersLineitem` fails only in parallel suite run**
-`MergedIndexRegistry` is a static singleton; qualified-name matching in
-`sourcesMatch` means Q9's `(ORDERS, LINEITEM)` entry is found by Q3OL's
-inner HEP pass when tests run concurrently. Scan then carries Q9's
-`MergedIndex` object; identity-based outer lookup fails → outer join not replaced.
-Fix (`MergedIndexTpchPlanTest`): `@Execution(ExecutionMode.SAME_THREAD)`.
+1. Save a separate DOT file for each query before and after, for cleaner visualization (use fewer texts, more colors) for presentations.
 
 ### Medium Term
 
