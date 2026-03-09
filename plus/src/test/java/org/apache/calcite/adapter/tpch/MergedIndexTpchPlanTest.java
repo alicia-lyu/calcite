@@ -828,20 +828,27 @@ class MergedIndexTpchPlanTest {
   }
 
   /**
-   * Writes a Graphviz DOT plan to {@code test-dot-output/<name>.dot}, relative
-   * to the Gradle test working directory ({@code plus/test-dot-output/}).
-   * Open with the VSCode Graphviz extension for visual plan inspection.
+   * Writes two Graphviz DOT plan files to {@code test-dot-output/}:
+   * <ul>
+   *   <li>{@code <name>.dot} — plain format: full first-line explain label, no colors.
+   *   <li>{@code <name>_color.dot} — presentation format: color-coded nodes with
+   *       shortened labels using actual column names instead of {@code $N} indices.
+   * </ul>
    */
   private static void writeDotFile(String name, RelNode rel) {
-    final String dot = dumpDot(rel);
+    writeDotToFile(name + ".dot", dumpDot(rel));
+    writeDotToFile(name + "_color.dot", dumpDotColor(rel));
+  }
+
+  private static void writeDotToFile(String filename, String content) {
     final java.nio.file.Path dir = java.nio.file.Paths.get("test-dot-output");
     try {
       java.nio.file.Files.createDirectories(dir);
-      final java.nio.file.Path file = dir.resolve(name + ".dot");
-      java.nio.file.Files.writeString(file, dot);
+      final java.nio.file.Path file = dir.resolve(filename);
+      java.nio.file.Files.writeString(file, content);
       System.out.println("DOT written → " + file.toAbsolutePath());
     } catch (java.io.IOException e) {
-      System.err.println("Failed to write DOT file " + name + ": " + e.getMessage());
+      System.err.println("Failed to write DOT file " + filename + ": " + e.getMessage());
     }
   }
 
@@ -851,13 +858,46 @@ class MergedIndexTpchPlanTest {
   }
 
   /**
-   * Generates a Graphviz DOT representation of the plan tree where every node
-   * gets a unique integer ID (based on object identity). This prevents visually
-   * identical nodes — e.g., multiple {@code EnumerableSort(sort0=$0, dir0=ASC)}
-   * siblings — from being merged into a single DOT node, which is what happens
-   * when Calcite's built-in DOT serializer uses the label string as the node ID.
+   * Plain DOT: each node gets its full first-line explain label and no color.
+   * Every node has a unique integer ID so visually identical siblings
+   * (e.g., two {@code EnumerableSort(sort0=[$0])} nodes) are never merged.
+   */
+  private static String dumpDot(RelNode root) {
+    final StringBuilder sb = new StringBuilder("digraph {\n  rankdir=BT;\n");
+    final java.util.IdentityHashMap<RelNode, Integer> ids = new java.util.IdentityHashMap<>();
+    final int[] counter = {0};
+    dumpDotNode(root, sb, ids, counter);
+    sb.append("}\n");
+    return sb.toString();
+  }
+
+  private static int dumpDotNode(RelNode node, StringBuilder sb,
+      java.util.IdentityHashMap<RelNode, Integer> ids, int[] counter) {
+    if (ids.containsKey(node)) {
+      return ids.get(node);
+    }
+    final int id = counter[0]++;
+    ids.put(node, id);
+    final String explain = RelOptUtil.dumpPlan("", node,
+        SqlExplainFormat.TEXT, SqlExplainLevel.EXPPLAN_ATTRIBUTES).trim();
+    final String label = explain.lines().findFirst()
+        .orElse(node.getClass().getSimpleName()).trim().replace("\"", "'");
+    sb.append("  n").append(id).append(" [label=\"").append(label).append("\"];\n");
+    final List<RelNode> inputs = node.getInputs();
+    for (int i = 0; i < inputs.size(); i++) {
+      final int childId = dumpDotNode(inputs.get(i), sb, ids, counter);
+      sb.append("  n").append(childId).append(" -> n").append(id)
+          .append(" [label=\"").append(i).append("\"];\n");
+    }
+    return id;
+  }
+
+  /**
+   * Colorful DOT: nodes are color-coded by operator type and labeled with
+   * short, human-readable names — actual column names instead of {@code $N}
+   * field-index references, and without the {@code Enumerable} prefix.
    *
-   * <p>Nodes are color-coded by operator type for presentation clarity:
+   * <p>Color legend:
    * <ul>
    *   <li>MergedIndexScan — light green (#90EE90)
    *   <li>MergedIndexJoin — lime green (#32CD32)
@@ -869,17 +909,17 @@ class MergedIndexTpchPlanTest {
    *   <li>Filter — peach (#FFDAB9)
    * </ul>
    */
-  private static String dumpDot(RelNode root) {
+  private static String dumpDotColor(RelNode root) {
     final StringBuilder sb = new StringBuilder(
         "digraph {\n  rankdir=BT;\n  node [fontname=\"Helvetica\"];\n");
     final java.util.IdentityHashMap<RelNode, Integer> ids = new java.util.IdentityHashMap<>();
     final int[] counter = {0};
-    dumpDotNode(root, sb, ids, counter);
+    dumpDotColorNode(root, sb, ids, counter);
     sb.append("}\n");
     return sb.toString();
   }
 
-  private static int dumpDotNode(RelNode node, StringBuilder sb,
+  private static int dumpDotColorNode(RelNode node, StringBuilder sb,
       java.util.IdentityHashMap<RelNode, Integer> ids, int[] counter) {
     if (ids.containsKey(node)) {
       return ids.get(node);
@@ -898,7 +938,7 @@ class MergedIndexTpchPlanTest {
         .append("];\n");
     final List<RelNode> inputs = node.getInputs();
     for (int i = 0; i < inputs.size(); i++) {
-      final int childId = dumpDotNode(inputs.get(i), sb, ids, counter);
+      final int childId = dumpDotColorNode(inputs.get(i), sb, ids, counter);
       sb.append("  n").append(childId).append(" -> n").append(id)
           .append(" [label=\"").append(i).append("\"];\n");
     }
@@ -906,16 +946,15 @@ class MergedIndexTpchPlanTest {
   }
 
   /**
-   * Returns a short, presentation-friendly DOT label for a plan node.
+   * Returns a short, presentation-friendly label for a colorful DOT node.
    *
-   * <p>Strips the "Enumerable" prefix from the class name. Shows only the
-   * most meaningful attribute per operator type; omits internal Calcite
-   * field-index noise ({@code $0}, {@code $4}, etc.) where possible.
+   * <p>Strips the {@code Enumerable} prefix. Resolves {@code $N} field-index
+   * references to actual column names using the node's input row type.
+   * Drops internal attributes like {@code sort0=}, {@code dir0=}, {@code joinType=}.
    */
   private static String nodeLabel(RelNode node, String firstLine) {
     final int parenIdx = firstLine.indexOf('(');
     final String fullCls = parenIdx >= 0 ? firstLine.substring(0, parenIdx) : firstLine;
-    // Strip "Enumerable" prefix for brevity in presentation diagrams.
     final String cls = fullCls.startsWith("Enumerable")
         ? fullCls.substring("Enumerable".length()) : fullCls;
     if (parenIdx < 0 || !firstLine.endsWith(")")) {
@@ -923,46 +962,93 @@ class MergedIndexTpchPlanTest {
     }
     final String inner = firstLine.substring(parenIdx + 1, firstLine.length() - 1);
 
+    // TableScan: show only the table name (last element of the qualified name).
     if (fullCls.contains("TableScan")) {
-      // table=[[TPCH, ORDERS]] → show only the last qualifier (table name)
       final int lb = inner.lastIndexOf(", ");
       final String name = (lb >= 0 ? inner.substring(lb + 2) : inner)
           .replace("[", "").replace("]", "");
       return (cls + "\\n" + name).replace("\"", "'");
     }
-    if (fullCls.contains("MergedIndexScan") || fullCls.contains("MergedIndexJoin")) {
-      // Show tables/sources; strip trailing collation attribute.
+
+    // MergedIndexScan / MergedIndexJoin: show table list, drop collation attribute.
+    if (fullCls.contains("MergedIndex")) {
       final int collationIdx = inner.indexOf(", collation");
       final String tables = collationIdx >= 0 ? inner.substring(0, collationIdx) : inner;
       final String attrs = tables.replace("], ", "]\\n").replace(", [", "\\n[");
       return (cls + "\\n" + attrs).replace("\"", "'");
     }
-    if (fullCls.contains("MergeJoin")) {
-      // Show only the join condition (drop joinType).
-      final int cond = inner.indexOf("condition=[");
-      final int condEnd = inner.indexOf("]", cond);
-      if (cond >= 0 && condEnd >= 0) {
-        return (cls + "\\n" + inner.substring(cond, condEnd + 1)).replace("\"", "'");
+
+    // MergeJoin: resolve join keys to "LEFT_COL = RIGHT_COL" using splitJoinCondition.
+    if (node instanceof EnumerableMergeJoin) {
+      final EnumerableMergeJoin mj = (EnumerableMergeJoin) node;
+      final List<Integer> lk = new ArrayList<>();
+      final List<Integer> rk = new ArrayList<>();
+      RelOptUtil.splitJoinCondition(mj.getLeft(), mj.getRight(),
+          mj.getCondition(), lk, rk, new ArrayList<>());
+      final List<org.apache.calcite.rel.type.RelDataTypeField> lf =
+          mj.getLeft().getRowType().getFieldList();
+      final List<org.apache.calcite.rel.type.RelDataTypeField> rf =
+          mj.getRight().getRowType().getFieldList();
+      final StringBuilder cond = new StringBuilder();
+      for (int i = 0; i < lk.size(); i++) {
+        if (i > 0) {
+          cond.append("\\n");
+        }
+        cond.append(lk.get(i) < lf.size() ? lf.get(lk.get(i)).getName() : "$" + lk.get(i));
+        cond.append(" = ");
+        cond.append(rk.get(i) < rf.size() ? rf.get(rk.get(i)).getName() : "$" + rk.get(i));
+      }
+      return (cls + "\\n" + cond).replace("\"", "'");
+    }
+
+    // Sort / LimitSort: resolve sort fields to "COL_NAME ASC/DESC", one per line.
+    if (node instanceof org.apache.calcite.rel.core.Sort
+        && !node.getInputs().isEmpty()) {
+      final org.apache.calcite.rel.core.Sort sort =
+          (org.apache.calcite.rel.core.Sort) node;
+      final List<org.apache.calcite.rel.type.RelDataTypeField> fields =
+          node.getInputs().get(0).getRowType().getFieldList();
+      final String keys = sort.getCollation().getFieldCollations().stream()
+          .map(fc -> {
+            final String fname = fc.getFieldIndex() < fields.size()
+                ? fields.get(fc.getFieldIndex()).getName() : "$" + fc.getFieldIndex();
+            final String dir =
+                fc.getDirection() == RelFieldCollation.Direction.DESCENDING ? " DESC" : " ASC";
+            return fname + dir;
+          })
+          .collect(Collectors.joining("\\n"));
+      final String fetchStr = sort.fetch != null ? "\\nLIMIT " + sort.fetch : "";
+      return (cls + "\\n" + keys + fetchStr).replace("\"", "'");
+    }
+
+    // Aggregate / SortedAggregate: resolve group-by indices to column names.
+    if (fullCls.contains("Aggregate") && !node.getInputs().isEmpty()) {
+      final List<org.apache.calcite.rel.type.RelDataTypeField> fields =
+          node.getInputs().get(0).getRowType().getFieldList();
+      final int grpStart = inner.indexOf("group=[{");
+      final int grpEnd = grpStart >= 0 ? inner.indexOf("}]", grpStart) : -1;
+      if (grpStart >= 0 && grpEnd >= 0) {
+        final String body = inner.substring(grpStart + "group=[{".length(), grpEnd).trim();
+        final String resolved = body.isEmpty() ? "(none)"
+            : java.util.Arrays.stream(body.split(",\\s*"))
+                .map(s -> {
+                  try {
+                    final int idx = Integer.parseInt(s.trim());
+                    return idx < fields.size() ? fields.get(idx).getName() : "$" + idx;
+                  } catch (NumberFormatException e) {
+                    return s.trim();
+                  }
+                })
+                .collect(Collectors.joining(", "));
+        return (cls + "\\ngroup: " + resolved).replace("\"", "'");
       }
     }
-    if (fullCls.contains("Sort")) {
-      // Show sort keys one per line; drop dir lines for brevity.
-      final String keys = inner.replace("], ", "]\\n").replace(", [", "\\n[");
-      return (cls + "\\n" + keys).replace("\"", "'");
-    }
-    if (fullCls.contains("Aggregate")) {
-      // Show only the group-by key.
-      final int grp = inner.indexOf("group=[");
-      final int grpEnd = inner.indexOf("]", grp);
-      if (grp >= 0 && grpEnd >= 0) {
-        return (cls + "\\n" + inner.substring(grp, grpEnd + 1)).replace("\"", "'");
-      }
-    }
-    // Default: just the short class name; no attributes (e.g. Project, Filter).
+
+    // Default: just the short class name (Project, Filter, etc.).
     return cls.replace("\"", "'");
   }
 
-  /** Returns a fill color for the DOT node based on operator type. */
+  /** Returns a fill color for the colorful DOT node based on operator type. */
   private static String nodeColor(RelNode node) {
     final String cls = node.getClass().getSimpleName();
     if (cls.contains("MergedIndexScan")) return "#90EE90"; // light green
