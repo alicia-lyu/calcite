@@ -856,9 +856,22 @@ class MergedIndexTpchPlanTest {
    * identical nodes — e.g., multiple {@code EnumerableSort(sort0=$0, dir0=ASC)}
    * siblings — from being merged into a single DOT node, which is what happens
    * when Calcite's built-in DOT serializer uses the label string as the node ID.
+   *
+   * <p>Nodes are color-coded by operator type for presentation clarity:
+   * <ul>
+   *   <li>MergedIndexScan — light green (#90EE90)
+   *   <li>MergedIndexJoin — lime green (#32CD32)
+   *   <li>MergeJoin — gold (#FFD700)
+   *   <li>Sort / LimitSort — light salmon (#FFA07A)
+   *   <li>TableScan — light blue (#ADD8E6)
+   *   <li>Aggregate — plum (#DDA0DD)
+   *   <li>Project — light gray (#D3D3D3)
+   *   <li>Filter — peach (#FFDAB9)
+   * </ul>
    */
   private static String dumpDot(RelNode root) {
-    final StringBuilder sb = new StringBuilder("digraph {\n  rankdir=BT;\n");
+    final StringBuilder sb = new StringBuilder(
+        "digraph {\n  rankdir=BT;\n  node [fontname=\"Helvetica\"];\n");
     final java.util.IdentityHashMap<RelNode, Integer> ids = new java.util.IdentityHashMap<>();
     final int[] counter = {0};
     dumpDotNode(root, sb, ids, counter);
@@ -873,24 +886,16 @@ class MergedIndexTpchPlanTest {
     }
     final int id = counter[0]++;
     ids.put(node, id);
-    // Use the first line of the text explain, broken into multiple lines for readability.
     final String explain = RelOptUtil.dumpPlan("", node,
         SqlExplainFormat.TEXT, SqlExplainLevel.EXPPLAN_ATTRIBUTES).trim();
     final String firstLine = explain.lines().findFirst()
         .orElse(node.getClass().getSimpleName()).trim();
-    // Split "ClassName(attr1=[...], attr2=[...])" into one line per attribute.
-    final String label;
-    final int parenIdx = firstLine.indexOf('(');
-    if (parenIdx >= 0 && firstLine.endsWith(")")) {
-      final String cls = firstLine.substring(0, parenIdx);
-      final String inner = firstLine.substring(parenIdx + 1, firstLine.length() - 1);
-      // Split on "], " (between bracketed attributes) and on ", [" (between table entries).
-      final String attrs = inner.replace("], ", "]\\n").replace(", [", "\\n[");
-      label = (cls + "\\n" + attrs).replace("\"", "'");
-    } else {
-      label = firstLine.replace("\"", "'");
-    }
-    sb.append("  n").append(id).append(" [label=\"").append(label).append("\"];\n");
+    final String label = nodeLabel(node, firstLine);
+    final String color = nodeColor(node);
+    sb.append("  n").append(id)
+        .append(" [label=\"").append(label).append("\"")
+        .append(", style=filled, fillcolor=\"").append(color).append("\"")
+        .append("];\n");
     final List<RelNode> inputs = node.getInputs();
     for (int i = 0; i < inputs.size(); i++) {
       final int childId = dumpDotNode(inputs.get(i), sb, ids, counter);
@@ -898,5 +903,77 @@ class MergedIndexTpchPlanTest {
           .append(" [label=\"").append(i).append("\"];\n");
     }
     return id;
+  }
+
+  /**
+   * Returns a short, presentation-friendly DOT label for a plan node.
+   *
+   * <p>Strips the "Enumerable" prefix from the class name. Shows only the
+   * most meaningful attribute per operator type; omits internal Calcite
+   * field-index noise ({@code $0}, {@code $4}, etc.) where possible.
+   */
+  private static String nodeLabel(RelNode node, String firstLine) {
+    final int parenIdx = firstLine.indexOf('(');
+    final String fullCls = parenIdx >= 0 ? firstLine.substring(0, parenIdx) : firstLine;
+    // Strip "Enumerable" prefix for brevity in presentation diagrams.
+    final String cls = fullCls.startsWith("Enumerable")
+        ? fullCls.substring("Enumerable".length()) : fullCls;
+    if (parenIdx < 0 || !firstLine.endsWith(")")) {
+      return cls.replace("\"", "'");
+    }
+    final String inner = firstLine.substring(parenIdx + 1, firstLine.length() - 1);
+
+    if (fullCls.contains("TableScan")) {
+      // table=[[TPCH, ORDERS]] → show only the last qualifier (table name)
+      final int lb = inner.lastIndexOf(", ");
+      final String name = (lb >= 0 ? inner.substring(lb + 2) : inner)
+          .replace("[", "").replace("]", "");
+      return (cls + "\\n" + name).replace("\"", "'");
+    }
+    if (fullCls.contains("MergedIndexScan") || fullCls.contains("MergedIndexJoin")) {
+      // Show tables/sources; strip trailing collation attribute.
+      final int collationIdx = inner.indexOf(", collation");
+      final String tables = collationIdx >= 0 ? inner.substring(0, collationIdx) : inner;
+      final String attrs = tables.replace("], ", "]\\n").replace(", [", "\\n[");
+      return (cls + "\\n" + attrs).replace("\"", "'");
+    }
+    if (fullCls.contains("MergeJoin")) {
+      // Show only the join condition (drop joinType).
+      final int cond = inner.indexOf("condition=[");
+      final int condEnd = inner.indexOf("]", cond);
+      if (cond >= 0 && condEnd >= 0) {
+        return (cls + "\\n" + inner.substring(cond, condEnd + 1)).replace("\"", "'");
+      }
+    }
+    if (fullCls.contains("Sort")) {
+      // Show sort keys one per line; drop dir lines for brevity.
+      final String keys = inner.replace("], ", "]\\n").replace(", [", "\\n[");
+      return (cls + "\\n" + keys).replace("\"", "'");
+    }
+    if (fullCls.contains("Aggregate")) {
+      // Show only the group-by key.
+      final int grp = inner.indexOf("group=[");
+      final int grpEnd = inner.indexOf("]", grp);
+      if (grp >= 0 && grpEnd >= 0) {
+        return (cls + "\\n" + inner.substring(grp, grpEnd + 1)).replace("\"", "'");
+      }
+    }
+    // Default: just the short class name; no attributes (e.g. Project, Filter).
+    return cls.replace("\"", "'");
+  }
+
+  /** Returns a fill color for the DOT node based on operator type. */
+  private static String nodeColor(RelNode node) {
+    final String cls = node.getClass().getSimpleName();
+    if (cls.contains("MergedIndexScan")) return "#90EE90"; // light green
+    if (cls.contains("MergedIndexJoin")) return "#32CD32"; // lime green
+    if (cls.contains("MergeJoin"))       return "#FFD700"; // gold
+    if (cls.contains("LimitSort"))       return "#FFA07A"; // light salmon
+    if (cls.contains("Sort"))            return "#FFA07A"; // light salmon
+    if (cls.contains("TableScan"))       return "#ADD8E6"; // light blue
+    if (cls.contains("Aggregate"))       return "#DDA0DD"; // plum
+    if (cls.contains("Project"))         return "#D3D3D3"; // light gray
+    if (cls.contains("Filter"))          return "#FFDAB9"; // peach
+    return "white";
   }
 }
