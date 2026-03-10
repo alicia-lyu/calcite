@@ -337,29 +337,30 @@ A merged index does **not** store a pre-computed join — it stores records from
 source table independently, interleaved by sort key. This distinction drives two
 fundamentally different maintenance phases:
 
-**Phase 1 — base table Δ → inner MI (no join needed)**
+#### Phase 1 — base table Δ → inner MI (no join needed)
 
 Each source contributes independently. One base-table insert/delete triggers exactly
 one MI record update, with no join against any other source:
 
-- `ORDERS` insert at orderkey=k → insert ORDERS record into MI(OL)[k]
+- `ORDERS` insert at orderkey=k → insert ORDERS record into MI(OL)\[k\]
 - `LINEITEM` insert at orderkey=k → re-aggregate LINEITEM for key k → update Agg
-  record in MI(OL)[k]
+  record in MI(OL)\[k\]
 
 The semi-naive formula `Δ(A ⋈ B) = (Δ(A) ⋈ B) ∪ (A ⋈ Δ(B))` does **not** apply
 here. Branch 2 (ORDERS delta) needs no join with Agg(LINEITEM); ORDERS records are
 simply inserted into the MI slot for key k. The formula overcounts by joining even
 for direct-insertion paths.
 
-**Phase 2 — inner MI Δ → outer MI (join/propagation required)**
+#### Phase 2 — inner MI Δ → outer MI (join/propagation required)
 
 When a change in the inner MI must propagate to the outer MI, the key level changes
 (e.g., orderkey → custkey). At this level, a join-like lookup IS required: to update
-MI(OL+CUSTOMER)[custkey=c], the system must correlate the inner MI delta at
+MI(OL+CUSTOMER)\[custkey=c\], the system must correlate the inner MI delta at
 (orderkey=k, custkey=c) with the CUSTOMER record at custkey=c. Between levels there
 may also be additional operators (aggregation, projection) beyond a simple join.
 
 **The BEFORE plan defines both phases:**
+
 - Phase 1 sources: each sub-pipeline feeding into the join input (e.g., Agg(LINEITEM),
   Sort(ORDERS))
 - Phase 2 operator: the join (and any operators) connecting levels
@@ -369,7 +370,7 @@ may also be additional operators (aggregation, projection) beyond a simple join.
 The implementation directly constructs a `LogicalUnion` of two `LogicalJoin` branches,
 wrapping one side in `LogicalDelta`:
 
-```
+```text
 LogicalUnion
   LogicalJoin(orderkey)
     LogicalDelta(Sort(Agg(LINEITEM)))   ← correct for LINEITEM delta (phase 1, re-agg)
