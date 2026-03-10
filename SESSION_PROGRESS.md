@@ -304,15 +304,66 @@ the merged index but the filter cannot be pushed below the assembled join result
 
 ---
 
+## Maintenance Plan Generation (implemented 2026-03-10)
+
+`MergedIndex.maintenancePlan` stores the incremental IVM plan derived by
+`deriveIncrementalPlan(Join)` in `MergedIndexTpchPlanTest`. The method directly
+constructs the semi-naive IVM formula:
+
+```
+Δ(A ⋈ B) = (Δ(A) ⋈ B) ∪ (A ⋈ Δ(B))
+```
+
+as a `LogicalUnion` of two `LogicalJoin` branches, each wrapping one side in
+`LogicalDelta`. The implementation bypasses `HepPlanner + StreamRules` because
+`DeltaJoinTransposeRule.onMatch()` calls `HepRuleCall.transformTo()` which runs
+`verifyTypeEquivalence` — this fails because TPC-H schema uses `JavaType(String)` while
+the newly created `LogicalJoin`s re-derive their row types as `VARCHAR` (SQL type system).
+By constructing the plan directly, we avoid the type mismatch entirely.
+
+### Unresolved gap: `EnumerableMergedIndexDeltaScan`
+
+For nested pipelines (Q3-OL outer, Q9 levels 1-4), the leaf of the maintenance plan
+is `LogicalDelta(EnumerableMergedIndexScan)`. No `StreamRule` exists for this node,
+so it is left as an unresolved leaf. A new physical operator
+`EnumerableMergedIndexDeltaScan` is needed, along with a rule converting
+`LogicalDelta(EnumerableMergedIndexScan) → EnumerableMergedIndexDeltaScan`.
+
+### Tag-based lazy propagation (future design)
+
+Each merged-index record carries a 1-byte `propagated` flag. On base-table insert:
+1. Insert into MI with `propagated=false`.
+2. Background worker finds untagged records, joins with partners (using the
+   `deriveIncrementalPlan` output as the plan template), propagates delta to next-level MI.
+3. Mark source record as `propagated=true`.
+
+This avoids storing full delta records (only sort key + delta size tracked in log) and
+keeps update cost O(1) amortized per cascade level.
+
+---
+
 ## Next Steps
 
 ### Short Term (next session)
 
-- **Maintenance plan generation**: explore how Calcite support incremental view maintenance. We will rely on this machinery to generate maintenance plans as shown above. Right now our code only generates query plans. I can think of the following tricky points:
-  - The view delta is inserted not into a materialized view strictly speaking, but into a merged index that stores a materialized view.
-  - Merged index delta might cascade into the next level of merged index maintenance. Calcite likely only defined base table update triggers, so we may need to define merged index delta triggers.
-  - Merge index delta is also unique in that there is typically a step of query processing to generate the delta (e.g., assembling joined records). But without this actual step we should be able to determine the size of the delta. For now, we can always process this step and leave this async triggering for the future (please still explore and write notes about it).
-  - To generate delta from merged index A to merged index B, the naive way is, upon insertions into A, we process the required step (e.g., join) and store this delta in a log. The better way is to tag each record in A whether they are propagated to B. Note that, for a joined record to B, as long as one of the participant is not propagated, this joined record will be propagated. With this tag, we only need to keep track of the delta size + sort key instead of the actual delta records in the log. Upon propagation, we process the required step, update the tag, and assemble the delta to B. However, the implementation of the latter might be too complex for this session, so we can start with the naive way, only explore the latter a bit, and write notes about it.
+- **`EnumerableMergedIndexDeltaScan` operator** — `deriveIncrementalPlan()` currently
+  leaves `LogicalDelta(EnumerableMergedIndexScan)` as an unresolved leaf for nested
+  pipelines (Q3-OL outer, Q9 levels 1-4). A new physical operator
+  `EnumerableMergedIndexDeltaScan` (analogous to `EnumerableMergedIndexScan`) is needed
+  to represent "new rows arriving from an inner merged index." Add it to
+  `adapter/enumerable/` and add a StreamRule that converts `LogicalDelta` over
+  `EnumerableMergedIndexScan` to `EnumerableMergedIndexDeltaScan`.
+
+- **Tag-based lazy propagation design** — document the tag-based approach in
+  `SESSION_PROGRESS.md` and `CLAUDE.md`: each merged-index record carries a 1-byte
+  `propagated` flag. On base-table insert → insert into MI with flag=false. A background
+  worker finds untagged records, assembles the delta join (using `deriveIncrementalPlan`
+  output as the plan template), propagates to the next-level MI, then marks as propagated.
+  This avoids storing full delta records and keeps update cost O(1) amortized.
+
+- **Maintenance plan section in paper notes** — add a short prose description to
+  `SESSION_PROGRESS.md` explaining the two-tier plan: query tier (one scan) + maintenance
+  tier (IVM formula derived this session).
 
 ### Medium Term
 
