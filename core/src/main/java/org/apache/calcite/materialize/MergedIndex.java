@@ -19,8 +19,11 @@ package org.apache.calcite.materialize;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelFieldCollation;
+import org.apache.calcite.rel.RelNode;
 
 import com.google.common.collect.ImmutableList;
+
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.util.List;
 import java.util.stream.Stream;
@@ -73,6 +76,13 @@ public class MergedIndex {
    * Used by the cost model in {@code EnumerableMergedIndexScan}.
    */
   public final double rowCount;
+
+  /**
+   * Incremental maintenance plan derived by applying {@code DeltaJoinTransposeRule}
+   * to this pipeline's join node. Null for manually registered indexes that do not
+   * go through the Pipeline discovery path.
+   */
+  public @Nullable RelNode maintenancePlan;
 
   /**
    * Constructor for base-table-only pipelines (most common case).
@@ -141,6 +151,10 @@ public class MergedIndex {
    * where A→B is a functional dependency (e.g. o_orderkey → o_orderdate),
    * this should return true. Currently uses exact prefix matching only.
    */
+  public void setMaintenancePlan(RelNode plan) { this.maintenancePlan = plan; }
+
+  public @Nullable RelNode getMaintenancePlan() { return maintenancePlan; }
+
   public boolean satisfies(RelCollation required) {
     List<RelFieldCollation> indexFields = collation.getFieldCollations();
     List<RelFieldCollation> requiredFields = required.getFieldCollations();

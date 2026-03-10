@@ -40,6 +40,9 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
 import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.logical.LogicalSort;
+import org.apache.calcite.rel.logical.LogicalJoin;
+import org.apache.calcite.rel.logical.LogicalUnion;
+import org.apache.calcite.rel.stream.LogicalDelta;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.sql.SqlExplainFormat;
 import org.apache.calcite.sql.SqlExplainLevel;
@@ -50,6 +53,8 @@ import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.Planner;
 import org.apache.calcite.tools.Programs;
 import org.apache.calcite.tools.RuleSets;
+
+import com.google.common.collect.ImmutableList;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.junit.jupiter.api.AfterEach;
@@ -161,6 +166,10 @@ class MergedIndexTpchPlanTest {
     // injectSortsBeforeJoin recurses and handles each nested join independently.
     final RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel);
 
+    // Capture logical joins (post-order) for IVM derivation — must use logical
+    // (pre-Phase-1) nodes because StreamRules expect SQL row types, not JavaType.
+    final List<Join> logicalJoins = findAllJoins(logicalWithSorts);
+
     final RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
 
@@ -190,11 +199,17 @@ class MergedIndexTpchPlanTest {
     final double rowCount =
         innerJoin.estimateRowCount(innerJoin.getCluster().getMetadataQuery());
 
-    MergedIndexRegistry.register(new MergedIndex(
+    final MergedIndex miQ3 = new MergedIndex(
         List.of(tableLeft, tableRight),
         List.of(collationLeft, collationRight),
         collationLeft,
-        rowCount));
+        rowCount);
+    // logicalJoins.get(0) = innermost (CUSTOMER ⋈ ORDERS) logical join
+    miQ3.setMaintenancePlan(deriveIncrementalPlan(logicalJoins.get(0)));
+    MergedIndexRegistry.register(miQ3);
+
+    System.out.println("=== Q3 MAINTENANCE PLAN (incremental) ===");
+    System.out.println(dumpText(miQ3.getMaintenancePlan()));
 
     // ── Phase 2: HEP planner fires PipelineToMergedIndexScanRule ──────────
     final HepProgram hepProgram = HepProgram.builder()
@@ -215,6 +230,11 @@ class MergedIndexTpchPlanTest {
     assertThat(planStr, containsString("EnumerableMergedIndexScan"));
     // The outer MergeJoin (orderkey join) is NOT replaced — partial substitution.
     assertThat(planStr, containsString("EnumerableMergeJoin"));
+    // Maintenance plan derives IVM decomposition
+    assertThat("Q3 inner MI missing maintenance plan",
+        miQ3.getMaintenancePlan() != null, is(true));
+    assertThat(dumpText(miQ3.getMaintenancePlan()), containsString("LogicalUnion"));
+    assertThat(dumpText(miQ3.getMaintenancePlan()), containsString("LogicalJoin"));
   }
 
   /**
@@ -268,6 +288,10 @@ class MergedIndexTpchPlanTest {
 
     final RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel);
 
+    // Capture logical join for IVM — must use logical node (SQL types),
+    // not the physical EnumerableMergeJoin (JavaType) from Phase 1.
+    final Join logicalJoinQ12 = findAllJoins(logicalWithSorts).get(0);
+
     final RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
 
@@ -296,11 +320,16 @@ class MergedIndexTpchPlanTest {
     final double rowCount =
         join.estimateRowCount(join.getCluster().getMetadataQuery());
 
-    MergedIndexRegistry.register(new MergedIndex(
+    final MergedIndex miQ12 = new MergedIndex(
         List.of(tableOrders, tableLineitem),
         List.of(collationOrders, collationLineitem),
         collationOrders,
-        rowCount));
+        rowCount);
+    miQ12.setMaintenancePlan(deriveIncrementalPlan(logicalJoinQ12));
+    MergedIndexRegistry.register(miQ12);
+
+    System.out.println("=== Q12 MAINTENANCE PLAN (incremental) ===");
+    System.out.println(dumpText(miQ12.getMaintenancePlan()));
 
     // ── Phase 2: HEP planner fires PipelineToMergedIndexScanRule ──────────
     final HepProgram hepProgram = HepProgram.builder()
@@ -319,6 +348,10 @@ class MergedIndexTpchPlanTest {
     final String planStr = dumpText(phase2Plan);
     assertThat(planStr, containsString("EnumerableMergedIndexScan"));
     assertThat(planStr, not(containsString("EnumerableMergeJoin")));
+    assertThat("Q12 MI missing maintenance plan",
+        miQ12.getMaintenancePlan() != null, is(true));
+    assertThat(dumpText(miQ12.getMaintenancePlan()), containsString("LogicalUnion"));
+    assertThat(dumpText(miQ12.getMaintenancePlan()), containsString("LogicalJoin"));
   }
 
   /**
@@ -388,6 +421,11 @@ class MergedIndexTpchPlanTest {
     final RelRoot root = planner.rel(validated);
 
     final RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel);
+
+    // Capture logical joins (post-order) for IVM — logical nodes have SQL row types
+    // compatible with StreamRules; physical EnumerableMergeJoin uses JavaType.
+    final List<Join> logicalJoinsOL = findAllJoins(logicalWithSorts);
+
     final RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
 
@@ -410,15 +448,20 @@ class MergedIndexTpchPlanTest {
         pipelines.size(), is(2));
 
     // ── Register merged indexes bottom-up ─────────────────────────────────
-    for (Pipeline p : pipelines) {
+    for (int i = 0; i < pipelines.size(); i++) {
+      final Pipeline p = pipelines.get(i);
       // Resolve Pipeline sources to MergedIndex (already registered inner ones)
       final List<Object> resolved = p.sources.stream()
           .map(s -> s instanceof Pipeline ? ((Pipeline) s).mergedIndex : s)
           .collect(Collectors.toList());
       p.mergedIndex = MergedIndex.of(resolved, p.sourceCollations,
           p.sharedCollation, p.rowCount);
+      // Use logical join (SQL types) for IVM derivation — matches StreamRules expectations
+      p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(logicalJoinsOL.get(i)));
       MergedIndexRegistry.register(p.mergedIndex);
     }
+
+    printMaintenancePlans("Q3-OL", pipelines);
 
     // ── Phase 2: two HEP passes for two-level pipeline dependency ─────────
     // Pass 1 replaces inner joins (Sort→Agg/Scan + Sort→Scan → MergeJoin)
@@ -456,6 +499,11 @@ class MergedIndexTpchPlanTest {
     assertThat(afterStr, not(containsString("EnumerableMergedIndexAggregate")));
     // Outer merged index involves CUSTOMER key
     assertThat(afterStr, containsString("C_CUSTKEY"));
+    // All pipelines have maintenance plans
+    for (Pipeline p : pipelines) {
+      assertThat("Q3-OL pipeline missing maintenance plan",
+          p.mergedIndex.getMaintenancePlan() != null, is(true));
+    }
   }
 
   // ── Pipeline discovery helpers for tpchQ3OrdersLineitem ──────────────────
@@ -471,14 +519,16 @@ class MergedIndexTpchPlanTest {
     final List<RelCollation> sourceCollations;
     final RelCollation sharedCollation;
     final double rowCount;
+    final EnumerableMergeJoin join;          // root join from Phase 1, for IVM derivation
     MergedIndex mergedIndex;                 // set after registration
 
     Pipeline(List<Object> sources, List<RelCollation> sourceCollations,
-        RelCollation sharedCollation, double rowCount) {
+        RelCollation sharedCollation, double rowCount, EnumerableMergeJoin join) {
       this.sources = sources;
       this.sourceCollations = sourceCollations;
       this.sharedCollation = sharedCollation;
       this.rowCount = rowCount;
+      this.join = join;
     }
   }
 
@@ -520,7 +570,7 @@ class MergedIndexTpchPlanTest {
     final double rowCount =
         join.estimateRowCount(join.getCluster().getMetadataQuery());
     final Pipeline p =
-        new Pipeline(List.of(leftSrc, rightSrc), List.of(lc, rc), lc, rowCount);
+        new Pipeline(List.of(leftSrc, rightSrc), List.of(lc, rc), lc, rowCount, join);
     byJoin.put(join, p);
     ordered.add(p);
   }
@@ -684,6 +734,10 @@ class MergedIndexTpchPlanTest {
     final RelRoot root = planner.rel(validated);
 
     final RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel);
+
+    // Capture logical joins (post-order) for IVM — same order as findAllPipelines.
+    final List<Join> logicalJoinsQ9 = findAllJoins(logicalWithSorts);
+
     final RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
 
@@ -699,14 +753,19 @@ class MergedIndexTpchPlanTest {
     // Discover all 5 pipelines bottom-up (inner first) and register nested MergedIndexes.
     final List<Pipeline> pipelines = findAllPipelines(phase1Plan);
     assertThat("Expected 5 pipelines for Q9", pipelines.size(), is(5));
-    for (Pipeline p : pipelines) {
+    for (int i = 0; i < pipelines.size(); i++) {
+      final Pipeline p = pipelines.get(i);
       final List<Object> resolved = p.sources.stream()
           .map(s -> s instanceof Pipeline ? ((Pipeline) s).mergedIndex : s)
           .collect(Collectors.toList());
       p.mergedIndex = MergedIndex.of(resolved, p.sourceCollations,
           p.sharedCollation, p.rowCount);
+      // Use logical join (SQL types) for IVM derivation — matches StreamRules expectations
+      p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(logicalJoinsQ9.get(i)));
       MergedIndexRegistry.register(p.mergedIndex);
     }
+
+    printMaintenancePlans("Q9", pipelines);
 
     // ── Phase 2: N HEP passes, one per pipeline level ─────────────────────
     // Each pass replaces one level; a new planner instance is required because
@@ -736,6 +795,85 @@ class MergedIndexTpchPlanTest {
     assertThat(countOccurrences(afterStr, "EnumerableSort("), is(1));
     assertThat(afterStr, containsString("EnumerableMergedIndexJoin"));
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
+    // All pipelines have maintenance plans
+    for (Pipeline p : pipelines) {
+      assertThat("Q9 pipeline missing maintenance plan",
+          p.mergedIndex.getMaintenancePlan() != null, is(true));
+    }
+  }
+
+  // ── IVM helpers ──────────────────────────────────────────────────────────
+
+  /**
+   * Derives the incremental maintenance plan for one pipeline join.
+   *
+   * <p>Directly constructs the semi-naive IVM decomposition without going through the
+   * HEP planner (which would invoke {@code verifyTypeEquivalence} and fail because
+   * the TPC-H schema uses {@code JavaType(String)} while {@code DeltaJoinTransposeRule}
+   * creates new {@code LogicalJoin}s whose row types are recomputed as SQL {@code VARCHAR}).
+   *
+   * <p>Result structure:
+   * <pre>
+   *   LogicalUnion(all=true)
+   *     LogicalJoin(condition, INNER)   ← Δ(left) ⋈ right  (new rows from left)
+   *       LogicalDelta(left)
+   *       right
+   *     LogicalJoin(condition, INNER)   ← left ⋈ Δ(right)  (new rows from right)
+   *       left
+   *       LogicalDelta(right)
+   * </pre>
+   * where {@code LogicalDelta(scan)} represents new rows arriving from a base table
+   * or inner merged index.
+   */
+  private static RelNode deriveIncrementalPlan(Join join) {
+    final RelNode left = join.getLeft();
+    final RelNode right = join.getRight();
+
+    // Branch 1: Δ(left) ⋈ right  — new rows from the left source
+    final LogicalJoin joinDeltaLeft =
+        LogicalJoin.create(LogicalDelta.create(left), right, join.getHints(),
+            join.getCondition(), join.getVariablesSet(), join.getJoinType(),
+            join.isSemiJoinDone(),
+            ImmutableList.copyOf(join.getSystemFieldList()));
+
+    // Branch 2: left ⋈ Δ(right)  — new rows from the right source
+    final LogicalJoin joinDeltaRight =
+        LogicalJoin.create(left, LogicalDelta.create(right), join.getHints(),
+            join.getCondition(), join.getVariablesSet(), join.getJoinType(),
+            join.isSemiJoinDone(),
+            ImmutableList.copyOf(join.getSystemFieldList()));
+
+    return LogicalUnion.create(List.of(joinDeltaLeft, joinDeltaRight), true);
+  }
+
+  /** Prints maintenance plans for all pipelines to stdout. */
+  private static void printMaintenancePlans(String label, List<Pipeline> pipelines) {
+    System.out.println("=== " + label + " MAINTENANCE PLANS ===");
+    for (int i = 0; i < pipelines.size(); i++) {
+      System.out.println("-- Level " + i + ": " + pipelines.get(i).mergedIndex);
+      final RelNode plan = pipelines.get(i).mergedIndex.getMaintenancePlan();
+      System.out.println(plan != null ? dumpText(plan) : "  (none)");
+    }
+  }
+
+  /**
+   * Collects all {@link Join} nodes in post-order (innermost first).
+   *
+   * <p>Used to find logical joins from a pre-Phase-1 plan for IVM derivation.
+   * Logical joins ({@link org.apache.calcite.rel.logical.LogicalJoin}) have SQL
+   * row types (e.g., {@code VARCHAR}) that are compatible with {@link StreamRules},
+   * whereas physical {@link EnumerableMergeJoin} nodes carry {@code JavaType} row
+   * types that cause a type mismatch in {@link StreamRules.DeltaJoinTransposeRule}.
+   */
+  private static List<Join> findAllJoins(RelNode node) {
+    final List<Join> result = new ArrayList<>();
+    for (RelNode input : node.getInputs()) {
+      result.addAll(findAllJoins(input));
+    }
+    if (node instanceof Join) {
+      result.add((Join) node);
+    }
+    return result;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
