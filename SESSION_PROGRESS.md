@@ -342,7 +342,7 @@ fundamentally different maintenance phases:
 #### Phase 1 — base table Δ → inner MI (no join needed)
 
 Each source contributes independently. One base-table insert/delete triggers exactly
-one MI record update, with no join against any other source:
+one MI record update, with no join against any other source. For example, in Q3-OL:
 
 - `ORDERS` insert at orderkey=k → insert ORDERS record into MI(OL)\[k\]
 - `LINEITEM` insert at orderkey=k → re-aggregate LINEITEM for key k → update Agg
@@ -356,26 +356,26 @@ for direct-insertion paths.
 #### Phase 2 — inner MI Δ → outer MI (join/propagation required)
 
 When a change in the inner MI must propagate to the outer MI, the key level changes
-(e.g., orderkey → custkey). At this level, a join-like lookup IS required: to update
-MI(OL+CUSTOMER)\[custkey=c\], the system must correlate the inner MI delta at
-(orderkey=k, custkey=c) with the CUSTOMER record at custkey=c. Between levels there
-may also be additional operators (aggregation, projection) beyond a simple join.
+(e.g., orderkey → custkey). Before this step, the inner MI just stores multiple types of records, now we need to assemble them together. It usually involves a join but may also involve additional operators, as defined by the pipeline for the current merged index.
+For example, in Q3-OL,
+when a lineitem insertion triggers an additional joined record, we need to produce it and insert it directly into the outer MI.
+Note that a join-like lookup in the outer merged index is still NOT required.
 
 **The BEFORE plan defines both phases:**
 
-- Phase 1 sources: each sub-pipeline feeding into the join input (e.g., Agg(LINEITEM),
-  Sort(ORDERS))
-- Phase 2 operator: the join (and any operators) connecting levels
+- Phase 1 updates leaf merged indexes that correspond to leaf pipelines.
+- Phase 2 updates non-leaf merged indexes that correspond to inner pipelines.
 
 ### Current `deriveIncrementalPlan` — branch-2 fix (2026-03-10)
 
 Branch 2 is now correct for **direct-insert sources** (`Sort → TableScan` with no
-`Aggregate` on top). The helper `isDirectTableInput(RelNode)` detects this case and
+`Aggregate` on top).
+The helper `isDirectTableInput(RelNode)` detects this case and
 emits `LogicalDelta(right)` alone — no join:
 
 ```text
 LogicalUnion
-  LogicalJoin(orderkey)
+  LogicalJoin(orderkey) // why is a join here? In this leaf pipeline, not one join appeared, it is cut off at the first sorts, which immediately precedes the join.
     LogicalDelta(Sort(Agg(LINEITEM)))   ← correct: LINEITEM delta re-aggregates
     Sort(ORDERS)
   LogicalDelta(Sort(ORDERS))            ← fixed: ORDERS record inserts directly; no join
@@ -405,13 +405,16 @@ by constructing a synthetic `LogicalDelta(innerScan)` and verifying the rule fir
 ### Remaining gap: outer pipeline branch-1 resolution
 
 For outer pipelines, branch 1 of the maintenance plan is:
+
 ```text
 LogicalJoin(LogicalDelta(Sort→inner_logical_join), Sort→CUSTOMER)
 ```
+
 The `LogicalDelta(Sort→inner_logical_join)` should ultimately become
 `EnumerableMergedIndexDeltaScan(inner_MI)`, but the logical plan is derived from
 logical joins (not physical), so the inner join node is `LogicalJoin`, not
 `EnumerableMergedIndexScan`. Resolving this requires either:
+
 - Running physical planning on the outer maintenance plan, then applying the delta rule, or
 - Building the outer maintenance plan using already-physical inner nodes (post-Phase-2).
 
@@ -434,7 +437,13 @@ cascade level.
 
 ### Short Term (next session)
 
-1. **Resolve outer pipeline branch-1 maintenance leaf**
+1. `injectSortsBeforeJoin` in `MergedIndexTpchPlanTest.java` should be expanded to inject sorts before group-by, order-by, distinct. Note that their inputs may already have the desired sort order, so verification is required.
+
+2. `deriveIncrementalPlan` should not take `Join join` as input but rather a list of logical sorts (verify that their sort order is compatible---same key or prefix chain), since it is sorts that define the boundaries of pipelines. Any record going in the sort is equivalently going into the required merged index. You seem overly obsessed with joins whereas the core of this project is sort (you thought that each join should correspond to a merged index, instead it is each pipeline), and join is only an important application.
+
+### Medium Term
+
+3. **Resolve outer pipeline branch-1 maintenance leaf**
    (file: `MergedIndexTpchPlanTest.java`, method `tpchQ3OrdersLineitem`)
    - Branch 1 of the outer pipeline maintenance plan contains
      `LogicalDelta(Sort→inner_logical_join)`. This should become
@@ -456,8 +465,6 @@ cascade level.
    - Q6: single-table aggregate, no join — good baseline showing no MI applies.
    - Q5: CUSTOMER ⋈ ORDERS ⋈ LINEITEM ⋈ SUPPLIER ⋈ NATION ⋈ REGION on nationkey
      prefix chain — tests hierarchical merged index recognition.
-
-### Medium Term
 
 - **More TPC-H queries** One important claim of this paper is to show that **all** queries plans using ordered operators can be converted to a materialized-view-like approach using merged indexes. Therefore, at the minimum we will do this for all TPC-H queries.
 - Realistic cost model: explore how Calcite calculate the cost, esp. index access or materialized view access, for queries and maintenance. Follow the same model, calculate the cost of merged index access and cost of full query plans + maintenance plans.
