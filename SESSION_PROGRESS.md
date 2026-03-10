@@ -329,21 +329,73 @@ the merged index but the filter cannot be pushed below the assembled join result
 ## Maintenance Plan Generation (implemented 2026-03-10)
 
 `MergedIndex.maintenancePlan` stores the incremental IVM plan derived by
-`deriveIncrementalPlan(Join)` in `MergedIndexTpchPlanTest`. The method directly
-constructs the semi-naive IVM formula:
+`deriveIncrementalPlan(Join)` in `MergedIndexTpchPlanTest`.
+
+### Two-phase maintenance model
+
+A merged index does **not** store a pre-computed join — it stores records from each
+source table independently, interleaved by sort key. This distinction drives two
+fundamentally different maintenance phases:
+
+**Phase 1 — base table Δ → inner MI (no join needed)**
+
+Each source contributes independently. One base-table insert/delete triggers exactly
+one MI record update, with no join against any other source:
+
+- `ORDERS` insert at orderkey=k → insert ORDERS record into MI(OL)[k]
+- `LINEITEM` insert at orderkey=k → re-aggregate LINEITEM for key k → update Agg
+  record in MI(OL)[k]
+
+The semi-naive formula `Δ(A ⋈ B) = (Δ(A) ⋈ B) ∪ (A ⋈ Δ(B))` does **not** apply
+here. Branch 2 (ORDERS delta) needs no join with Agg(LINEITEM); ORDERS records are
+simply inserted into the MI slot for key k. The formula overcounts by joining even
+for direct-insertion paths.
+
+**Phase 2 — inner MI Δ → outer MI (join/propagation required)**
+
+When a change in the inner MI must propagate to the outer MI, the key level changes
+(e.g., orderkey → custkey). At this level, a join-like lookup IS required: to update
+MI(OL+CUSTOMER)[custkey=c], the system must correlate the inner MI delta at
+(orderkey=k, custkey=c) with the CUSTOMER record at custkey=c. Between levels there
+may also be additional operators (aggregation, projection) beyond a simple join.
+
+**The BEFORE plan defines both phases:**
+- Phase 1 sources: each sub-pipeline feeding into the join input (e.g., Agg(LINEITEM),
+  Sort(ORDERS))
+- Phase 2 operator: the join (and any operators) connecting levels
+
+### Current `deriveIncrementalPlan` — approximation
+
+The implementation directly constructs a `LogicalUnion` of two `LogicalJoin` branches,
+wrapping one side in `LogicalDelta`:
 
 ```
-Δ(A ⋈ B) = (Δ(A) ⋈ B) ∪ (A ⋈ Δ(B))
+LogicalUnion
+  LogicalJoin(orderkey)
+    LogicalDelta(Sort(Agg(LINEITEM)))   ← correct for LINEITEM delta (phase 1, re-agg)
+    Sort(ORDERS)
+  LogicalJoin(orderkey)
+    Sort(Agg(LINEITEM))
+    LogicalDelta(Sort(ORDERS))          ← incorrect: ORDERS delta needs NO join
 ```
 
-as a `LogicalUnion` of two `LogicalJoin` branches, each wrapping one side in
-`LogicalDelta`. The implementation bypasses `HepPlanner + StreamRules` because
+Branch 2 is an over-approximation. For phase 1 (ORDERS → inner MI), the correct plan
+is just `insert Δ(ORDERS) into MI(OL)` with no join. The current formula is accurate
+only for phase 2 (inter-level propagation).
+
+The implementation bypasses `HepPlanner + StreamRules` because
 `DeltaJoinTransposeRule.onMatch()` calls `HepRuleCall.transformTo()` which runs
 `verifyTypeEquivalence` — this fails because TPC-H schema uses `JavaType(String)` while
 the newly created `LogicalJoin`s re-derive their row types as `VARCHAR` (SQL type system).
 By constructing the plan directly, we avoid the type mismatch entirely.
 
-### Unresolved gap: `EnumerableMergedIndexDeltaScan`
+### Unresolved gap: full maintenance plan accuracy
+
+The deeper issue is that the entire maintenance model needs to distinguish the two
+phases. An accurate maintenance plan for phase 1 would skip the join for direct-
+insertion sources and only propagate through each source's own sub-pipeline (Agg,
+Sort, etc.). The current `deriveIncrementalPlan` treats all branches as joins, which
+is correct only for phase 2.
 
 For nested pipelines (Q3-OL outer, Q9 levels 1-4), the leaf of the maintenance plan
 is `LogicalDelta(EnumerableMergedIndexScan)`. No `StreamRule` exists for this node,
@@ -356,12 +408,13 @@ so it is left as an unresolved leaf. A new physical operator
 Each merged-index record carries a 1-byte `propagated` flag. On base-table insert:
 
 1. Insert into MI with `propagated=false`.
-2. Background worker finds untagged records, joins with partners (using the
-   `deriveIncrementalPlan` output as the plan template), propagates delta to next-level MI.
+2. Background worker finds untagged records, runs the phase-1 source pipeline for
+   that key (re-agg LINEITEM, etc.), propagates delta to next-level MI via phase-2
+   join lookup.
 3. Mark source record as `propagated=true`.
 
-This avoids storing full delta records (only sort key + delta size tracked in log) and
-keeps update cost O(1) amortized per cascade level.
+This avoids storing full delta records and keeps update cost O(1) amortized per
+cascade level.
 
 ---
 
