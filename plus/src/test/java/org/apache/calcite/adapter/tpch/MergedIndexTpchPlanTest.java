@@ -566,48 +566,60 @@ class MergedIndexTpchPlanTest {
     return null;
   }
 
-  /** IDEAL BEFORE plan
-   * digraph G {
-    rankdir=BT;
-    node [shape=rect, fontname="Helvetica,Arial,sans-serif", fontsize=12, style=filled, fillcolor="#f9f9f9"];
-    edge [fontname="Helvetica,Arial,sans-serif", fontsize=10];
-    label = "TPC-H Q9 — ideal order-based plan";
-    labelloc = "t";
-
-    ScanN   [label="Scan: Nation",   shape=folder, fillcolor="#e2e3e5"];
-    ScanS   [label="Scan: Supplier", shape=folder, fillcolor="#e2e3e5"];
-    ScanPS  [label="Scan: PartSupp", shape=folder, fillcolor="#e2e3e5"];
-    ScanO   [label="Scan: Orders",   shape=folder, fillcolor="#e2e3e5"];
-    ScanL   [label="Scan: Lineitem", shape=folder, fillcolor="#e2e3e5"];
-    ScanP   [label="Scan: Part",     shape=folder, fillcolor="#e2e3e5"];
-
-    MJ2      [label="Merge Join: (nationkey)", fillcolor="#cfe2ff"];
-    MJ3      [label="Merge Join: (orderkey)\nextract(year from o_orderdate) as o_year", fillcolor="#cfe2ff"];
-    SortL    [label="Sort: (partkey, suppkey)"];
-    SelectP  [label="Filter: p_name LIKE '%[COLOR]%'", fillcolor="#f8d7da"];
-    MJ4      [label="Merge Semi Join: (partkey)", fillcolor="#cfe2ff"];
-    MJ_Final [label="Merge Join: (partkey, suppkey)\nn_name, o_year, amount", fillcolor="#cfe2ff"];
-    Sort_MJonS [label="Sort: (suppkey)"];
-    MJ_addsup [label="Merge Join: (suppkey)", fillcolor="#cfe2ff"];
-    SortFinal [label="Sort: (nationkey, o_year)"];
-    Agg      [label="Groupby: (nationkey, n_name, o_year)\nSUM(amount)", fillcolor="#fff3cd"];
-
-    ScanS  -> MJ_addsup;  
-    ScanPS -> MJ_Final;
-    MJ2;  ScanN -> MJ2;
-    ScanO  -> MJ3;  ScanL -> MJ3;
-    MJ3    -> SortL -> MJ4;  ScanP -> SelectP -> MJ4;
-    MJ4    -> MJ_Final;
-    MJ_addsup -> SortFinal -> MJ2;
-    MJ_Final -> Sort_MJonS -> MJ_addsup;
-    MJ2 -> Agg;
-}
-   * <h3>Ideal AFTER structure (merged indexes substituted)</h3>
-   * <pre>
-   *       Only Sort(nation,o_year) → Aggregate(nation,o_year) appear in the query plan, with the sort replaced by the indexed join view produced by the last merge join.
+  /**
+   * TPC-H Q9 (no color filter on part name): 6-table join
+   * ORDERS ⋈ LINEITEM ⋈ PART ⋈ PARTSUPP ⋈ SUPPLIER ⋈ NATION.
    *
+   * <p>Demonstrates <em>full</em> 6-table pipeline substitution across five
+   * nested merged indexes registered bottom-up:
+   * <ol>
+   *   <li>OL: ORDERS ⋈ LINEITEM on {@code o_orderkey = l_orderkey}
+   *   <li>OLP: view(OL) ⋈ PART on {@code l_partkey = p_partkey}
+   *   <li>OLPS: view(OLP) ⋈ PARTSUPP on {@code (l_partkey, l_suppkey) = (ps_partkey, ps_suppkey)}
+   *   <li>OLPPS: view(OLPS) ⋈ SUPPLIER on {@code l_suppkey = s_suppkey}
+   *   <li>OLPPSS+NATION: view(OLPPS) ⋈ NATION on {@code s_nationkey = n_nationkey}
+   * </ol>
+   *
+   * <p>Five HEP passes are applied: each pass fires {@code PipelineToMergedIndexScanRule}
+   * once, bottom-up, until all intermediate merge joins are eliminated.
+   * {@code EnumerableFilter(p_name LIKE '%green%')} remains in the query-time plan
+   * because the PART filter cannot be pushed below the assembled join result.
+   *
+   * <h3>Expected BEFORE structure (order-based pipeline)</h3>
+   * <pre>
+   *   EnumerableSort(n_name ASC, o_year DESC)
+   *     EnumerableAggregate(n_name, o_year)
+   *       EnumerableFilter(p_name LIKE '%green%')
+   *         EnumerableMergeJoin(s_nationkey = n_nationkey)
+   *           EnumerableSort(s_nationkey)
+   *             EnumerableMergeJoin(l_suppkey = s_suppkey)
+   *               EnumerableSort(l_suppkey)
+   *                 EnumerableMergeJoin(l_partkey, l_suppkey = ps_partkey, ps_suppkey)
+   *                   EnumerableSort(l_partkey, l_suppkey)
+   *                     EnumerableMergeJoin(l_partkey = p_partkey)
+   *                       EnumerableSort(l_partkey)
+   *                         EnumerableMergeJoin(o_orderkey = l_orderkey)
+   *                           EnumerableSort → Scan(ORDERS)
+   *                           EnumerableSort → Scan(LINEITEM)
+   *                       EnumerableSort → Scan(PART)
+   *                   EnumerableSort → Scan(PARTSUPP)
+   *               EnumerableSort → Scan(SUPPLIER)
+   *           EnumerableSort → Scan(NATION)
    * </pre>
    *
+   * <h3>Expected AFTER structure (query-time plan)</h3>
+   * <pre>
+   *   EnumerableSort(n_name ASC, o_year DESC)   ← ORDER BY only; no intermediate sorts
+   *     EnumerableAggregate(n_name, o_year)
+   *       EnumerableProject
+   *         EnumerableFilter(p_name LIKE '%green%')
+   *           EnumerableMergedIndexJoin(nationkey, INNER)
+   *             EnumerableMergedIndexScan([view(OLPPS)]:S_NATIONKEY,
+   *                                      [NATION]:N_NATIONKEY)
+   * </pre>
+   *
+   * <p>Full DOT diagrams for BEFORE/AFTER are in {@code test-dot-output/q9_before.dot}
+   * and {@code test-dot-output/q9_after.dot}.
    */
   @Test void tpchQ9() throws Exception {
     // Use explicit JOIN ... ON ... syntax so all join conditions are equi-joins

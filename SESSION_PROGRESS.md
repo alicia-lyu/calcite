@@ -236,9 +236,8 @@ the merged index but the filter cannot be pushed below the assembled join result
 
 ### Short Term (next session)
 
-- **Tag Q9 milestone** — `git tag v0.4-q9-full-substitution` now that all 4 TPC-H tests pass.
-- **Add Javadoc BEFORE/AFTER snippets to `tpchQ9()`** — matching the style of `tpchQ3OrdersLineitem()`;
-  reference the DOT files (`q9_before.dot`, `q9_after.dot`).
+- **More TPC-H queries** — Q5, Q7, Q10 have similar multi-table join patterns; add tests
+  exercising the outer pipeline substitution path.
 
 ### Medium Term
 
