@@ -153,78 +153,110 @@ At query time:                               At update time (like a B-tree):
 
 Full DOT diagrams in `plus/test-dot-output/`. Plans are accurate as of the last test run.
 
+### Query time vs. maintenance time
+
+The BEFORE plan (Phase 1, pre-HEP) IS the maintenance plan for each merged index.
+At update time, when a base table row is inserted/deleted/updated, the affected
+pipeline segment re-executes for the changed key and updates the merged index.
+This is 1-to-1 cost: one base-table change → one merged index entry change,
+the same as a traditional single-table index.
+
+For nested merged indexes (Q3-OL, Q9), updates cascade level-by-level: a base
+table change triggers the inner maintenance plan, whose output delta triggers the
+outer maintenance plan, and so on. Each individual step is still 1-to-1; there
+are depth-many cascading steps total.
+
+---
+
 ### Q12 — 2-table full substitution (`tpchQ12`)
 
-Key: `o_orderkey = l_orderkey`. One HEP pass.
+Key: `o_orderkey = l_orderkey`. One HEP pass. One level, no cascade.
 
 ```text
-BEFORE                                     AFTER
-EnumerableSort                             EnumerableSort
-  EnumerableAggregate                        EnumerableAggregate
-    EnumerableMergeJoin(orderkey)              EnumerableMergedIndexScan
-      EnumerableSort → Scan(ORDERS)              [ORDERS]:O_ORDERKEY
-      EnumerableSort → Scan(LINEITEM)            [LINEITEM]:L_ORDERKEY
+QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLAN (from BEFORE)
+EnumerableSort                             On ORDERS insert(o_orderkey=k):
+  EnumerableAggregate                        insert ORDERS record at key k
+    EnumerableMergedIndexScan                  into MI(ORDERS+LINEITEM)
+      [ORDERS]:O_ORDERKEY                On LINEITEM insert(l_orderkey=k):
+      [LINEITEM]:L_ORDERKEY               insert LINEITEM record at key k
+                                            into MI(ORDERS+LINEITEM)
 ```
+
+Maintenance plan structure (the replaced pipeline from BEFORE):
+```text
+  MergeJoin(orderkey)   ← re-run for delta key k to produce merged index entry
+    Sort → Scan(ORDERS)
+    Sort → Scan(LINEITEM)
+```
+
+---
 
 ### Q3 — 3-table partial substitution (`tpchQ3`)
 
-Key: `c_custkey = o_custkey` (leaf), `o_orderkey = l_orderkey` (outer, stays). One HEP pass.
+Key: `c_custkey = o_custkey` (leaf replaced), `o_orderkey = l_orderkey` (outer, stays at query time). One HEP pass.
+
+The outer join has no registered merged index — it remains in the query-time plan,
+so no maintenance plan is generated for it.
 
 ```text
-BEFORE                                     AFTER
-EnumerableLimitSort                        EnumerableLimitSort
-  EnumerableAggregate                        EnumerableAggregate
-    EnumerableMergeJoin(orderkey) ←outer       EnumerableMergeJoin(orderkey) ← REMAINS
-      EnumerableSort(orderkey)                   EnumerableSort(orderkey)
-        EnumerableMergeJoin(custkey) ←leaf           EnumerableMergedIndexScan
-          EnumerableSort → Scan(CUSTOMER)               [CUSTOMER]:C_CUSTKEY
-          EnumerableSort → Scan(ORDERS)                 [ORDERS]:O_CUSTKEY
-      EnumerableSort → Scan(LINEITEM)            EnumerableSort → Scan(LINEITEM)
+QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLAN for MI(CUSTOMER+ORDERS)
+EnumerableLimitSort                        On CUSTOMER insert(c_custkey=k):
+  EnumerableAggregate                        insert CUSTOMER record at key k
+    EnumerableMergeJoin(orderkey) ←stays   On ORDERS insert(o_custkey=k):
+      EnumerableSort(orderkey)               insert ORDERS record at key k
+        EnumerableMergedIndexScan            into MI(CUSTOMER+ORDERS)
+          [CUSTOMER]:C_CUSTKEY
+          [ORDERS]:O_CUSTKEY             No maintenance plan for outer join
+      EnumerableSort → Scan(LINEITEM)      (LINEITEM ⋈ result stays query-time)
 ```
+
+---
 
 ### Q3-OL — 3-table full substitution (`tpchQ3OrdersLineitem`)
 
-Keys: `l_orderkey = o_orderkey` (inner), `o_custkey = c_custkey` (outer). Two HEP passes.
+Keys: `l_orderkey = o_orderkey` (inner), `o_custkey = c_custkey` (outer). Two HEP passes. Two-level cascade.
 
 ```text
-BEFORE                                     AFTER
-EnumerableLimitSort                        EnumerableLimitSort
-  EnumerableProject                          EnumerableProject
-    EnumerableMergeJoin(custkey) ←outer        EnumerableMergedIndexJoin(custkey, INNER)
-      EnumerableSort(custkey)                    EnumerableMergedIndexScan
-        EnumerableMergeJoin(orderkey) ←inner       [view(OL)]:O_CUSTKEY
-          EnumerableSort                            [CUSTOMER]:C_CUSTKEY
-            EnumerableAggregate → Scan(LINEITEM)
-          EnumerableSort → Scan(ORDERS)
-      EnumerableSort → Scan(CUSTOMER)
+QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLANS (from BEFORE)
+EnumerableLimitSort                        Level 1 — MI(OL) by orderkey:
+  EnumerableProject                          On LINEITEM insert(l_orderkey=k):
+    EnumerableMergedIndexJoin(custkey)         re-aggregate LINEITEM for key k,
+      EnumerableMergedIndexScan                update MI(OL) at k
+        [view(OL)]:O_CUSTKEY               On ORDERS insert(o_orderkey=k):
+        [CUSTOMER]:C_CUSTKEY                 insert ORDERS record at k in MI(OL)
+
+                                           Level 2 — MI(OL+CUSTOMER) by custkey:
+                                             On MI(OL) delta at (orderkey, custkey=c):
+                                               update MI(OL+CUSTOMER) at custkey c
+                                             On CUSTOMER insert(c_custkey=c):
+                                               insert CUSTOMER record at c
 ```
+
+Maintenance plan structure (the two replaced pipelines from BEFORE):
+```text
+  Inner: MergeJoin(orderkey)              Outer: MergeJoin(custkey)
+           Sort(Agg(LINEITEM))                     Sort(MI(OL) view)
+           Sort → Scan(ORDERS)                     Sort → Scan(CUSTOMER)
+```
+
+---
 
 ### Q9 — 6-table full substitution (`tpchQ9`)
 
 Keys: orderkey → partkey → (partkey,suppkey) → suppkey → nationkey. Five HEP passes.
 `findAllPipelines` discovers 5 nested `Pipeline` objects post-order; `MergedIndex.of()`
-builds OL → OLP → OLPS → OLPPS → OLPPSS+NATION bottom-up.
+builds OL → OLP → OLPS → OLPPS → OLPPSS+NATION bottom-up. Five-level cascade.
 
 ```text
-BEFORE                                     AFTER
-EnumerableSort(n_name, o_year DESC)        EnumerableSort(n_name, o_year DESC) ← ORDER BY only
-  EnumerableAggregate(n_name, o_year)        EnumerableAggregate(n_name, o_year)
-    EnumerableFilter(p_name LIKE ...)          EnumerableProject
-      EnumerableMergeJoin(nationkey)             EnumerableFilter(p_name LIKE ...)
-        EnumerableSort                             EnumerableMergedIndexJoin(nationkey, INNER)
-          EnumerableMergeJoin(suppkey)               EnumerableMergedIndexScan
-            EnumerableSort                             [view(OLPPS)]:N_NATIONKEY
-              EnumerableMergeJoin(partkey,suppkey)     [NATION]:N_NATIONKEY
-                EnumerableSort → Scan(PARTSUPP)
-                EnumerableSort
-                  EnumerableMergeJoin(partkey)
-                    EnumerableSort → Scan(PART)
-                    EnumerableSort
-                      EnumerableMergeJoin(orderkey)
-                        EnumerableSort → Scan(ORDERS)
-                        EnumerableSort → Scan(LINEITEM)
-            EnumerableSort → Scan(SUPPLIER)
-        EnumerableSort → Scan(NATION)
+QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLANS (5 levels from BEFORE)
+EnumerableSort(n_name, o_year DESC)        L1 OL(orderkey):   ORDERS/LINEITEM delta
+  EnumerableAggregate(n_name, o_year)      L2 OLP(partkey):   OL/PART delta
+    EnumerableProject                      L3 OLPS(pk,sk):    OLP/PARTSUPP delta
+      EnumerableFilter(p_name LIKE ...)    L4 OLPPS(suppkey): OLPS/SUPPLIER delta
+        EnumerableMergedIndexJoin          L5 final(natkey):  OLPPS/NATION delta
+          EnumerableMergedIndexScan
+            [view(OLPPS)]:S_NATIONKEY      Each level: 1 delta in → 1 MI entry updated
+            [NATION]:N_NATIONKEY           Cascade depth = 5 for a LINEITEM base change
 ```
 
 Note: `EnumerableFilter(p_name LIKE '%green%')` remains because PART is absorbed into
@@ -236,8 +268,13 @@ the merged index but the filter cannot be pushed below the assembled join result
 
 ### Short Term (next session)
 
-- **More TPC-H queries** — Q5, Q7, Q10 have similar multi-table join patterns; add tests
-  exercising the outer pipeline substitution path.
+- **Maintenance plan generation** — add a `@Nullable RelNode maintenancePlan` field to
+  `MergedIndex`; in `Pipeline` (test helper) store the original `EnumerableMergeJoin` node
+  before HEP substitution; in `tpchQ9()` and `tpchQ3OrdersLineitem()` print each
+  registered index's maintenance plan tree alongside the query-time plan, demonstrating
+  the query/maintenance split described in the Test Plan Summaries above.
+  Files to change: `materialize/MergedIndex.java`, `MergedIndexTpchPlanTest.java`
+  (Pipeline class + registration loop + new `printMaintenancePlans()` helper).
 
 ### Medium Term
 
