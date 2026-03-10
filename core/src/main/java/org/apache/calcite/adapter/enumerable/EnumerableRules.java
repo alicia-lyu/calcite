@@ -113,6 +113,17 @@ public class EnumerableRules {
       ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE =
           PipelineToMergedIndexScanRule.Config.DEFAULT.toRule();
 
+  /**
+   * Rule that converts a {@link org.apache.calcite.rel.stream.LogicalDelta}
+   * whose input is an {@link EnumerableMergedIndexScan} into an
+   * {@link EnumerableMergedIndexDeltaScan}.
+   *
+   * <p>Not included in {@link #ENUMERABLE_RULES}; callers opt in explicitly.
+   */
+  public static final DeltaToMergedIndexDeltaScanRule
+      ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE =
+          DeltaToMergedIndexDeltaScanRule.Config.DEFAULT.toRule();
+
   public static final EnumerableLimitSortRule ENUMERABLE_LIMIT_SORT_RULE =
       EnumerableLimitSortRule.Config.DEFAULT.toRule();
 

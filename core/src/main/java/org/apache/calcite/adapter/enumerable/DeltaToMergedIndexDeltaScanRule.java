@@ -18,7 +18,6 @@ package org.apache.calcite.adapter.enumerable;
 
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelRule;
-import org.apache.calcite.rel.rel2sql.RelToSqlConverter;
 import org.apache.calcite.rel.rules.TransformationRule;
 import org.apache.calcite.rel.stream.LogicalDelta;
 
@@ -40,6 +39,7 @@ import org.immutables.value.Value;
  * <p>See: "Storing and Indexing Multiple Tables by Interesting Orderings",
  * Wenhui Lyu &amp; Goetz Graefe, VLDB 2026.
  */
+@Value.Enclosing
 public class DeltaToMergedIndexDeltaScanRule
     extends RelRule<DeltaToMergedIndexDeltaScanRule.Config>
     implements TransformationRule {
@@ -60,10 +60,10 @@ public class DeltaToMergedIndexDeltaScanRule
   /** Rule configuration. */
   @Value.Immutable
   public interface Config extends RelRule.Config {
-    Config DEFAULT = ImmutableDeltaToMergedIndexDeltaScanRuleConfig.builder()
-        .operandSupplier(b0 -> b0.operand(LogicalDelta.class).oneInput(
-            b1 -> b1.operand(EnumerableMergedIndexScan.class).noInputs()))
-        .build();
+    Config DEFAULT =
+        ImmutableDeltaToMergedIndexDeltaScanRule.Config.of()
+            .withOperandSupplier(b0 -> b0.operand(LogicalDelta.class).oneInput(
+                b1 -> b1.operand(EnumerableMergedIndexScan.class).noInputs()));
 
     @Override default DeltaToMergedIndexDeltaScanRule toRule() {
       return new DeltaToMergedIndexDeltaScanRule(this);
