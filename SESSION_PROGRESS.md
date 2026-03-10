@@ -423,24 +423,29 @@ cascade level.
 
 ### Short Term (next session)
 
-- **`EnumerableMergedIndexDeltaScan` operator** — `deriveIncrementalPlan()` currently
-  leaves `LogicalDelta(EnumerableMergedIndexScan)` as an unresolved leaf for nested
-  pipelines (Q3-OL outer, Q9 levels 1-4). A new physical operator
-  `EnumerableMergedIndexDeltaScan` (analogous to `EnumerableMergedIndexScan`) is needed
-  to represent "new rows arriving from an inner merged index." Add it to
-  `adapter/enumerable/` and add a StreamRule that converts `LogicalDelta` over
-  `EnumerableMergedIndexScan` to `EnumerableMergedIndexDeltaScan`.
+1. **Fix `deriveIncrementalPlan` for phase-1 accuracy**
+   (file: `MergedIndexTpchPlanTest.java`, method `deriveIncrementalPlan`)
+   - Branch 2 (`left ⋈ Δ(right)`) is wrong for direct-insert sources — a bare
+     `Sort → TableScan` with no aggregation on top needs no join; only emit
+     `LogicalDelta(right)`.
+   - Fix: inspect the right-hand source; if it is `Sort → TableScan` (no Agg), emit
+     `LogicalDelta(right)` alone; if it is `Sort → Agg → Scan`, keep the join branch.
+   - Update test assertions: `containsString("LogicalJoin")` will need refinement to
+     match the corrected shape.
 
-- **Tag-based lazy propagation design** — document the tag-based approach in
-  `SESSION_PROGRESS.md` and `CLAUDE.md`: each merged-index record carries a 1-byte
-  `propagated` flag. On base-table insert → insert into MI with flag=false. A background
-  worker finds untagged records, assembles the delta join (using `deriveIncrementalPlan`
-  output as the plan template), propagates to the next-level MI, then marks as propagated.
-  This avoids storing full delta records and keeps update cost O(1) amortized.
+2. **Generate maintenance plan DOT files**
+   (file: `MergedIndexTpchPlanTest.java`)
+   - After deriving each `maintenancePlan`, call the existing `writeDot` helper, e.g.,
+     `writeDot("q12_maintenance.dot", maintenancePlan)`.
+   - Output goes to `plus/test-dot-output/` alongside the existing BEFORE/AFTER query
+     plan DOTs.
 
-- **Maintenance plan section in paper notes** — add a short prose description to
-  `SESSION_PROGRESS.md` explaining the two-tier plan: query tier (one scan) + maintenance
-  tier (IVM formula derived this session).
+3. **`EnumerableMergedIndexDeltaScan` operator**
+   (new file: `adapter/enumerable/EnumerableMergedIndexDeltaScan.java`; new StreamRule)
+   - `deriveIncrementalPlan()` leaves `LogicalDelta(EnumerableMergedIndexScan)` as an
+     unresolved leaf for nested pipelines (Q3-OL outer, Q9 levels 1–4).
+   - Implement a physical operator analogous to `EnumerableMergedIndexScan` and a rule
+     converting `LogicalDelta(EnumerableMergedIndexScan) → EnumerableMergedIndexDeltaScan`.
 
 ### Medium Term
 
