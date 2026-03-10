@@ -18,6 +18,7 @@ package org.apache.calcite.adapter.tpch;
 
 import org.apache.calcite.adapter.enumerable.EnumerableConvention;
 import org.apache.calcite.adapter.enumerable.EnumerableMergeJoin;
+import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexDeltaScan;
 import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan;
 import org.apache.calcite.adapter.enumerable.EnumerableRules;
 import org.apache.calcite.adapter.enumerable.EnumerableSort;
@@ -517,6 +518,24 @@ class MergedIndexTpchPlanTest {
       assertThat("Q3-OL pipeline missing maintenance plan",
           p.mergedIndex.getMaintenancePlan() != null, is(true));
     }
+
+    // ── Verify DeltaToMergedIndexDeltaScanRule ────────────────────────────
+    // Construct a synthetic LogicalDelta(EnumerableMergedIndexScan) and verify
+    // the rule converts it to EnumerableMergedIndexDeltaScan.
+    final EnumerableMergedIndexScan innerScan =
+        EnumerableMergedIndexScan.create(
+            phase2Plan.getCluster(),
+            pipelines.get(0).mergedIndex,
+            logicalJoinsOL.get(0).getRowType());
+    final RelNode deltaOfScan = LogicalDelta.create(innerScan);
+    final HepProgram deltaProgram = HepProgram.builder()
+        .addRuleInstance(
+            EnumerableRules.ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE)
+        .build();
+    final HepPlanner deltaPlanner = new HepPlanner(deltaProgram);
+    deltaPlanner.setRoot(deltaOfScan);
+    final RelNode resolvedDeltaPlan = deltaPlanner.findBestExp();
+    assertThat(dumpText(resolvedDeltaPlan), containsString("EnumerableMergedIndexDeltaScan"));
   }
 
   // ── Pipeline discovery helpers for tpchQ3OrdersLineitem ──────────────────
