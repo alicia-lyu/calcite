@@ -288,6 +288,28 @@ Keys: orderkey → partkey → (partkey,suppkey) → suppkey → nationkey. Five
 builds OL → OLP → OLPS → OLPPS → OLPPSS+NATION bottom-up. Five-level cascade.
 
 ```text
+BEFORE                                     AFTER
+EnumerableSort(n_name, o_year DESC)        EnumerableSort(n_name, o_year DESC) ← ORDER BY only
+  EnumerableAggregate(n_name, o_year)        EnumerableAggregate(n_name, o_year)
+    EnumerableFilter(p_name LIKE ...)          EnumerableProject
+      EnumerableMergeJoin(nationkey)             EnumerableFilter(p_name LIKE ...)
+        EnumerableSort                             EnumerableMergedIndexJoin(nationkey, INNER)
+          EnumerableMergeJoin(suppkey)               EnumerableMergedIndexScan
+            EnumerableSort                             [view(OLPPS)]:N_NATIONKEY
+              EnumerableMergeJoin(partkey,suppkey)     [NATION]:N_NATIONKEY
+                EnumerableSort → Scan(PARTSUPP)
+                EnumerableSort
+                  EnumerableMergeJoin(partkey)
+                    EnumerableSort → Scan(PART)
+                    EnumerableSort
+                      EnumerableMergeJoin(orderkey)
+                        EnumerableSort → Scan(ORDERS)
+                        EnumerableSort → Scan(LINEITEM)
+            EnumerableSort → Scan(SUPPLIER)
+        EnumerableSort → Scan(NATION)
+```
+
+```text
 QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLANS (5 levels from BEFORE)
 EnumerableSort(n_name, o_year DESC)        L1 OL(orderkey):   ORDERS/LINEITEM delta
   EnumerableAggregate(n_name, o_year)      L2 OLP(partkey):   OL/PART delta
