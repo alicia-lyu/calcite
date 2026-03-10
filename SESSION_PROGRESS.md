@@ -332,6 +332,7 @@ so it is left as an unresolved leaf. A new physical operator
 ### Tag-based lazy propagation (future design)
 
 Each merged-index record carries a 1-byte `propagated` flag. On base-table insert:
+
 1. Insert into MI with `propagated=false`.
 2. Background worker finds untagged records, joins with partners (using the
    `deriveIncrementalPlan` output as the plan template), propagates delta to next-level MI.
