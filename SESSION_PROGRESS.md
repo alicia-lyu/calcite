@@ -420,14 +420,13 @@ cascade level.
 
 ### Short Term (next session)
 
-1. **Resolve outer pipeline delta leaf**
-   (file: `MergedIndexTpchPlanTest.java`, method `tpchQ3OrdersLineitem`)
-   - The outer MI's maintenance plan has `LogicalDelta(Sort(inner_logical_join))` as
-     its left branch. This should eventually become `EnumerableMergedIndexDeltaScan(inner_MI)`.
-   - Fix: after Phase 2, replace the left branch with a `LogicalDelta` wrapping the
-     physical `EnumerableMergedIndexScan` from `afterPass1`, then apply
-     `ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE`.
-   - Target assertion: outer maintenance plan contains `EnumerableMergedIndexDeltaScan`.
+**Resolve outer pipeline delta leaf**
+(file: `MergedIndexTpchPlanTest.java`, method `tpchQ3OrdersLineitem`)
+
+The last task fixed the maintenance plan for leaf merged indexes, but not for branch/root merged indexes. Specifically, phase 2 should only contain the delta equivalent of the pipeline of this branch merged index. This pipeline is cut off on both ends by sorts, the inbound sorts represent delta coming from the upstream merged index, and a single `LogicalDelta(MI_OL)` represent it. When the downstream operator can pull delta records from this `LogicalDelta(MI_OL)` one by one, which may trigger the leaf maintenance plan.
+I understand that, this should eventually become `EnumerableMergedIndexDeltaScan(inner_MI)`, but on the logical level your implementation is wrong.
+
+### Medium Term
 
 2. **Visually verify maintenance plan DOTs**
    (output: `plus/test-dot-output/*_maintenance*.dot`)
