@@ -173,6 +173,17 @@ are depth-many cascading steps total.
 Key: `o_orderkey = l_orderkey`. One HEP pass. One level, no cascade.
 
 ```text
+BEFORE                                     AFTER (Query plan only)
+EnumerableSort                             EnumerableSort
+  EnumerableAggregate                        EnumerableAggregate
+    EnumerableMergeJoin(orderkey)              EnumerableMergedIndexScan
+      EnumerableSort → Scan(ORDERS)              [ORDERS]:O_ORDERKEY
+      EnumerableSort → Scan(LINEITEM)            [LINEITEM]:L_ORDERKEY
+```
+
+After: query plan + maintenance plan
+
+```text
 QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLAN (from BEFORE)
 EnumerableSort                             On ORDERS insert(o_orderkey=k):
   EnumerableAggregate                        insert ORDERS record at key k
@@ -191,30 +202,24 @@ Maintenance plan structure (the replaced pipeline from BEFORE):
 
 ---
 
-### Q3 — 3-table partial substitution (`tpchQ3`)
-
-Key: `c_custkey = o_custkey` (leaf replaced), `o_orderkey = l_orderkey` (outer, stays at query time). One HEP pass.
-
-The outer join has no registered merged index — it remains in the query-time plan,
-so no maintenance plan is generated for it.
-
-```text
-QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLAN for MI(CUSTOMER+ORDERS)
-EnumerableLimitSort                        On CUSTOMER insert(c_custkey=k):
-  EnumerableAggregate                        insert CUSTOMER record at key k
-    EnumerableMergeJoin(orderkey) ←stays   On ORDERS insert(o_custkey=k):
-      EnumerableSort(orderkey)               insert ORDERS record at key k
-        EnumerableMergedIndexScan            into MI(CUSTOMER+ORDERS)
-          [CUSTOMER]:C_CUSTKEY
-          [ORDERS]:O_CUSTKEY             No maintenance plan for outer join
-      EnumerableSort → Scan(LINEITEM)      (LINEITEM ⋈ result stays query-time)
-```
-
----
-
 ### Q3-OL — 3-table full substitution (`tpchQ3OrdersLineitem`)
 
 Keys: `l_orderkey = o_orderkey` (inner), `o_custkey = c_custkey` (outer). Two HEP passes. Two-level cascade.
+
+```text
+BEFORE                                     AFTER (Query plan only)
+EnumerableLimitSort                        EnumerableLimitSort
+  EnumerableProject                          EnumerableProject
+    EnumerableMergeJoin(custkey) ←outer        EnumerableMergedIndexJoin(custkey, INNER)
+      EnumerableSort(custkey)                    EnumerableMergedIndexScan
+        EnumerableMergeJoin(orderkey) ←inner       [view(OL)]:O_CUSTKEY
+          EnumerableSort                            [CUSTOMER]:C_CUSTKEY
+            EnumerableAggregate → Scan(LINEITEM)
+          EnumerableSort → Scan(ORDERS)
+      EnumerableSort → Scan(CUSTOMER)
+```
+
+After: query plan + maintenance plan
 
 ```text
 QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLANS (from BEFORE)
@@ -237,6 +242,41 @@ Maintenance plan structure (the two replaced pipelines from BEFORE):
   Inner: MergeJoin(orderkey)              Outer: MergeJoin(custkey)
            Sort(Agg(LINEITEM))                     Sort(MI(OL) view)
            Sort → Scan(ORDERS)                     Sort → Scan(CUSTOMER)
+```
+
+---
+
+### Incorrect example: Q3 — 3-table partial substitution (`tpchQ3`)
+
+Key: `c_custkey = o_custkey` (leaf replaced), `o_orderkey = l_orderkey` (outer, stays at query time). One HEP pass.
+
+```text
+BEFORE                                     AFTER (Query plan only)
+EnumerableLimitSort                        EnumerableLimitSort
+  EnumerableAggregate                        EnumerableAggregate
+    EnumerableMergeJoin(orderkey) ←outer       EnumerableMergeJoin(orderkey) ← REMAINS
+      EnumerableSort(orderkey)                   EnumerableSort(orderkey)
+        EnumerableMergeJoin(custkey) ←leaf           EnumerableMergedIndexScan
+          EnumerableSort → Scan(CUSTOMER)               [CUSTOMER]:C_CUSTKEY
+          EnumerableSort → Scan(ORDERS)                 [ORDERS]:O_CUSTKEY
+      EnumerableSort → Scan(LINEITEM)            EnumerableSort → Scan(LINEITEM)
+```
+
+After: query plan + maintenance plan
+
+The outer join has no registered merged index — it remains in the query-time plan,
+so no maintenance plan is generated for it.
+
+```text
+QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLAN for MI(CUSTOMER+ORDERS)
+EnumerableLimitSort                        On CUSTOMER insert(c_custkey=k):
+  EnumerableAggregate                        insert CUSTOMER record at key k
+    EnumerableMergeJoin(orderkey) ←stays   On ORDERS insert(o_custkey=k):
+      EnumerableSort(orderkey)               insert ORDERS record at key k
+        EnumerableMergedIndexScan            into MI(CUSTOMER+ORDERS)
+          [CUSTOMER]:C_CUSTKEY
+          [ORDERS]:O_CUSTKEY             No maintenance plan for outer join
+      EnumerableSort → Scan(LINEITEM)      (LINEITEM ⋈ result stays query-time)
 ```
 
 ---
@@ -268,13 +308,11 @@ the merged index but the filter cannot be pushed below the assembled join result
 
 ### Short Term (next session)
 
-- **Maintenance plan generation** — add a `@Nullable RelNode maintenancePlan` field to
-  `MergedIndex`; in `Pipeline` (test helper) store the original `EnumerableMergeJoin` node
-  before HEP substitution; in `tpchQ9()` and `tpchQ3OrdersLineitem()` print each
-  registered index's maintenance plan tree alongside the query-time plan, demonstrating
-  the query/maintenance split described in the Test Plan Summaries above.
-  Files to change: `materialize/MergedIndex.java`, `MergedIndexTpchPlanTest.java`
-  (Pipeline class + registration loop + new `printMaintenancePlans()` helper).
+- **Maintenance plan generation**: explore how Calcite support incremental view maintenance. We will rely on this machinery to generate maintenance plans as shown above. Right now our code only generates query plans. I can think of the following tricky points:
+  - The view delta is inserted not into a materialized view strictly speaking, but into a merged index that stores a materialized view.
+  - Merged index delta might cascade into the next level of merged index maintenance. Calcite likely only defined base table update triggers, so we may need to define merged index delta triggers.
+  - Merge index delta is also unique in that there is typically a step of query processing to generate the delta (e.g., assembling joined records). But without this actual step we should be able to determine the size of the delta. For now, we can always process this step and leave this async triggering for the future (please still explore and write notes about it).
+  - To generate delta from merged index A to merged index B, the naive way is, upon insertions into A, we process the required step (e.g., join) and store this delta in a log. The better way is to tag each record in A whether they are propagated to B. Note that, for a joined record to B, as long as one of the participant is not propagated, this joined record will be propagated. With this tag, we only need to keep track of the delta size + sort key instead of the actual delta records in the log. Upon propagation, we process the required step, update the tag, and assemble the delta to B. However, the implementation of the latter might be too complex for this session, so we can start with the naive way, only explore the latter a bit, and write notes about it.
 
 ### Medium Term
 
