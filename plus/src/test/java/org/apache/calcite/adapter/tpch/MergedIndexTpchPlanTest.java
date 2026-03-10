@@ -39,6 +39,7 @@ import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
+import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.core.TableScan;
@@ -208,7 +209,8 @@ class MergedIndexTpchPlanTest {
         collationLeft,
         rowCount);
     // logicalJoins.get(0) = innermost (CUSTOMER ⋈ ORDERS) logical join
-    miQ3.setMaintenancePlan(deriveIncrementalPlan(logicalJoins.get(0)));
+    miQ3.setMaintenancePlan(deriveIncrementalPlan(
+        List.of(logicalJoins.get(0).getLeft(), logicalJoins.get(0).getRight())));
     MergedIndexRegistry.register(miQ3);
 
     System.out.println("=== Q3 MAINTENANCE PLAN (incremental) ===");
@@ -239,9 +241,9 @@ class MergedIndexTpchPlanTest {
         miQ3.getMaintenancePlan() != null, is(true));
     final String maintStr3 = dumpText(miQ3.getMaintenancePlan());
     assertThat(maintStr3, containsString("LogicalUnion"));
-    // Branch 1 (Δ(CUSTOMER) ⋈ ORDERS) has a join; branch 2 (Δ(ORDERS)) does not.
-    assertThat(countOccurrences(maintStr3, "LogicalJoin"), is(1));
-    assertThat(maintStr3, containsString("LogicalDelta"));
+    // Each source inserts independently — no join needed in the maintenance plan.
+    assertThat(countOccurrences(maintStr3, "LogicalJoin"), is(0));
+    assertThat(countOccurrences(maintStr3, "LogicalDelta"), is(2));
   }
 
   /**
@@ -332,7 +334,8 @@ class MergedIndexTpchPlanTest {
         List.of(collationOrders, collationLineitem),
         collationOrders,
         rowCount);
-    miQ12.setMaintenancePlan(deriveIncrementalPlan(logicalJoinQ12));
+    miQ12.setMaintenancePlan(deriveIncrementalPlan(
+        List.of(logicalJoinQ12.getLeft(), logicalJoinQ12.getRight())));
     MergedIndexRegistry.register(miQ12);
 
     System.out.println("=== Q12 MAINTENANCE PLAN (incremental) ===");
@@ -360,9 +363,9 @@ class MergedIndexTpchPlanTest {
         miQ12.getMaintenancePlan() != null, is(true));
     final String maintStr12 = dumpText(miQ12.getMaintenancePlan());
     assertThat(maintStr12, containsString("LogicalUnion"));
-    // Branch 1 (Δ(ORDERS) ⋈ LINEITEM) has a join; branch 2 (Δ(LINEITEM)) does not.
-    assertThat(countOccurrences(maintStr12, "LogicalJoin"), is(1));
-    assertThat(maintStr12, containsString("LogicalDelta"));
+    // Each source inserts independently — no join needed in the maintenance plan.
+    assertThat(countOccurrences(maintStr12, "LogicalJoin"), is(0));
+    assertThat(countOccurrences(maintStr12, "LogicalDelta"), is(2));
   }
 
   /**
@@ -468,7 +471,9 @@ class MergedIndexTpchPlanTest {
       p.mergedIndex = MergedIndex.of(resolved, p.sourceCollations,
           p.sharedCollation, p.rowCount);
       // Use logical join (SQL types) for IVM derivation — matches StreamRules expectations
-      p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(logicalJoinsOL.get(i)));
+      final Join ljOL = logicalJoinsOL.get(i);
+      p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
+          List.of(ljOL.getLeft(), ljOL.getRight())));
       MergedIndexRegistry.register(p.mergedIndex);
     }
 
@@ -513,10 +518,13 @@ class MergedIndexTpchPlanTest {
     assertThat(afterStr, not(containsString("EnumerableMergedIndexAggregate")));
     // Outer merged index involves CUSTOMER key
     assertThat(afterStr, containsString("C_CUSTKEY"));
-    // All pipelines have maintenance plans
+    // All pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.
+    // Outer pipelines may contain nested LogicalJoin inside a delta (from the inner pipeline).
     for (Pipeline p : pipelines) {
       assertThat("Q3-OL pipeline missing maintenance plan",
           p.mergedIndex.getMaintenancePlan() != null, is(true));
+      final String m = dumpText(p.mergedIndex.getMaintenancePlan());
+      assertThat(countOccurrences(m, "LogicalDelta"), is(2));
     }
 
     // ── Verify DeltaToMergedIndexDeltaScanRule ────────────────────────────
@@ -793,7 +801,9 @@ class MergedIndexTpchPlanTest {
       p.mergedIndex = MergedIndex.of(resolved, p.sourceCollations,
           p.sharedCollation, p.rowCount);
       // Use logical join (SQL types) for IVM derivation — matches StreamRules expectations
-      p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(logicalJoinsQ9.get(i)));
+      final Join ljQ9 = logicalJoinsQ9.get(i);
+      p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
+          List.of(ljQ9.getLeft(), ljQ9.getRight())));
       MergedIndexRegistry.register(p.mergedIndex);
     }
 
@@ -830,74 +840,48 @@ class MergedIndexTpchPlanTest {
     assertThat(countOccurrences(afterStr, "EnumerableSort("), is(1));
     assertThat(afterStr, containsString("EnumerableMergedIndexJoin"));
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
-    // All pipelines have maintenance plans
+    // All pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.
+    // Outer pipelines may contain nested LogicalJoin inside a delta (from the inner pipeline).
     for (Pipeline p : pipelines) {
       assertThat("Q9 pipeline missing maintenance plan",
           p.mergedIndex.getMaintenancePlan() != null, is(true));
+      final String m = dumpText(p.mergedIndex.getMaintenancePlan());
+      assertThat(countOccurrences(m, "LogicalDelta"), is(2));
     }
   }
 
   // ── IVM helpers ──────────────────────────────────────────────────────────
 
   /**
-   * Derives the incremental maintenance plan for one pipeline join.
+   * Derives the incremental maintenance plan for a merged-index pipeline.
    *
-   * <p>Directly constructs the semi-naive IVM decomposition without going through the
-   * HEP planner (which would invoke {@code verifyTypeEquivalence} and fail because
-   * the TPC-H schema uses {@code JavaType(String)} while {@code DeltaJoinTransposeRule}
-   * creates new {@code LogicalJoin}s whose row types are recomputed as SQL {@code VARCHAR}).
+   * <p>A merged index stores records from each source independently, interleaved by
+   * sort key. Each source independently inserts its records at update time — no join
+   * against any other source is needed at the MI level. The maintenance plan is
+   * therefore a union of independent delta streams, one per sorted input:
    *
-   * <p>Result structure:
    * <pre>
    *   LogicalUnion(all=true)
-   *     LogicalJoin(condition, INNER)   ← Δ(left) ⋈ right  (new rows from left)
-   *       LogicalDelta(left)
-   *       right
-   *     LogicalJoin(condition, INNER)   ← left ⋈ Δ(right)  (new rows from right)
-   *       left
-   *       LogicalDelta(right)
+   *     LogicalDelta(sortedInputs.get(0))
+   *     LogicalDelta(sortedInputs.get(1))
+   *     ...
    * </pre>
-   * where {@code LogicalDelta(scan)} represents new rows arriving from a base table
-   * or inner merged index.
+   *
+   * <p>For nested pipelines (outer MI), the left sorted input wraps the entire inner
+   * pipeline (e.g., {@code Sort(inner_join_result)}). {@code LogicalDelta} over this
+   * node means "run the inner pipeline for changed keys and emit the assembled delta,"
+   * which is the Phase 2 propagation defined by the inner pipeline's own operators.
+   * No additional join against the right source is added here.
+   *
+   * <p>{@code sortedInputs} are the sort nodes immediately feeding the pipeline
+   * operator (join, aggregate, etc.) — the boundaries of the interesting-ordering
+   * pipeline that defines this MI.
    */
-  private static RelNode deriveIncrementalPlan(Join join) {
-    final RelNode left = join.getLeft();
-    final RelNode right = join.getRight();
-
-    // Branch 1: Δ(left) ⋈ right  — new rows from the left source
-    final LogicalJoin joinDeltaLeft =
-        LogicalJoin.create(LogicalDelta.create(left), right, join.getHints(),
-            join.getCondition(), join.getVariablesSet(), join.getJoinType(),
-            join.isSemiJoinDone(),
-            ImmutableList.copyOf(join.getSystemFieldList()));
-
-    // Branch 2: if right is a bare Sort → TableScan, just emit Δ(right) —
-    //   new record is directly inserted into the MI at its sort key (no join needed).
-    //   If right has an Aggregate or inner Join on top, keep the full left ⋈ Δ(right).
-    final RelNode branch2;
-    if (isDirectTableInput(right)) {
-      branch2 = LogicalDelta.create(right);
-    } else {
-      branch2 = LogicalJoin.create(left, LogicalDelta.create(right), join.getHints(),
-          join.getCondition(), join.getVariablesSet(), join.getJoinType(),
-          join.isSemiJoinDone(),
-          ImmutableList.copyOf(join.getSystemFieldList()));
-    }
-
-    return LogicalUnion.create(List.of(joinDeltaLeft, branch2), true);
-  }
-
-  /**
-   * Returns true if {@code node} is a {@link Sort} whose immediate input is a
-   * {@link TableScan} (no intermediate Aggregate or Project).
-   * Used to distinguish direct-insert sources from aggregated views.
-   */
-  private static boolean isDirectTableInput(RelNode node) {
-    if (!(node instanceof Sort)) {
-      return false;
-    }
-    final RelNode input = ((Sort) node).getInput();
-    return input instanceof TableScan;
+  private static RelNode deriveIncrementalPlan(List<RelNode> sortedInputs) {
+    final List<RelNode> branches = sortedInputs.stream()
+        .map(LogicalDelta::create)
+        .collect(Collectors.toList());
+    return LogicalUnion.create(branches, true);
   }
 
   /** Prints maintenance plans for all pipelines to stdout. */
@@ -944,6 +928,16 @@ class MergedIndexTpchPlanTest {
    * join uses a different key) are handled correctly.
    */
   private static RelNode injectSortsBeforeJoin(RelNode node) {
+    if (node instanceof Aggregate) {
+      // Recurse into the aggregate's input to process any nested joins.
+      // Do NOT inject a sort here: when this aggregate is a join input, the enclosing
+      // join branch wraps it in a LogicalSort externally, and the Volcano planner pushes
+      // the sort requirement inside via EnumerableSortedAggregate.passThroughTraits.
+      // Top-level aggregates (e.g., Q9 GROUP BY) must not receive an injected sort.
+      final Aggregate agg = (Aggregate) node;
+      final RelNode newInput = injectSortsBeforeJoin(agg.getInput());
+      return agg.copy(agg.getTraitSet(), List.of(newInput));
+    }
     if (node instanceof Join) {
       final Join join = (Join) node;
       final List<Integer> leftKeys = new ArrayList<>();
@@ -973,6 +967,20 @@ class MergedIndexTpchPlanTest {
         .map(MergedIndexTpchPlanTest::injectSortsBeforeJoin)
         .collect(Collectors.toList());
     return node.copy(node.getTraitSet(), newInputs);
+  }
+
+  /** Returns true if {@code input}'s trait set already satisfies {@code required} as a prefix. */
+  private static boolean inputAlreadySorted(RelNode input, RelCollation required) {
+    final RelCollation existing =
+        input.getTraitSet().getTrait(RelCollationTraitDef.INSTANCE);
+    if (existing == null || existing.getFieldCollations().isEmpty()) return false;
+    final List<RelFieldCollation> req = required.getFieldCollations();
+    final List<RelFieldCollation> have = existing.getFieldCollations();
+    if (have.size() < req.size()) return false;
+    for (int i = 0; i < req.size(); i++) {
+      if (req.get(i).getFieldIndex() != have.get(i).getFieldIndex()) return false;
+    }
+    return true;
   }
 
   /**
