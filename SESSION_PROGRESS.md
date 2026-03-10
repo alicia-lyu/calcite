@@ -366,25 +366,24 @@ Note that a join-like lookup in the outer merged index is still NOT required.
 - Phase 1 updates leaf merged indexes that correspond to leaf pipelines.
 - Phase 2 updates non-leaf merged indexes that correspond to inner pipelines.
 
-### Current `deriveIncrementalPlan` — branch-2 fix (2026-03-10)
+### Current `deriveIncrementalPlan` — union of independent deltas (2026-03-10)
 
-Branch 2 is now correct for **direct-insert sources** (`Sort → TableScan` with no
-`Aggregate` on top).
-The helper `isDirectTableInput(RelNode)` detects this case and
-emits `LogicalDelta(right)` alone — no join:
+A merged index stores records from each source **independently**, interleaved by
+sort key. No join between sources is needed at maintenance time — each source inserts
+its records directly at the appropriate sort key. The maintenance plan is therefore:
 
 ```text
-LogicalUnion
-  LogicalJoin(orderkey) // why is a join here? In this leaf pipeline, not one join appeared, it is cut off at the first sorts, which immediately precedes the join.
-    LogicalDelta(Sort(Agg(LINEITEM)))   ← correct: LINEITEM delta re-aggregates
-    Sort(ORDERS)
-  LogicalDelta(Sort(ORDERS))            ← fixed: ORDERS record inserts directly; no join
+LogicalUnion(all=true)
+  LogicalDelta(sortedInputs[0])    ← new records from source 0
+  LogicalDelta(sortedInputs[1])    ← new records from source 1
+  ...
 ```
 
-For nested pipelines (Q3-OL outer, Q9 levels 1–4), branch 1 is
-`LogicalJoin(LogicalDelta(Sort→inner_join), Sort→right)`. The
-`LogicalDelta(Sort→inner_join)` leaf is still unresolved — it represents a delta
-arriving from the inner MI but has no physical operator yet.
+For nested pipelines (Q3-OL outer, Q9 levels 1–4), the left sorted input wraps
+the entire inner pipeline (e.g., `Sort(inner_join_result)`). `LogicalDelta` over
+this node means "run the inner pipeline for changed keys and emit the assembled
+delta" — the Phase 2 propagation is defined by the inner pipeline's own operators.
+No additional join node is added at the outer MI level.
 
 The implementation bypasses `HepPlanner + StreamRules` because
 `DeltaJoinTransposeRule.onMatch()` calls `HepRuleCall.transformTo()` which runs
@@ -401,22 +400,6 @@ By constructing the plan directly, we avoid the type mismatch entirely.
 `DeltaToMergedIndexDeltaScanRule` matches `LogicalDelta(EnumerableMergedIndexScan)`
 and replaces it with `EnumerableMergedIndexDeltaScan`. Tested in `tpchQ3OrdersLineitem`
 by constructing a synthetic `LogicalDelta(innerScan)` and verifying the rule fires.
-
-### Remaining gap: outer pipeline branch-1 resolution
-
-For outer pipelines, branch 1 of the maintenance plan is:
-
-```text
-LogicalJoin(LogicalDelta(Sort→inner_logical_join), Sort→CUSTOMER)
-```
-
-The `LogicalDelta(Sort→inner_logical_join)` should ultimately become
-`EnumerableMergedIndexDeltaScan(inner_MI)`, but the logical plan is derived from
-logical joins (not physical), so the inner join node is `LogicalJoin`, not
-`EnumerableMergedIndexScan`. Resolving this requires either:
-
-- Running physical planning on the outer maintenance plan, then applying the delta rule, or
-- Building the outer maintenance plan using already-physical inner nodes (post-Phase-2).
 
 ### Tag-based lazy propagation (future design)
 
@@ -437,22 +420,14 @@ cascade level.
 
 ### Short Term (next session)
 
-1. `injectSortsBeforeJoin` in `MergedIndexTpchPlanTest.java` should be expanded to inject sorts before group-by, order-by, distinct. Note that their inputs may already have the desired sort order, so verification is required.
-
-2. `deriveIncrementalPlan` should not take `Join join` as input but rather a list of logical sorts (verify that their sort order is compatible---same key or prefix chain), since it is sorts that define the boundaries of pipelines. Any record going in the sort is equivalently going into the required merged index. You seem overly obsessed with joins whereas the core of this project is sort (you thought that each join should correspond to a merged index, instead it is each pipeline), and join is only an important application.
-
-### Medium Term
-
-3. **Resolve outer pipeline branch-1 maintenance leaf**
+1. **Resolve outer pipeline delta leaf**
    (file: `MergedIndexTpchPlanTest.java`, method `tpchQ3OrdersLineitem`)
-   - Branch 1 of the outer pipeline maintenance plan contains
-     `LogicalDelta(Sort→inner_logical_join)`. This should become
-     `EnumerableMergedIndexDeltaScan(inner_MI)`.
-   - Fix: build the outer maintenance plan after Phase 2, substituting the physical
-     `EnumerableMergedIndexScan` from `afterPass1` as the left input instead of the
-     logical join. Then apply `ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE`.
-   - Target assertion: `dumpText(resolvedOuterMaintPlan)` contains
-     `EnumerableMergedIndexDeltaScan`.
+   - The outer MI's maintenance plan has `LogicalDelta(Sort(inner_logical_join))` as
+     its left branch. This should eventually become `EnumerableMergedIndexDeltaScan(inner_MI)`.
+   - Fix: after Phase 2, replace the left branch with a `LogicalDelta` wrapping the
+     physical `EnumerableMergedIndexScan` from `afterPass1`, then apply
+     `ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE`.
+   - Target assertion: outer maintenance plan contains `EnumerableMergedIndexDeltaScan`.
 
 2. **Visually verify maintenance plan DOTs**
    (output: `plus/test-dot-output/*_maintenance*.dot`)
