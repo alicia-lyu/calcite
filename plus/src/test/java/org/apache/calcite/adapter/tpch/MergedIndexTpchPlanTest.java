@@ -39,6 +39,8 @@ import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
 import org.apache.calcite.rel.core.Join;
+import org.apache.calcite.rel.core.Sort;
+import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.logical.LogicalUnion;
@@ -210,6 +212,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q3 MAINTENANCE PLAN (incremental) ===");
     System.out.println(dumpText(miQ3.getMaintenancePlan()));
+    writeDotFile("q3_maintenance", miQ3.getMaintenancePlan());
 
     // ── Phase 2: HEP planner fires PipelineToMergedIndexScanRule ──────────
     final HepProgram hepProgram = HepProgram.builder()
@@ -233,8 +236,11 @@ class MergedIndexTpchPlanTest {
     // Maintenance plan derives IVM decomposition
     assertThat("Q3 inner MI missing maintenance plan",
         miQ3.getMaintenancePlan() != null, is(true));
-    assertThat(dumpText(miQ3.getMaintenancePlan()), containsString("LogicalUnion"));
-    assertThat(dumpText(miQ3.getMaintenancePlan()), containsString("LogicalJoin"));
+    final String maintStr3 = dumpText(miQ3.getMaintenancePlan());
+    assertThat(maintStr3, containsString("LogicalUnion"));
+    // Branch 1 (Δ(CUSTOMER) ⋈ ORDERS) has a join; branch 2 (Δ(ORDERS)) does not.
+    assertThat(countOccurrences(maintStr3, "LogicalJoin"), is(1));
+    assertThat(maintStr3, containsString("LogicalDelta"));
   }
 
   /**
@@ -330,6 +336,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q12 MAINTENANCE PLAN (incremental) ===");
     System.out.println(dumpText(miQ12.getMaintenancePlan()));
+    writeDotFile("q12_maintenance", miQ12.getMaintenancePlan());
 
     // ── Phase 2: HEP planner fires PipelineToMergedIndexScanRule ──────────
     final HepProgram hepProgram = HepProgram.builder()
@@ -350,8 +357,11 @@ class MergedIndexTpchPlanTest {
     assertThat(planStr, not(containsString("EnumerableMergeJoin")));
     assertThat("Q12 MI missing maintenance plan",
         miQ12.getMaintenancePlan() != null, is(true));
-    assertThat(dumpText(miQ12.getMaintenancePlan()), containsString("LogicalUnion"));
-    assertThat(dumpText(miQ12.getMaintenancePlan()), containsString("LogicalJoin"));
+    final String maintStr12 = dumpText(miQ12.getMaintenancePlan());
+    assertThat(maintStr12, containsString("LogicalUnion"));
+    // Branch 1 (Δ(ORDERS) ⋈ LINEITEM) has a join; branch 2 (Δ(LINEITEM)) does not.
+    assertThat(countOccurrences(maintStr12, "LogicalJoin"), is(1));
+    assertThat(maintStr12, containsString("LogicalDelta"));
   }
 
   /**
@@ -462,6 +472,9 @@ class MergedIndexTpchPlanTest {
     }
 
     printMaintenancePlans("Q3-OL", pipelines);
+    for (int i = 0; i < pipelines.size(); i++) {
+      writeDotFile("q3ol_maintenance_" + i, pipelines.get(i).mergedIndex.getMaintenancePlan());
+    }
 
     // ── Phase 2: two HEP passes for two-level pipeline dependency ─────────
     // Pass 1 replaces inner joins (Sort→Agg/Scan + Sort→Scan → MergeJoin)
@@ -766,6 +779,9 @@ class MergedIndexTpchPlanTest {
     }
 
     printMaintenancePlans("Q9", pipelines);
+    for (int i = 0; i < pipelines.size(); i++) {
+      writeDotFile("q9_maintenance_" + i, pipelines.get(i).mergedIndex.getMaintenancePlan());
+    }
 
     // ── Phase 2: N HEP passes, one per pipeline level ─────────────────────
     // Each pass replaces one level; a new planner instance is required because
@@ -836,14 +852,33 @@ class MergedIndexTpchPlanTest {
             join.isSemiJoinDone(),
             ImmutableList.copyOf(join.getSystemFieldList()));
 
-    // Branch 2: left ⋈ Δ(right)  — new rows from the right source
-    final LogicalJoin joinDeltaRight =
-        LogicalJoin.create(left, LogicalDelta.create(right), join.getHints(),
-            join.getCondition(), join.getVariablesSet(), join.getJoinType(),
-            join.isSemiJoinDone(),
-            ImmutableList.copyOf(join.getSystemFieldList()));
+    // Branch 2: if right is a bare Sort → TableScan, just emit Δ(right) —
+    //   new record is directly inserted into the MI at its sort key (no join needed).
+    //   If right has an Aggregate or inner Join on top, keep the full left ⋈ Δ(right).
+    final RelNode branch2;
+    if (isDirectTableInput(right)) {
+      branch2 = LogicalDelta.create(right);
+    } else {
+      branch2 = LogicalJoin.create(left, LogicalDelta.create(right), join.getHints(),
+          join.getCondition(), join.getVariablesSet(), join.getJoinType(),
+          join.isSemiJoinDone(),
+          ImmutableList.copyOf(join.getSystemFieldList()));
+    }
 
-    return LogicalUnion.create(List.of(joinDeltaLeft, joinDeltaRight), true);
+    return LogicalUnion.create(List.of(joinDeltaLeft, branch2), true);
+  }
+
+  /**
+   * Returns true if {@code node} is a {@link Sort} whose immediate input is a
+   * {@link TableScan} (no intermediate Aggregate or Project).
+   * Used to distinguish direct-insert sources from aggregated views.
+   */
+  private static boolean isDirectTableInput(RelNode node) {
+    if (!(node instanceof Sort)) {
+      return false;
+    }
+    final RelNode input = ((Sort) node).getInput();
+    return input instanceof TableScan;
   }
 
   /** Prints maintenance plans for all pipelines to stdout. */

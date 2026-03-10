@@ -449,8 +449,8 @@ cascade level.
 
 ### Medium Term
 
-- **More TPC-H queries** — Q5, Q7, Q10 have similar multi-table join patterns; add tests
-  exercising the outer pipeline substitution path.
+- **More TPC-H queries** One important claim of this paper is to show that **all** queries plans using ordered operators can be converted to a materialized-view-like approach using merged indexes. Therefore, at the minimum we will do this for all TPC-H queries.
+- Realistic cost model: explore how Calcite calculate the cost, esp. index access or materialized view access, for queries and maintenance. Follow the same model, calculate the cost of merged index access and cost of full query plans + maintenance plans.
 - **`extractTestSource` cleanup** — `collectPipelines` in the test directly casts `join.getLeft()`
   to `EnumerableSort` (line 518); add an `unwrap`-style guard in case a future Calcite version
   wraps inputs differently.
