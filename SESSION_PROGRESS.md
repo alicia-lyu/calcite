@@ -2,8 +2,6 @@
 
 ## Status
 
-NOTE: This is frozen and stale. The latest change is in `./overhaul-03-10.md`.
-
 | Item                                                                    | Status  |
 |-------------------------------------------------------------------------|---------|
 | `CLAUDE.md` + `main.md`                                                 | Done    |
@@ -11,15 +9,18 @@ NOTE: This is frozen and stale. The latest change is in `./overhaul-03-10.md`.
 | `core/.../materialize/MergedIndexRegistry.java` (`findFor(List<Object>, ...)`) | Done |
 | `core/.../adapter/enumerable/EnumerableMergedIndexScan.java`            | Done    |
 | `core/.../adapter/enumerable/EnumerableMergedIndexJoin.java` (NEW)      | Done    |
-| `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java` (outer pipeline support) | Done |
+| `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java` (generalized) | Done |
 | `core/.../adapter/enumerable/EnumerableRules.java` (constant)           | Done    |
 | `core/.../adapter/enumerable/EnumerableMergedIndexDeltaScan.java` (NEW) | Done    |
 | `core/.../adapter/enumerable/DeltaToMergedIndexDeltaScanRule.java` (NEW)| Done    |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
-| TPC-H Q3 (CUSTOMER ⋈ ORDERS ⋈ LINEITEM, partial substitution)          | Done ✓      |
-| TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓      |
-| TPC-H Q3-OL full 3-table substitution — `tpchQ3OrdersLineitem()`        | Done ✓      |
-| TPC-H Q9 (6-table, all leaf joins substituted)                          | Done ✓      |
+| TPC-H Q3 (deleted — incorrect CUSTOMER+ORDERS example)                  | Removed |
+| TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓  |
+| TPC-H Q3-OL full 3-table substitution — `tpchQ3OrdersLineitem()`        | Done ✓  |
+| TPC-H Q9 (6-table, all leaf joins substituted)                          | Done ✓  |
+| Pipeline overhaul: sort-boundary-based discovery                         | Done ✓  |
+| Rule generalization: accept SortedAggregate inputs                       | Done ✓  |
+| `inputAlreadySorted` direction check fix                                 | Done ✓  |
 
 ## Commands
 
@@ -31,25 +32,11 @@ NOTE: This is frozen and stale. The latest change is in `./overhaul-03-10.md`.
 ./gradlew :core:test --tests "*.PipelineToMergedIndexScanRuleTest"
 ```
 
-Search for `=== Q3 BEFORE`, `=== Q3 AFTER`, `=== Q12 BEFORE`, `=== Q12 AFTER` in output.
+Search for `=== Q12 BEFORE`, `=== Q12 AFTER`, `=== Q3 OL AFTER`, `=== Q9 AFTER` in output.
 
 ### Sample AFTER output
 
-**Q3** (partial substitution — inner join replaced, outer join remains):
-
-```
-EnumerableLimitSort(...)
-  EnumerableAggregate(...)
-    EnumerableMergeJoin(condition=[=($8, $17)])          ← outer join REMAINS
-      EnumerableSort(sort0=[$8])
-        EnumerableMergedIndexScan(
-          tables=[[[TPCH, CUSTOMER]:C_CUSTKEY, [TPCH, ORDERS]:O_CUSTKEY]],
-          collation=[[0]])
-      EnumerableSort(sort0=[$0])
-        EnumerableTableScan(table=[[TPCH, LINEITEM]])
-```
-
-**Q12** (full substitution):
+**Q12** (full 2-table substitution):
 
 ```
 EnumerableSort(...)
@@ -57,6 +44,27 @@ EnumerableSort(...)
     EnumerableMergedIndexScan(
       tables=[[[TPCH, ORDERS]:O_ORDERKEY, [TPCH, LINEITEM]:L_ORDERKEY]],
       collation=[[0]])
+```
+
+**Q3-OL** (full 3-table substitution — both inner and outer replaced):
+
+```
+EnumerableLimitSort(...)
+  EnumerableProject(...)
+    EnumerableMergedIndexJoin(sources=[[view([0]), [TPCH, CUSTOMER]:C_CUSTKEY]], joinType=[INNER], collation=[[3]])
+      EnumerableMergedIndexScan(tables=[[view([0]), [TPCH, CUSTOMER]:C_CUSTKEY]], collation=[[3]])
+```
+
+**Q9** (full 6-table substitution):
+
+```
+EnumerableSort(sort0=[$0], sort1=[$1], dir0=[ASC], dir1=[DESC])
+  EnumerableAggregate(group=[{0, 1}], SUM_PROFIT=[SUM($2)])
+    EnumerableSort(sort0=[$0], sort1=[$1], dir0=[ASC], dir1=[ASC])
+      EnumerableProject(...)
+        EnumerableFilter(condition=[LIKE($26, '%green%')])
+          EnumerableMergedIndexJoin(...)
+            EnumerableMergedIndexScan(...)
 ```
 
 ---
@@ -250,38 +258,12 @@ Maintenance plan structure (the two replaced pipelines from BEFORE):
 
 ---
 
-### Incorrect example: Q3 — 3-table partial substitution (`tpchQ3`)
+### Q3 (deleted)
 
-Key: `c_custkey = o_custkey` (leaf replaced), `o_orderkey = l_orderkey` (outer, stays at query time). One HEP pass.
-
-```text
-BEFORE                                     AFTER (Query plan only)
-EnumerableLimitSort                        EnumerableLimitSort
-  EnumerableAggregate                        EnumerableAggregate
-    EnumerableMergeJoin(orderkey) ←outer       EnumerableMergeJoin(orderkey) ← REMAINS
-      EnumerableSort(orderkey)                   EnumerableSort(orderkey)
-        EnumerableMergeJoin(custkey) ←leaf           EnumerableMergedIndexScan
-          EnumerableSort → Scan(CUSTOMER)               [CUSTOMER]:C_CUSTKEY
-          EnumerableSort → Scan(ORDERS)                 [ORDERS]:O_CUSTKEY
-      EnumerableSort → Scan(LINEITEM)            EnumerableSort → Scan(LINEITEM)
-```
-
-After: query plan + maintenance plan
-
-The outer join has no registered merged index — it remains in the query-time plan,
-so no maintenance plan is generated for it.
-
-```text
-QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLAN for MI(CUSTOMER+ORDERS)
-EnumerableLimitSort                        On CUSTOMER insert(c_custkey=k):
-  EnumerableAggregate                        insert CUSTOMER record at key k
-    EnumerableMergeJoin(orderkey) ←stays   On ORDERS insert(o_custkey=k):
-      EnumerableSort(orderkey)               insert ORDERS record at key k
-        EnumerableMergedIndexScan            into MI(CUSTOMER+ORDERS)
-          [CUSTOMER]:C_CUSTKEY
-          [ORDERS]:O_CUSTKEY             No maintenance plan for outer join
-      EnumerableSort → Scan(LINEITEM)      (LINEITEM ⋈ result stays query-time)
-```
+The `tpchQ3` test was an incorrect example: it registered a merged index for
+CUSTOMER ⋈ ORDERS by custkey, but the natural inner pipeline for TPC-H Q3 is
+ORDERS ⋈ LINEITEM by orderkey. The correct 3-table test is `tpchQ3OrdersLineitem`
+(Q3-OL), which tests inner (ORDERS+LINEITEM by orderkey) + outer (+CUSTOMER by custkey).
 
 ---
 
@@ -422,48 +404,38 @@ cascade level.
 
 ### Short Term (next session)
 
-**Resolve outer pipeline delta leaf**
-(file: `MergedIndexTpchPlanTest.java`, method `tpchQ3OrdersLineitem`)
+1. **Pipeline conversion / physicalPlan** (file: `MergedIndexTpchPlanTest.java`)
+   - Per `overhaul-03-10.md` §Pipeline Conversion: create `physicalPlan` for each pipeline,
+     converting logical plan to physical pull-based operators. The upstream operator must
+     process interleaved records from the merged index (Algorithm 1/2 in `main.tex`).
+   - `PipelineToMergedIndexScanRule.java` needs overhaul per the doc.
 
-The last task fixed the maintenance plan for leaf merged indexes, but not for branch/root merged indexes. Specifically, phase 2 should only contain the delta equivalent of the pipeline of this branch merged index. This pipeline is cut off on both ends by sorts, the inbound sorts represent delta coming from the upstream merged index (e.g., leaf merged index)---a single `LogicalDelta(MI_OL)` should represent it, right now this is a whole subtree that is the maintenance plan of MI_OL.When the downstream operator can pull delta records from this `LogicalDelta(MI_OL)` one by one, which may trigger the leaf maintenance plan. This trickle down like effect is similar to classic Cascade.
-I understand that, this should eventually become `EnumerableMergedIndexDeltaScan(inner_MI)`, but on the logical level your implementation is wrong.
+2. **Resolve outer pipeline delta leaf** (file: `MergedIndexTpchPlanTest.java`)
+   - Phase 2 maintenance should use `LogicalDelta(MI_OL)` for inner MI delta, not the
+     full inner pipeline subtree. This should become
+     `EnumerableMergedIndexDeltaScan(inner_MI)` at physical level.
+
+3. **Maintenance plans overhaul** (file: `MergedIndexTpchPlanTest.java`)
+   - Per `overhaul-03-10.md` §Maintenance plans: maintenance plans process delta instead
+     of full data. Current `deriveIncrementalPlan` may need rework.
 
 ### Medium Term
 
-2. **Visually verify maintenance plan DOTs**
-   (output: `plus/test-dot-output/*_maintenance*.dot`)
-   - Run TPC-H tests, inspect `q3_maintenance`, `q12_maintenance`,
-     `q3ol_maintenance_0/1`, `q9_maintenance_0..4`.
-   - Confirm IVM structure matches the two-phase model in this document.
+1. **Additional TPC-H queries** — show all order-based query plans can use merged indexes.
+   - Q5: CUSTOMER ⋈ ORDERS ⋈ LINEITEM ⋈ SUPPLIER ⋈ NATION ⋈ REGION — hierarchical keys.
+   - Q6: single-table aggregate, no join — baseline showing no MI applies.
 
-3. **Begin additional TPC-H queries**
-   (file: `MergedIndexTpchPlanTest.java`, new `@Test` methods)
-   - Q6: single-table aggregate, no join — good baseline showing no MI applies.
-   - Q5: CUSTOMER ⋈ ORDERS ⋈ LINEITEM ⋈ SUPPLIER ⋈ NATION ⋈ REGION on nationkey
-     prefix chain — tests hierarchical merged index recognition.
-
-- **More TPC-H queries** One important claim of this paper is to show that **all** queries plans using ordered operators can be converted to a materialized-view-like approach using merged indexes. Therefore, at the minimum we will do this for all TPC-H queries.
-- Realistic cost model: explore how Calcite calculate the cost, esp. index access or materialized view access, for queries and maintenance. Follow the same model, calculate the cost of merged index access and cost of full query plans + maintenance plans.
-- **`extractTestSource` cleanup** — `collectPipelines` in the test directly casts `join.getLeft()`
-  to `EnumerableSort` (line 518); add an `unwrap`-style guard in case a future Calcite version
-  wraps inputs differently.
+2. **Realistic cost model** — explore Calcite's cost model for index/MV access, adapt
+   for merged index access and full query+maintenance plan costs.
 
 ### Long Term
 
-1. **PATH B: Native merged index support** — add a second operand pattern to
-   `PipelineToMergedIndexScanRule` matching `EnumerableMergeJoin` over bare
-   `EnumerableTableScan` nodes that already carry the correct collation trait (no explicit
-   `EnumerableSort`). Requires modifying `TpchSchema` to report collations via
-   `getStatistic() → Statistics.of(n, keys, collations)`.
+1. **PATH B: Native merged index support** — `PipelineToMergedIndexScanRule` matching
+   bare `EnumerableTableScan` with collation traits (no explicit `EnumerableSort`).
 
-2. **Functional dependency metadata** — investigate `RelMdFunctionalDependencies` to
-   expose ORDERKEY→CUSTKEY automatically, enabling 3-table merged index recognition
-   without manual registration.
+2. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
+   ORDERKEY→CUSTKEY recognition.
 
-3. **JOB (Join Order Benchmark)** — representative JOB queries to show generalization
-   beyond TPC-H star schemas.
+3. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
 
-4. **`implement()` stub** — `EnumerableMergedIndexScan.implement()` returns an empty
-   enumerable stub. A real implementation would drive a sequential B-tree scan over
-   interleaved records, assembling joins and aggregations on-the-fly.
-   Explore hooking into the LeanStore repo.
+4. **`implement()` stub** — real sequential B-tree scan implementation; LeanStore integration.
