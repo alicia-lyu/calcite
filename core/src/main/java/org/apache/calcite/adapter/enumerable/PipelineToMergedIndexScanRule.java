@@ -23,6 +23,7 @@ import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelRule;
 import org.apache.calcite.plan.hep.HepRelVertex;
 import org.apache.calcite.rel.RelCollation;
+import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.rules.TransformationRule;
@@ -93,19 +94,20 @@ public class PipelineToMergedIndexScanRule
 
   @Override public void onMatch(RelOptRuleCall call) {
     final EnumerableMergeJoin join = call.rel(0);
-    final RelNode leftSortNode = unwrap(join.getLeft());
-    final RelNode rightSortNode = unwrap(join.getRight());
-    final Object leftSource = extractSource(leftSortNode);
-    final Object rightSource = extractSource(rightSortNode);
+    final RelNode leftNode = unwrap(join.getLeft());
+    final RelNode rightNode = unwrap(join.getRight());
+    final Object leftSource = extractSource(leftNode);
+    final Object rightSource = extractSource(rightNode);
     if (leftSource == null || rightSource == null) {
       return;
     }
-    if (!(leftSortNode instanceof EnumerableSort)) {
+
+    // Shared collation: prefer an explicit EnumerableSort; fall back to
+    // the node's trait-set collation (e.g. SortedAggregate output).
+    final RelCollation collation = extractCollation(leftNode, rightNode);
+    if (collation == null || collation.getFieldCollations().isEmpty()) {
       return;
     }
-
-    // Shared collation comes from the left Sort's collation.
-    final RelCollation collation = ((EnumerableSort) leftSortNode).getCollation();
 
     final Optional<MergedIndex> idxOpt =
         MergedIndexRegistry.findFor(List.of(leftSource, rightSource), collation);
@@ -128,6 +130,29 @@ public class PipelineToMergedIndexScanRule
   }
 
   /**
+   * Extracts the shared collation from the merge-join inputs.
+   *
+   * <p>Prefers an explicit {@link EnumerableSort}'s collation; falls back to
+   * the trait-set collation of the first input (e.g. when a
+   * {@link EnumerableSortedAggregate} directly feeds the join).
+   */
+  private static @Nullable RelCollation extractCollation(RelNode left, RelNode right) {
+    if (left instanceof EnumerableSort) {
+      return ((EnumerableSort) left).getCollation();
+    }
+    if (right instanceof EnumerableSort) {
+      return ((EnumerableSort) right).getCollation();
+    }
+    // Neither input is an explicit Sort — try the trait set.
+    final List<RelCollation> collations =
+        left.getTraitSet().getTraits(RelCollationTraitDef.INSTANCE);
+    if (collations != null && !collations.isEmpty()) {
+      return collations.get(0);
+    }
+    return null;
+  }
+
+  /**
    * Extracts the source identity for one side of a {@link EnumerableMergeJoin}.
    *
    * <p>Accepted patterns:
@@ -141,20 +166,39 @@ public class PipelineToMergedIndexScanRule
    *   <li>{@code Sort → EnumerableMergedIndexJoin → EnumerableMergedIndexScan} → returns
    *       {@link MergedIndex} from the underlying scan (outer pipeline view, produced after
    *       a prior HEP pass replaced an outer pipeline)
+   *   <li>{@code SortedAggregate → ... → TableScan} — a sorted operator that is not
+   *       an explicit Sort; drills through to the base table
+   *   <li>{@code EnumerableMergedIndexScan} — direct scan (no Sort wrapper)
    * </ul>
    *
-   * @param sortNode the sort node that is a direct input to the merge join
+   * @param node the direct input to the merge join (may be Sort, SortedAggregate, etc.)
    * @return the source object, or {@code null} if the pattern is unrecognized
    */
-  private static @Nullable Object extractSource(RelNode sortNode) {
-    if (!(sortNode instanceof EnumerableSort)) {
-      return null;
+  private static @Nullable Object extractSource(RelNode node) {
+    if (node instanceof EnumerableSort) {
+      final RelNode below = unwrap(((EnumerableSort) node).getInput());
+      return extractSourceBelow(below);
     }
-    final RelNode below = unwrap(((EnumerableSort) sortNode).getInput());
+    // Direct MergedIndexScan (no Sort wrapper).
+    if (node instanceof EnumerableMergedIndexScan) {
+      return ((EnumerableMergedIndexScan) node).mergedIndex;
+    }
+    // Single-input sorted operator (e.g. SortedAggregate): drill through.
+    if (node.getInputs().size() == 1) {
+      return extractSourceBelow(node);
+    }
+    return null;
+  }
+
+  /**
+   * Given a node below a Sort (or a single-input sorted operator), identifies
+   * the source as a {@link MergedIndex} or {@link RelOptTable}.
+   */
+  private static @Nullable Object extractSourceBelow(RelNode below) {
     if (below instanceof EnumerableMergedIndexScan) {
       return ((EnumerableMergedIndexScan) below).mergedIndex;
     }
-    // Sort → EnumerableMergedIndexJoin → EnumerableMergedIndexScan:
+    // EnumerableMergedIndexJoin → EnumerableMergedIndexScan:
     // after an outer pipeline is replaced, its result appears as this pattern.
     if (below instanceof EnumerableMergedIndexJoin) {
       final RelNode scanNode = unwrap(((EnumerableMergedIndexJoin) below).getInput(0));
