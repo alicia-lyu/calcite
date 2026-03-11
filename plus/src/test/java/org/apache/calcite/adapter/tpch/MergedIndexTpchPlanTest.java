@@ -565,8 +565,7 @@ class MergedIndexTpchPlanTest {
 
   /**
    * Post-order flattening of the pipeline tree: leaves first, root last.
-   * Excludes leaf pipelines (those with fewer than 2 sources) — only
-   * pipelines with 2+ sources correspond to merged indexes.
+   * Excludes leaf pipelines
    */
   private static List<Pipeline> flattenPipelines(Pipeline root) {
     final List<Pipeline> result = new ArrayList<>();
@@ -578,9 +577,10 @@ class MergedIndexTpchPlanTest {
     for (Pipeline child : p.sources) {
       flattenPostOrder(child, result);
     }
-    if (p.sources.size() >= 2) {
+    if (p.mergedIndex != null) {
       result.add(p);
     }
+    // previous code keeps pipelines with 2+ sources, since it corresponds to merged indexes. However, with 1 source only, a single-table traditional index follows exactly the same logic and is considered a view, not a trivial pipeline representing a table source only. For future work, wrap a single-table traditional index inside MergedIndex
   }
 
   /**
