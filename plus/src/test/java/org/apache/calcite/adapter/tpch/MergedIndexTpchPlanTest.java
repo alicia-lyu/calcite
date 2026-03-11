@@ -23,6 +23,7 @@ import org.apache.calcite.adapter.enumerable.EnumerableRules;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.MergedIndexRegistry;
 import org.apache.calcite.materialize.Pipeline;
+import org.apache.calcite.materialize.TaggedRowSchema;
 import org.apache.calcite.plan.ConventionTraitDef;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
@@ -212,6 +213,45 @@ class MergedIndexTpchPlanTest {
     // Each source inserts independently — no join needed in the maintenance plan.
     assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalJoin"), is(0));
     assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalDelta"), is(2));
+
+    // ── TaggedRowSchema for Q12 (ORDERS ⋈ LINEITEM on orderkey) ──────────
+    // Verify byte-width metadata for cost estimation and slot counts.
+    final TaggedRowSchema schema = p.mergedIndex.getTaggedRowSchema();
+    assertThat("Q12 keyFieldCount", schema.keyFieldCount, is(1));
+    assertThat("Q12 sourceCount", schema.sourceCount, is(2));
+    assertThat("Q12 domainCount", schema.domainCount, is(2));
+
+    // orderkey is IDENTIFIER → Long.class → BIGINT = 8 bytes
+    assertThat("Q12 keyFieldByteWidths[0]",
+        schema.keyFieldByteWidths.get(0), is(8.0));
+    // keyPrefixByteWidth = 1 (tag) + 8 (BIGINT) = 9
+    assertThat("Q12 keyPrefixByteWidth", schema.keyPrefixByteWidth, is(9.0));
+
+    // ORDERS has 9 cols, 1 key → 8 payload; LINEITEM has 16 cols, 1 key → 15
+    assertThat("Q12 payloadFieldCounts[0]",
+        schema.payloadFieldCounts.get(0), is(8));
+    assertThat("Q12 payloadFieldCounts[1]",
+        schema.payloadFieldCounts.get(1), is(15));
+
+    // Total record byte widths: keyPrefix(9) + indexId(2) + payload
+    assertThat("Q12 totalRecordByteWidth(0)",
+        schema.totalRecordByteWidth(0),
+        is(9.0 + 2 + schema.payloadByteWidths.get(0)));
+    assertThat("Q12 totalRecordByteWidth(1)",
+        schema.totalRecordByteWidth(1),
+        is(9.0 + 2 + schema.payloadByteWidths.get(1)));
+
+    // Slot counts: 2*1 + 2 + payloadFieldCount
+    assertThat("Q12 taggedRowSlotCount(0)",
+        schema.taggedRowSlotCount(0), is(2 + 2 + 8));
+    assertThat("Q12 taggedRowSlotCount(1)",
+        schema.taggedRowSlotCount(1), is(2 + 2 + 15));
+
+    System.out.println("=== Q12 TaggedRowSchema ===");
+    System.out.println("  keyFieldCount=" + schema.keyFieldCount);
+    System.out.println("  keyPrefixByteWidth=" + schema.keyPrefixByteWidth);
+    System.out.println("  payloadByteWidths=" + schema.payloadByteWidths);
+    System.out.println("  totalRecordByteWidths=" + schema.totalRecordByteWidths);
   }
 
   /**

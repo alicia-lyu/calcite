@@ -22,6 +22,7 @@ import org.apache.calcite.linq4j.Linq4j;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.MergedIndexRegistry;
 import org.apache.calcite.materialize.Pipeline;
+import org.apache.calcite.materialize.TaggedRowSchema;
 import org.apache.calcite.plan.ConventionTraitDef;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
@@ -271,6 +272,107 @@ public class PipelineToMergedIndexScanRuleTest {
       assertThat("Should have 2 boundary sorts",
           asm2.boundarySorts.size(), is(2));
     }
+  }
+
+  /**
+   * Verifies {@link TaggedRowSchema} metadata and round-trip conversion
+   * for the simple 2-table schema: A(k INT, x INT) ⋈ B(k INT, y INT) on k.
+   *
+   * <p>Expected layout per tagged row (5 slots):
+   * {@code [(byte)1, keyVal, (byte)0, (byte)sourceId, payloadVal]}
+   */
+  @Test void taggedRowSchemaSimple() throws Exception {
+    final String sql =
+        "SELECT \"a\".\"x\", \"b\".\"y\""
+            + " FROM \"A\" \"a\""
+            + " JOIN \"B\" \"b\" ON \"a\".\"k\" = \"b\".\"k\"";
+
+    final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
+    final SchemaPlus defSchema = rootSchema.add("s", new TwoTableSchema());
+
+    final FrameworkConfig config = Frameworks.newConfigBuilder()
+        .parserConfig(SqlParser.Config.DEFAULT)
+        .defaultSchema(defSchema)
+        .traitDefs(ConventionTraitDef.INSTANCE, RelCollationTraitDef.INSTANCE)
+        .programs(
+            Programs.of(RuleSets.ofList(
+                EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
+                EnumerableRules.ENUMERABLE_PROJECT_RULE,
+                EnumerableRules.ENUMERABLE_SORT_RULE,
+                EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
+                EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
+                EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE)))
+        .build();
+
+    Planner planner = Frameworks.getPlanner(config);
+    SqlNode parsed = planner.parse(sql);
+    SqlNode validated = planner.validate(parsed);
+    RelRoot root = planner.rel(validated);
+
+    RelNode logicalWithSorts =
+        MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
+    RelTraitSet desiredTraits =
+        root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
+    RelNode phase1Plan = planner.transform(0, desiredTraits, logicalWithSorts);
+
+    Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    List<Pipeline> pipelines =
+        MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
+            .filter(p -> p.sources.size() >= 2)
+            .collect(Collectors.toList());
+    assertThat(pipelines.size(), is(1));
+
+    Pipeline p = pipelines.get(0);
+    MergedIndex mi = new MergedIndex(p);
+
+    // ── TaggedRowSchema metadata assertions ──────────────────────────────
+    TaggedRowSchema schema = mi.getTaggedRowSchema();
+
+    assertThat("keyFieldCount", schema.keyFieldCount, is(1));
+    assertThat("sourceCount", schema.sourceCount, is(2));
+    assertThat("domainCount", schema.domainCount, is(2)); // 1 key + 1 index
+
+    // INT = 4 bytes
+    assertThat("keyFieldByteWidths[0]", schema.keyFieldByteWidths.get(0), is(4.0));
+    // keyPrefixByteWidth = 1 (tag) + 4 (INT key) = 5
+    assertThat("keyPrefixByteWidth", schema.keyPrefixByteWidth, is(5.0));
+
+    // Payload: A has 1 non-key column (x INT=4), B has 1 (y INT=4)
+    assertThat("payloadFieldCounts[0]", schema.payloadFieldCounts.get(0), is(1));
+    assertThat("payloadFieldCounts[1]", schema.payloadFieldCounts.get(1), is(1));
+    assertThat("payloadByteWidths[0]", schema.payloadByteWidths.get(0), is(4.0));
+    assertThat("payloadByteWidths[1]", schema.payloadByteWidths.get(1), is(4.0));
+
+    // totalRecordByteWidth = 5 (keyPrefix) + 2 (indexId) + 4 (payload) = 11
+    assertThat("totalRecordByteWidth(0)", schema.totalRecordByteWidth(0), is(11.0));
+    assertThat("totalRecordByteWidth(1)", schema.totalRecordByteWidth(1), is(11.0));
+
+    // Slot counts: 2*1 + 2 + 1 = 5
+    assertThat("taggedRowSlotCount(0)", schema.taggedRowSlotCount(0), is(5));
+    assertThat("taggedRowSlotCount(1)", schema.taggedRowSlotCount(1), is(5));
+
+    // ── toTaggedRow + field extraction round-trip ────────────────────────
+    // A row: k=1, x=10
+    Object[] taggedA = schema.toTaggedRow(0, new Object[]{1, 10});
+    assertThat("taggedA length", taggedA.length, is(5));
+    assertThat("taggedA domain tag", taggedA[0], is((byte) 1));
+    assertThat("taggedA key value", taggedA[1], is(1));
+    assertThat("taggedA index domain", taggedA[2], is((byte) 0));
+    assertThat("taggedA source id", taggedA[3], is((byte) 0));
+    assertThat("taggedA payload", taggedA[4], is(10));
+
+    // B row: k=1, y=100
+    Object[] taggedB = schema.toTaggedRow(1, new Object[]{1, 100});
+    assertThat("taggedB length", taggedB.length, is(5));
+    assertThat("taggedB key value", taggedB[1], is(1));
+    assertThat("taggedB source id", taggedB[3], is((byte) 1));
+    assertThat("taggedB payload", taggedB[4], is(100));
+
+    // Field extraction helpers
+    assertThat("getKeyValue(taggedA, 0)", schema.getKeyValue(taggedA, 0), is(1));
+    assertThat("getSourceId(taggedA)", schema.getSourceId(taggedA), is((byte) 0));
+    assertThat("getSourceId(taggedB)", schema.getSourceId(taggedB), is((byte) 1));
+    assertThat("getPayloadStartSlot", schema.getPayloadStartSlot(), is(4));
   }
 
   /** Finds the first {@link EnumerableSortedAggregate} in the tree. */

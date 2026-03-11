@@ -99,6 +99,11 @@ public class MergedIndex {
         .collect(ImmutableList.toImmutableList());
   }
 
+  /** Returns the tagged row schema for this merged index's sources. */
+  public TaggedRowSchema getTaggedRowSchema() {
+    return new TaggedRowSchema(this);
+  }
+
   public void setMaintenancePlan(RelNode plan) {
     this.maintenancePlan = plan;
   }
