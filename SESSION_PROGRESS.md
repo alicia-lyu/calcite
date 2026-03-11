@@ -21,6 +21,14 @@
 | Pipeline overhaul: sort-boundary-based discovery                         | Done ✓  |
 | Rule generalization: accept SortedAggregate inputs                       | Done ✓  |
 | `inputAlreadySorted` direction check fix                                 | Done ✓  |
+| `flattenPipelines`: `p.mergedIndex != null` (not source count)           | Done ✓  |
+
+## Terminology
+
+- **Bottom side** / earlier = input side (table scans, leaf pipelines). Smaller field indices.
+- **Top side** / later = output side (final result, root pipeline).
+- `injectSortsBeforeSortBasedOps` processes bottom-up (starts from input side) for proper
+  recognition of sorted inputs by later operators.
 
 ## Commands
 
@@ -404,28 +412,64 @@ cascade level.
 
 ### Short Term (next session)
 
-1. **Pipeline conversion / physicalPlan** (file: `MergedIndexTpchPlanTest.java`)
+1. **MergedIndex ↔ Pipeline deduplication**
+   (files: `materialize/MergedIndex.java`, `materialize/MergedIndexRegistry.java`,
+    `MergedIndexTpchPlanTest.java`)
+   - Per `CHANGE PENDING` comment on `MergedIndex.java`: all info needed for a merged
+     index (sources, collation, rowCount) is already captured by Pipeline. MergedIndex
+     should reference back to Pipeline instead of duplicating fields.
+   - Move Pipeline from test class to `materialize/Pipeline.java` (production code).
+   - MergedIndex gets a `pipeline` back-reference; redundant fields delegate to Pipeline.
+   - MergedIndexRegistry sources become Pipelines (`sourceEquals` compares pipelines).
+   - Field redundancy table:
+     | MergedIndex field | Pipeline equivalent |
+     |---|---|
+     | `sources: List<Object>` | `sources: List<Pipeline>` (via `resolveSources`) |
+     | `tables: List<RelOptTable>` | derived from sources; tables abstracted at this level |
+     | `tableCollations: List<RelCollation>` | each `child.boundaryCollation` |
+     | `collation: RelCollation` | `sharedCollation` |
+     | `rowCount: double` | `rowCount` |
+     | `maintenancePlan: RelNode` | future `physicalPlan` field on Pipeline |
+
+2. **Pipeline conversion / physicalPlan** (file: `MergedIndexTpchPlanTest.java`)
    - Per `overhaul-03-10.md` §Pipeline Conversion: create `physicalPlan` for each pipeline,
      converting logical plan to physical pull-based operators. The upstream operator must
      process interleaved records from the merged index (Algorithm 1/2 in `main.tex`).
+   - `physicalPlan` covers three execution modes (differ only in timing and data flow):
+     query-time (input data flow, final pipeline), index creation (input data flow,
+     non-final pipeline), maintenance-time (input delta flow, non-final pipeline).
    - `PipelineToMergedIndexScanRule.java` needs overhaul per the doc.
 
-2. **Resolve outer pipeline delta leaf** (file: `MergedIndexTpchPlanTest.java`)
+3. **Resolve outer pipeline delta leaf** (file: `MergedIndexTpchPlanTest.java`)
    - Phase 2 maintenance should use `LogicalDelta(MI_OL)` for inner MI delta, not the
      full inner pipeline subtree. This should become
      `EnumerableMergedIndexDeltaScan(inner_MI)` at physical level.
 
-3. **Maintenance plans overhaul** (file: `MergedIndexTpchPlanTest.java`)
+4. **Maintenance plans overhaul** (file: `MergedIndexTpchPlanTest.java`)
    - Per `overhaul-03-10.md` §Maintenance plans: maintenance plans process delta instead
      of full data. Current `deriveIncrementalPlan` may need rework.
 
 ### Medium Term
 
-1. **Additional TPC-H queries** — show all order-based query plans can use merged indexes.
+1. **Direction-agnostic sort injection** (file: `MergedIndexTpchPlanTest.java`,
+   method `injectSortsBeforeSortBasedOps`)
+   - Sort-based operators (Aggregate GROUP BY, Join) don't inherently require ASC or DESC.
+     Currently `injectSortsBeforeSortBasedOps` always creates ASC sorts
+     (`new RelFieldCollation(idx)` defaults to ASC).
+   - Future: look downstream at parent operator's required direction and proactively match.
+   - Concrete example: Q9's GROUP BY creates `Sort(n_name ASC, o_year ASC)` but ORDER BY
+     needs `(n_name ASC, o_year DESC)`. With direction propagation, the injected sort would
+     use DESC for o_year, eliminating the redundant post-aggregate sort.
+
+2. **`extractCollation` specificity** (file: `PipelineToMergedIndexScanRule.java`)
+   - When both MergeJoin inputs have collations, choose the most specific one. Both sides
+     are compatible but not necessarily identical.
+
+3. **Additional TPC-H queries** — show all order-based query plans can use merged indexes.
    - Q5: CUSTOMER ⋈ ORDERS ⋈ LINEITEM ⋈ SUPPLIER ⋈ NATION ⋈ REGION — hierarchical keys.
    - Q6: single-table aggregate, no join — baseline showing no MI applies.
 
-2. **Realistic cost model** — explore Calcite's cost model for index/MV access, adapt
+4. **Realistic cost model** — explore Calcite's cost model for index/MV access, adapt
    for merged index access and full query+maintenance plan costs.
 
 ### Long Term
