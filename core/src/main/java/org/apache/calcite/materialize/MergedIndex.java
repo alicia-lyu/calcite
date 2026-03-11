@@ -44,8 +44,13 @@ import java.util.stream.Stream;
  * <p>See: "Storing and Indexing Multiple Tables by Interesting Orderings",
  * Wenhui Lyu &amp; Goetz Graefe, VLDB 2026.
  */
-// CHANGE PENDING: info of merged index is redundant with {@link Pipeline}. All info needed for a merged index (its sources, collation, row count) is already captured by the corresponding Pipeline, in which the merged index is a field. Here, we can just reference back to the Pipeline instead of duplicating the info. In the future, maintenance plan or query plan (the difference only lies in execution time and data flow vs delta flow) will also be generated within the pipeline (field PhysicalPlan). Delete redundant methods here.
 public class MergedIndex {
+
+  /**
+   * The pipeline that this merged index backs. Null for indexes created
+   * directly without pipeline discovery (e.g. simple unit tests).
+   */
+  public final @Nullable Pipeline pipeline;
 
   /**
    * Each element is a {@link RelOptTable} (base table) or a
@@ -86,7 +91,27 @@ public class MergedIndex {
   public @Nullable RelNode maintenancePlan;
 
   /**
+   * Creates a MergedIndex from a {@link Pipeline}. Sources, collation, and
+   * row count are derived from the pipeline's structure, eliminating field
+   * duplication. Also sets the pipeline's back-reference to this index.
+   *
+   * @param pipeline the pipeline backing this merged index
+   */
+  public MergedIndex(Pipeline pipeline) {
+    this.pipeline = pipeline;
+    this.sources = resolveSources(pipeline);
+    this.tables = expandTables(this.sources);
+    this.tableCollations = pipeline.sources.stream()
+        .map(child -> child.boundaryCollation)
+        .collect(ImmutableList.toImmutableList());
+    this.collation = pipeline.sharedCollation;
+    this.rowCount = pipeline.rowCount;
+    pipeline.mergedIndex = this;
+  }
+
+  /**
    * Constructor for base-table-only pipelines (most common case).
+   * Does not associate a Pipeline (legacy path for simple unit tests).
    *
    * @param tables           base tables in pipeline order
    * @param tableCollations  per-table sort collations
@@ -96,6 +121,7 @@ public class MergedIndex {
   public MergedIndex(List<RelOptTable> tables,
       List<RelCollation> tableCollations,
       RelCollation collation, double rowCount) {
+    this.pipeline = null;
     this.sources = tables.stream().map(t -> (Object) t)
         .collect(ImmutableList.toImmutableList());
     this.tables = ImmutableList.copyOf(tables);
@@ -107,6 +133,7 @@ public class MergedIndex {
   /**
    * Static factory for pipelines with mixed base-table / view sources.
    * Use this when any source is a {@link MergedIndex} inner pipeline view.
+   * Does not associate a Pipeline (legacy path).
    *
    * @param sources          each element is a {@link RelOptTable} or a
    *                         {@link MergedIndex} (inner pipeline view)
@@ -117,26 +144,68 @@ public class MergedIndex {
   public static MergedIndex of(List<Object> sources,
       List<RelCollation> sourceCollations,
       RelCollation collation, double rowCount) {
-    ImmutableList<RelOptTable> tables = sources.stream()
-        .flatMap(s -> s instanceof MergedIndex
-            ? ((MergedIndex) s).tables.stream()
-            : Stream.of((RelOptTable) s))
-        .collect(ImmutableList.toImmutableList());
-    return new MergedIndex(
+    ImmutableList<RelOptTable> tables = expandTables(
+        ImmutableList.copyOf(sources));
+    return new MergedIndex(null,
         ImmutableList.copyOf(sources), tables,
         ImmutableList.copyOf(sourceCollations), collation, rowCount);
   }
 
-  /** Private constructor used by {@link #of}. */
-  private MergedIndex(ImmutableList<Object> sources,
+  /** Private constructor used by {@link #of} and legacy paths. */
+  private MergedIndex(@Nullable Pipeline pipeline,
+      ImmutableList<Object> sources,
       ImmutableList<RelOptTable> tables,
       ImmutableList<RelCollation> tableCollations,
       RelCollation collation, double rowCount) {
+    this.pipeline = pipeline;
     this.sources = sources;
     this.tables = tables;
     this.tableCollations = tableCollations;
     this.collation = collation;
     this.rowCount = rowCount;
+  }
+
+  /**
+   * Resolves a pipeline's child sources to {@link RelOptTable} or
+   * {@link MergedIndex} for the {@link #sources} field.
+   */
+  private static ImmutableList<Object> resolveSources(Pipeline p) {
+    return p.sources.stream().map(child -> {
+      if (child.mergedIndex != null) {
+        return (Object) child.mergedIndex;
+      }
+      // Leaf pipeline: find the table scan
+      final RelOptTable table = findLeafScan(child.root);
+      return table != null ? (Object) table : (Object) child;
+    }).collect(ImmutableList.toImmutableList());
+  }
+
+  /**
+   * Expands a source list to a flat list of base tables, recursing into
+   * any inner {@link MergedIndex} views.
+   */
+  private static ImmutableList<RelOptTable> expandTables(
+      ImmutableList<Object> sources) {
+    return sources.stream()
+        .flatMap(s -> s instanceof MergedIndex
+            ? ((MergedIndex) s).tables.stream()
+            : Stream.of((RelOptTable) s))
+        .collect(ImmutableList.toImmutableList());
+  }
+
+  /**
+   * Drills through single-input operators to find a leaf
+   * {@link org.apache.calcite.adapter.enumerable.EnumerableTableScan}.
+   */
+  private static @Nullable RelOptTable findLeafScan(RelNode node) {
+    if (node instanceof org.apache.calcite.adapter.enumerable.EnumerableTableScan) {
+      return ((org.apache.calcite.adapter.enumerable.EnumerableTableScan) node)
+          .getTable();
+    }
+    if (node.getInputs().size() == 1) {
+      return findLeafScan(node.getInputs().get(0));
+    }
+    return null;
   }
 
   /**

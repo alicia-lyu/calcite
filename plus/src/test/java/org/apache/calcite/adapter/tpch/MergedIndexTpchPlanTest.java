@@ -23,11 +23,10 @@ import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan;
 import org.apache.calcite.adapter.enumerable.EnumerableRules;
 import org.apache.calcite.adapter.enumerable.EnumerableSort;
 import org.apache.calcite.adapter.enumerable.EnumerableSortedAggregate;
-import org.apache.calcite.adapter.enumerable.EnumerableTableScan;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.MergedIndexRegistry;
+import org.apache.calcite.materialize.Pipeline;
 import org.apache.calcite.plan.ConventionTraitDef;
-import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.hep.HepPlanner;
@@ -173,9 +172,7 @@ class MergedIndexTpchPlanTest {
     assertThat("Expected 1 non-trivial pipeline for Q12", pipelines.size(), is(1));
 
     final Pipeline p = pipelines.get(0);
-    final List<Object> resolved = resolveSources(p);
-    p.mergedIndex = MergedIndex.of(resolved, resolveSourceCollations(p),
-        p.sharedCollation, p.rowCount);
+    new MergedIndex(p);
     p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
         List.of(logicalJoinQ12.getLeft(), logicalJoinQ12.getRight())));
     MergedIndexRegistry.register(p.mergedIndex);
@@ -306,9 +303,7 @@ class MergedIndexTpchPlanTest {
     // ── Register merged indexes bottom-up ─────────────────────────────────
     for (int i = 0; i < pipelines.size(); i++) {
       final Pipeline p = pipelines.get(i);
-      final List<Object> resolved = resolveSources(p);
-      p.mergedIndex = MergedIndex.of(resolved, resolveSourceCollations(p),
-          p.sharedCollation, p.rowCount);
+      new MergedIndex(p);
       // Use logical join (SQL types) for IVM derivation — matches StreamRules expectations
       final Join ljOL = logicalJoinsOL.get(i);
       p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
@@ -412,26 +407,6 @@ class MergedIndexTpchPlanTest {
    * records from all {@link #sources}. The operators between {@link #root}
    * and the source boundaries execute at query time over a single scan.
    */
-  private static class Pipeline {
-    final RelNode root;                    // topmost operator IN this pipeline (inclusive)
-    final List<Pipeline> sources;          // child pipelines at Sort boundaries
-    final RelCollation sharedCollation;    // sort order shared by all ops in this pipeline
-    final RelCollation boundaryCollation;  // collation of the Sort above this pipeline
-                                           // (how this pipeline delivers data to its parent)
-    final double rowCount;           // estimated output row count at root 
-    MergedIndex mergedIndex;               // set after registration
-
-    Pipeline(RelNode root, List<Pipeline> sources,
-        RelCollation sharedCollation, RelCollation boundaryCollation,
-        double rowCount) {
-      this.root = root;
-      this.sources = sources;
-      this.sharedCollation = sharedCollation;
-      this.boundaryCollation = boundaryCollation;
-      this.rowCount = rowCount;
-    }
-  }
-
   /**
    * Builds a pipeline tree from the Phase 1 physical plan by identifying
    * {@link EnumerableSort} operators as boundaries between pipelines.
@@ -577,51 +552,16 @@ class MergedIndexTpchPlanTest {
     for (Pipeline child : p.sources) {
       flattenPostOrder(child, result);
     }
-    if (p.mergedIndex != null) {
+    // Use sources.size() >= 2 at discovery time because mergedIndex is not yet
+    // set (it's created from the discovered pipelines). Future work: include
+    // single-source pipelines too (single-table traditional indexes follow the
+    // same logic and are views, not trivial table sources).
+    if (p.sources.size() >= 2) {
       result.add(p);
     }
-    // previous code keeps pipelines with 2+ sources, since it corresponds to merged indexes. However, with 1 source only, a single-table traditional index follows exactly the same logic and is considered a view, not a trivial pipeline representing a table source only. For future work, wrap a single-table traditional index inside MergedIndex
   }
 
-  /**
-   * Resolves a pipeline's sources to {@link RelOptTable} or
-   * {@link MergedIndex} for registration with {@link MergedIndexRegistry}.
-   */
-  private static List<Object> resolveSources(Pipeline p) {
-    return p.sources.stream().map(child -> {
-      if (child.mergedIndex != null) {
-        return (Object) child.mergedIndex;
-      }
-      // Leaf pipeline: find the table scan
-      final RelOptTable table = findLeafScan(child.root);
-      return table != null ? (Object) table : (Object) child;
-    }).collect(Collectors.toList());
-  }
 
-  /**
-   * Collects the shared collation from each child pipeline as the
-   * per-source collation list for {@link MergedIndex} registration.
-   */
-  private static List<RelCollation> resolveSourceCollations(Pipeline p) {
-    return p.sources.stream()
-        .map(child -> child.boundaryCollation)
-        .collect(Collectors.toList());
-  }
-
-  /**
-   * Drills through a chain of single-input operators to find the leaf
-   * {@link EnumerableTableScan}, returning its table. Returns {@code null}
-   * if the chain splits (multi-input) or has no scan at the leaf.
-   */
-  private static @Nullable RelOptTable findLeafScan(RelNode node) {
-    if (node instanceof EnumerableTableScan) {
-      return ((EnumerableTableScan) node).getTable();
-    }
-    if (node.getInputs().size() == 1) {
-      return findLeafScan(node.getInputs().get(0));
-    }
-    return null;
-  }
 
   /**
    * TPC-H Q9 (no color filter on part name): 6-table join
@@ -763,9 +703,7 @@ class MergedIndexTpchPlanTest {
     assertThat("Expected 5 pipelines for Q9", pipelines.size(), is(5));
     for (int i = 0; i < pipelines.size(); i++) {
       final Pipeline p = pipelines.get(i);
-      final List<Object> resolved = resolveSources(p);
-      p.mergedIndex = MergedIndex.of(resolved, resolveSourceCollations(p),
-          p.sharedCollation, p.rowCount);
+      new MergedIndex(p);
       // Use logical join (SQL types) for IVM derivation — matches StreamRules expectations
       final Join ljQ9 = logicalJoinsQ9.get(i);
       p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(

@@ -65,7 +65,7 @@ public final class MergedIndexRegistry {
   public static synchronized Optional<MergedIndex> findFor(
       List<Object> sources, RelCollation required) {
     for (MergedIndex index : INDEXES) {
-      if (sourcesMatch(index.sources, sources) && index.satisfies(required)) { // index.sources -> index.pipeline.sources
+      if (sourcesMatch(index.sources, sources) && index.satisfies(required)) {
         return Optional.of(index);
       }
     }
@@ -93,7 +93,6 @@ public final class MergedIndexRegistry {
     return true;
   }
 
-  // sources become pipelines in the future
   private static boolean sourceEquals(Object a, Object b) {
     if (a instanceof RelOptTable && b instanceof RelOptTable) {
       return ((RelOptTable) a).getQualifiedName()
