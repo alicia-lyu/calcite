@@ -6,13 +6,14 @@ I noticed a series of issues in the current code. Some false assumptions have be
 
 **Done.** Renamed `injectSortsBeforeJoin` → `injectSortsBeforeSortBasedOps`. Now handles:
 
-- **Sort node**: recurses into input; drops the Sort when no FETCH/OFFSET and `inputAlreadySorted` confirms the input is already sorted (e.g. Q9's ORDER BY is dropped because the Aggregate output is sorted on GROUP BY keys).
+- **Sort node**: recurses into input; drops the Sort when no FETCH/OFFSET and `inputAlreadySorted` confirms the input is already sorted. Note: `inputAlreadySorted` now checks both field index AND direction, so Q9's `ORDER BY n_name ASC, o_year DESC` is NOT dropped (Aggregate output is `[n_name ASC, o_year ASC]` — direction mismatch on `o_year`).
 - **Aggregate node**: injects `LogicalSort` on group keys before the aggregate input when not already sorted.
 - **Join node**: guards each injection with `inputAlreadySorted` to skip wrapping an already-sorted input.
 
 Enhanced `inputAlreadySorted` to drill through single-input operators (Aggregate, Project, Filter, etc.) to reach an authoritative `Sort` node, enabling detection of e.g. `Agg(Sort([k]))` as already sorted on `[k]`.
 
 **Not yet handled** (future work):
+
 - **Window functions** (`OVER`): require sorting on PARTITION BY + ORDER BY keys.
 - **DISTINCT / set operators** (INTERSECT, EXCEPT): sort-based implementations need a sort on all output columns.
 - **Merge-sort joins with non-equi conditions**: currently skipped (cross/non-equi guard), but some could benefit from partial key injection.
@@ -28,7 +29,7 @@ Every query can be seen as a tree of pipelines as shown below. A pipeline is def
 
 ![Pipeline identification](img/Screenshot%202026-03-10%20at%207.58.51 PM.png)
 
-Therefore, the first mistake in your code is definition of a pipeline. It should be something like this. I don't remember some Java syntax and didn't check some definitions, please correct them yourself.
+Therefore, the first mistake in your code is definition of a pipeline which is centered on a merge join. It should be something like this. I don't remember some Java syntax and didn't check some definitions, please correct them yourself.
 
 ```java
 private static class Pipeline {
@@ -66,6 +67,15 @@ private static Pipeline findAllPipelines(RelNode node, Pipeline currPipeline = n
 Note that the boundary here depends entirely on whether an operator is a sort operator. I believe the code currently doesn't check `inputAlreadySorted` before injecting sort operators. For successful identification of boundaries, you must decide whether `inputAlreadySorted`.
 
 Also note that the code I provided you with above didn't explicit use join for pipeline. Sort is what defines a pipeline, join is only one important use case.
+
+**Done.** Pipeline class and discovery overhauled:
+- `Pipeline` now has `root`, `sources` (child pipelines), `sharedCollation`, `boundaryCollation`, `rowCount`, `mergedIndex`. No `join` field.
+- `buildPipelineTree` / `buildPipeline` / `collectChildPipelines`: top-down recursion cutting at `EnumerableSort` boundaries.
+- `sharedCollation` derived from first boundary Sort's collation (not root node's output collation).
+- `flattenPipelines`: post-order flattening, only non-trivial pipelines (≥ 2 sources).
+- `resolveSources` / `resolveSourceCollations`: map child pipelines to `RelOptTable` or `MergedIndex`.
+- `tpchQ3` test deleted — it was an incorrect example registering CUSTOMER ⋈ ORDERS instead of ORDERS ⋈ LINEITEM.
+- `PipelineToMergedIndexScanRule` generalized: `extractSource` now accepts sorted non-Sort inputs (e.g. `SortedAggregate`); `extractCollation` falls back to trait-set collation when no explicit Sort is present.
 
 ## Pipeline Conversion
 
