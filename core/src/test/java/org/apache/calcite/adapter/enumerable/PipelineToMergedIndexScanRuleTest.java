@@ -186,37 +186,33 @@ public class PipelineToMergedIndexScanRuleTest {
   }
 
   /**
-   * Verifies assembly subtree identification for a multi-operator case:
-   * a SortedAggregate sits between a boundary Sort and the MergeJoin,
-   * with no intermediate Sort separating them.
+   * Verifies assembly subtree identification for the aggregate-above-join case.
    *
-   * <p>This hypothetical structure arises when an optimizer recognizes that
-   * both the SortedAggregate and the MergeJoin share the same key, so the
-   * intermediate Sort between them is redundant and removed.
+   * <p>This test uses a simple 2-table schema where the planner places the
+   * aggregate above the join (both share the same key {@code k}). The
+   * assembly subtree for the join pipeline is just {MergeJoin} — the
+   * SortedAggregate sits above the LCA and is a "remaining operator."
    *
-   * <p>Actual rel tree (from Phase 1 plan, aggregate placed above join):
+   * <p>Actual rel tree (from Phase 1 plan):
    * <pre>
-   *   SortedAggregate(k)                        ← pipeline root
+   *   SortedAggregate(k)                        ← remaining operator
    *     MergeJoin(k)
    *       Sort(k) → Scan(A)                     ← boundary Sort (source 0)
    *       Sort(k) → Scan(B)                     ← boundary Sort (source 1)
    * </pre>
    *
-   * <p>In this case the SortedAggregate has no boundary sort as a direct input —
-   * only the MergeJoin does. So the assembly subtree = {MergeJoin} and the
-   * SortedAggregate is a "remaining operator" above the assembly.
+   * <p>The multi-operator case (assembly = {MergeJoin, SortedAggregate}) arises
+   * naturally in Q3-OL's inner pipeline where the SortedAggregate feeds one
+   * side of the MergeJoin without an intermediate Sort. This happens because
+   * {@code injectSortsBeforeSortBasedOps} uses {@code inputAlreadySorted} to
+   * skip redundant Sorts when the aggregate output is already sorted on the
+   * join key. See {@code MergedIndexTpchPlanTest.tpchQ3OrdersLineitem} for
+   * that case.
    *
-   * <p>For the multi-operator case, we construct a second Pipeline where the
-   * MergeJoin is the root and one Sort child is replaced by
-   * {@code SortedAggregate → Sort(boundary)}, making both the MergeJoin and
-   * the SortedAggregate boundary consumers. This requires the aggregate to be
-   * a child of the MergeJoin, which arises from queries like Q3-OL where the
-   * aggregate feeds one side of the join without an intermediate Sort.
-   *
-   * <p>Since Calcite's planner always inserts Sorts before every join input,
-   * the multi-operator subtree only occurs when redundant Sorts are eliminated.
-   * We test this by locating nodes from the Phase 1 plan and manually
-   * constructing the Pipeline with the desired boundary structure.
+   * <p>When the aggregate is above the join (as in this test), a second
+   * Pipeline rooted at the aggregate is also constructed to verify that
+   * the LCA correctly identifies the MergeJoin even when the pipeline root
+   * is a different operator.
    */
   @Test void multiOperatorAssemblySubtree() throws Exception {
     // Query: aggregate A by key k, then join with B on k.
