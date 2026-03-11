@@ -211,7 +211,7 @@ The raw scan output needs a schema for records from heterogeneous source tables.
   Compact but loses column-level type safety.
 - **Per-source typed rows via Enumerable union**: each source produces its own typed
   enumerable; the scan merges and tags. Assembly knows each source's schema.
-- Define a type for each record type as the following did with `Formattable`. Maybe it can be called mergeable. Static code generation seems necessary here, what is the java equivalent / alternative to static. code generation?
+- Define a type for each record type as the following did with `Formattable`. Maybe it can be called mergeable. Static code generation seems necessary here, what is the java equivalent / workaround to static code generation? Maybe Calcite already defined all records types under one interface, and we can simply use a type like `tuple(SourceTag,RecordInterface)`?
 
 ```java
 // Source - https://stackoverflow.com/a/79629091

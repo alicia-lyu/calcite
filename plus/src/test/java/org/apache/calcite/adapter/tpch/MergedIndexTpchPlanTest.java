@@ -66,8 +66,10 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
 
 /**
@@ -172,6 +174,16 @@ class MergedIndexTpchPlanTest {
         .filter(p -> p.sources.size() >= 2)
         .collect(Collectors.toList());
     assertThat("Expected 1 join pipeline for Q12", pipelines.size(), is(1));
+
+    // ── Verify assembly subtree ───────────────────────────────────────────
+    final Pipeline.AssemblySubtree asmQ12 = pipelines.get(0).findAssemblySubtree();
+    assertThat("Q12 assembly subtree should exist", asmQ12 != null, is(true));
+    assertThat("Q12 LCA should be MergeJoin",
+        asmQ12.lca, instanceOf(EnumerableMergeJoin.class));
+    assertThat("Q12 assembly should contain only the MergeJoin",
+        asmQ12.nodes, hasSize(1));
+    assertThat("Q12 should have 2 boundary sorts",
+        asmQ12.boundarySorts, hasSize(2));
 
     final Pipeline p = pipelines.get(0);
     new MergedIndex(p);
@@ -303,6 +315,34 @@ class MergedIndexTpchPlanTest {
         .collect(Collectors.toList());
     assertThat("Expected 2 join pipelines (inner orderkey + outer custkey)",
         pipelines.size(), is(2));
+
+    // ── Verify assembly subtrees ──────────────────────────────────────────
+    // Inner pipeline (orderkey): MergeJoin with SortedAggregate on one side
+    // (no intermediate Sort between SortedAgg and the boundary Sort below it).
+    // Assembly = {MergeJoin, SortedAggregate}.
+    final Pipeline.AssemblySubtree asmInner =
+        pipelines.get(0).findAssemblySubtree();
+    assertThat("Q3-OL inner assembly subtree should exist",
+        asmInner != null, is(true));
+    assertThat("Q3-OL inner LCA should be MergeJoin",
+        asmInner.lca, instanceOf(EnumerableMergeJoin.class));
+    assertThat("Q3-OL inner assembly should contain MergeJoin + SortedAggregate",
+        asmInner.nodes, hasSize(2));
+    assertThat("Q3-OL inner should have 2 boundary sorts",
+        asmInner.boundarySorts, hasSize(2));
+
+    // Outer pipeline (custkey): just a MergeJoin with 2 boundary sorts.
+    // Assembly = {MergeJoin}.
+    final Pipeline.AssemblySubtree asmOuter =
+        pipelines.get(1).findAssemblySubtree();
+    assertThat("Q3-OL outer assembly subtree should exist",
+        asmOuter != null, is(true));
+    assertThat("Q3-OL outer LCA should be MergeJoin",
+        asmOuter.lca, instanceOf(EnumerableMergeJoin.class));
+    assertThat("Q3-OL outer assembly should contain only MergeJoin",
+        asmOuter.nodes, hasSize(1));
+    assertThat("Q3-OL outer should have 2 boundary sorts",
+        asmOuter.boundarySorts, hasSize(2));
 
     // ── Register merged indexes bottom-up ─────────────────────────────────
     for (int i = 0; i < pipelines.size(); i++) {
@@ -482,22 +522,10 @@ class MergedIndexTpchPlanTest {
   }
 
   /**
-   * Returns {@code true} if {@code node} is a pipeline-separating Sort.
-   *
-   * <p>A boundary Sort is an {@link EnumerableSort} with a non-empty
-   * collation and no FETCH/OFFSET (LimitSort carries row-count semantics
-   * and is not a pipeline boundary).
+   * Delegates to {@link Pipeline#isBoundarySort(RelNode)}.
    */
   private static boolean isBoundarySort(RelNode node) {
-    if (!(node instanceof EnumerableSort)) {
-      return false;
-    }
-    final EnumerableSort sort = (EnumerableSort) node;
-    // LimitSort (has FETCH/OFFSET) is not a pipeline boundary
-    if (sort.fetch != null || sort.offset != null) {
-      return false;
-    }
-    return !sort.getCollation().getFieldCollations().isEmpty();
+    return Pipeline.isBoundarySort(node);
   }
 
   /**
@@ -703,6 +731,20 @@ class MergedIndexTpchPlanTest {
         .filter(p -> p.sources.size() >= 2)
         .collect(Collectors.toList());
     assertThat("Expected 5 join pipelines for Q9", pipelines.size(), is(5));
+
+    // ── Verify assembly subtrees ──────────────────────────────────────────
+    for (int i = 0; i < pipelines.size(); i++) {
+      final Pipeline.AssemblySubtree asm = pipelines.get(i).findAssemblySubtree();
+      assertThat("Q9 pipeline " + i + " assembly subtree should exist",
+          asm != null, is(true));
+      assertThat("Q9 pipeline " + i + " LCA should be MergeJoin",
+          asm.lca, instanceOf(EnumerableMergeJoin.class));
+      assertThat("Q9 pipeline " + i + " assembly should contain only MergeJoin",
+          asm.nodes, hasSize(1));
+      assertThat("Q9 pipeline " + i + " should have 2 boundary sorts",
+          asm.boundarySorts, hasSize(2));
+    }
+
     for (int i = 0; i < pipelines.size(); i++) {
       final Pipeline p = pipelines.get(i);
       new MergedIndex(p);

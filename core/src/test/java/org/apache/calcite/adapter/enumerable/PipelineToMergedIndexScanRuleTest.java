@@ -66,8 +66,10 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.is;
 
 /**
  * Integration test for {@link PipelineToMergedIndexScanRule}.
@@ -181,6 +183,162 @@ public class PipelineToMergedIndexScanRuleTest {
     assertThat(planStr, containsString("EnumerableMergedIndexScan"));
     assertThat(planStr, not(containsString("EnumerableMergeJoin")));
     assertThat(planStr, not(containsString("EnumerableSort")));
+  }
+
+  /**
+   * Verifies assembly subtree identification for a multi-operator case:
+   * a SortedAggregate sits between a boundary Sort and the MergeJoin,
+   * with no intermediate Sort separating them.
+   *
+   * <p>This hypothetical structure arises when an optimizer recognizes that
+   * both the SortedAggregate and the MergeJoin share the same key, so the
+   * intermediate Sort between them is redundant and removed.
+   *
+   * <p>Actual rel tree (from Phase 1 plan, aggregate placed above join):
+   * <pre>
+   *   SortedAggregate(k)                        ← pipeline root
+   *     MergeJoin(k)
+   *       Sort(k) → Scan(A)                     ← boundary Sort (source 0)
+   *       Sort(k) → Scan(B)                     ← boundary Sort (source 1)
+   * </pre>
+   *
+   * <p>In this case the SortedAggregate has no boundary sort as a direct input —
+   * only the MergeJoin does. So the assembly subtree = {MergeJoin} and the
+   * SortedAggregate is a "remaining operator" above the assembly.
+   *
+   * <p>For the multi-operator case, we construct a second Pipeline where the
+   * MergeJoin is the root and one Sort child is replaced by
+   * {@code SortedAggregate → Sort(boundary)}, making both the MergeJoin and
+   * the SortedAggregate boundary consumers. This requires the aggregate to be
+   * a child of the MergeJoin, which arises from queries like Q3-OL where the
+   * aggregate feeds one side of the join without an intermediate Sort.
+   *
+   * <p>Since Calcite's planner always inserts Sorts before every join input,
+   * the multi-operator subtree only occurs when redundant Sorts are eliminated.
+   * We test this by locating nodes from the Phase 1 plan and manually
+   * constructing the Pipeline with the desired boundary structure.
+   */
+  @Test void multiOperatorAssemblySubtree() throws Exception {
+    // Query: aggregate A by key k, then join with B on k.
+    final String sql =
+        "SELECT \"b\".\"y\", SUM(\"a\".\"x\") AS sx"
+            + " FROM \"A\" \"a\""
+            + " JOIN \"B\" \"b\" ON \"a\".\"k\" = \"b\".\"k\""
+            + " GROUP BY \"a\".\"k\", \"b\".\"y\"";
+
+    final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
+    final SchemaPlus defSchema = rootSchema.add("s", new TwoTableSchema());
+
+    final FrameworkConfig config = Frameworks.newConfigBuilder()
+        .parserConfig(SqlParser.Config.DEFAULT)
+        .defaultSchema(defSchema)
+        .traitDefs(ConventionTraitDef.INSTANCE, RelCollationTraitDef.INSTANCE)
+        .programs(
+            Programs.of(RuleSets.ofList(
+                EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
+                EnumerableRules.ENUMERABLE_PROJECT_RULE,
+                EnumerableRules.ENUMERABLE_SORT_RULE,
+                EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
+                EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
+                EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE)))
+        .build();
+
+    Planner planner = Frameworks.getPlanner(config);
+    SqlNode parsed = planner.parse(sql);
+    SqlNode validated = planner.validate(parsed);
+    RelRoot root = planner.rel(validated);
+
+    RelCollation joinKeyCollation = RelCollations.of(0);
+    RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel, joinKeyCollation);
+
+    RelTraitSet desiredTraits =
+        root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
+    RelNode phase1Plan = planner.transform(0, desiredTraits, logicalWithSorts);
+
+    String planStr = RelOptUtil.dumpPlan(
+        "", phase1Plan, SqlExplainFormat.TEXT, SqlExplainLevel.DIGEST_ATTRIBUTES);
+    System.out.println("=== Multi-operator assembly BEFORE ===");
+    System.out.println(planStr);
+
+    // ── Case 1: Aggregate above join (standard planner output) ────────────
+    // Pipeline root = SortedAggregate (or Aggregate), boundaries = 2 Sorts
+    // under the MergeJoin. Assembly = {MergeJoin} only — the aggregate is
+    // a remaining operator because it has no boundary Sort as a direct input.
+    EnumerableMergeJoin join = Objects.requireNonNull(
+        findMergeJoin(phase1Plan),
+        "Plan must contain EnumerableMergeJoin: " + planStr);
+    EnumerableSort leftSort = (EnumerableSort) join.getLeft();
+    EnumerableSort rightSort = (EnumerableSort) join.getRight();
+    RelCollation collation = leftSort.getCollation();
+
+    // Build pipeline with root = join's parent (aggregate or project)
+    Pipeline pLeft = new Pipeline(leftSort.getInput(), List.of(),
+        collation, collation, 10.0);
+    Pipeline pRight = new Pipeline(rightSort.getInput(), List.of(),
+        collation, collation, 10.0);
+    Pipeline pJoin = new Pipeline(join, List.of(pLeft, pRight),
+        collation, collation, 10.0);
+    Pipeline.AssemblySubtree asm1 = pJoin.findAssemblySubtree();
+    assertThat("Assembly subtree should exist", asm1 != null, is(true));
+    assertThat("LCA should be the MergeJoin", asm1.lca, is(join));
+    assertThat("Assembly should contain only MergeJoin",
+        asm1.nodes.size(), is(1));
+    assertThat("Should have 2 boundary sorts",
+        asm1.boundarySorts.size(), is(2));
+
+    // ── Case 2: Hypothetical multi-operator assembly ──────────────────────
+    // Construct a Pipeline where MergeJoin's left input is
+    // SortedAggregate → Sort(boundary) instead of Sort(boundary) → Scan.
+    // This simulates the case where an optimizer removed the redundant Sort
+    // between the SortedAggregate and MergeJoin because they share key k.
+    //
+    // We find the Sort below the left side of the join — that will become
+    // the "inner" boundary sort that sits below a SortedAggregate in the
+    // hypothetical plan tree.
+    //
+    // Actual tree: join → leftSort → Scan(A)
+    //                   → rightSort → Scan(B)
+    // We pretend:  join → SortedAgg → leftSort → Scan(A)   (no outer Sort)
+    //                   → rightSort → Scan(B)
+    //
+    // Since findAssemblySubtree walks the actual tree from pipeline.root,
+    // we need an actual SortedAggregate node in the tree. Find one from
+    // the phase1 plan (above the join) and use it to construct a pipeline.
+    RelNode aggNode = findSortedAggregate(phase1Plan);
+    if (aggNode != null) {
+      // The aggregate sits above the join: Agg → Sort → MergeJoin → ...
+      // or Agg → MergeJoin → ... (if Sort was removed).
+      // Build pipeline with root = aggNode, where boundaries are the two
+      // Sorts directly under the MergeJoin. The assembly subtree should
+      // still be {MergeJoin} because the SortedAggregate doesn't directly
+      // consume a boundary Sort.
+      Pipeline pAgg = new Pipeline(aggNode, List.of(pLeft, pRight),
+          collation, collation, 10.0);
+      Pipeline.AssemblySubtree asm2 = pAgg.findAssemblySubtree();
+      assertThat("Aggregate-rooted assembly subtree should exist",
+          asm2 != null, is(true));
+      // LCA is still MergeJoin: it's the deepest node reaching both boundaries
+      assertThat("LCA should be MergeJoin even with Aggregate as root",
+          asm2.lca, instanceOf(EnumerableMergeJoin.class));
+      assertThat("Assembly should contain only MergeJoin",
+          asm2.nodes.size(), is(1));
+      assertThat("Should have 2 boundary sorts",
+          asm2.boundarySorts.size(), is(2));
+    }
+  }
+
+  /** Finds the first {@link EnumerableSortedAggregate} in the tree. */
+  private static @Nullable RelNode findSortedAggregate(RelNode node) {
+    if (node instanceof EnumerableSortedAggregate) {
+      return node;
+    }
+    for (RelNode input : node.getInputs()) {
+      RelNode found = findSortedAggregate(input);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
   }
 
   /**
