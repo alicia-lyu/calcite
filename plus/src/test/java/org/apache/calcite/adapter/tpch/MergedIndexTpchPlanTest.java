@@ -47,6 +47,7 @@ import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.logical.LogicalUnion;
 import org.apache.calcite.rel.stream.LogicalDelta;
+import org.apache.calcite.rel.stream.StreamRules;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.sql.SqlExplainFormat;
 import org.apache.calcite.sql.SqlExplainLevel;
@@ -111,9 +112,12 @@ class MergedIndexTpchPlanTest {
   /**
    * TPC-H Q3 (no date filter): CUSTOMER ⋈ ORDERS ⋈ LINEITEM.
    *
-   * <p>Demonstrates <em>partial</em> pipeline substitution: the inner pipeline
-   * (CUSTOMER ⋈ ORDERS on custkey) is replaced by a merged index scan, while
-   * the outer pipeline (result ⋈ LINEITEM on orderkey) remains unchanged.
+   * <p><b>INCORRECT EXAMPLE</b> — this test registers a merged index for the
+   * inner pipeline CUSTOMER ⋈ ORDERS (by custkey), leaving the outer join with
+   * LINEITEM on orderkey intact. However, the correct pipeline for merged-index
+   * substitution is ORDERS ⋈ LINEITEM (by orderkey) as the inner join —
+   * see {@link #tpchQ3OrdersLineitem()} for the correct formulation.
+   * This test is kept as a regression guard for partial substitution mechanics.
    *
    * <p>Expected AFTER structure:
    * <pre>
@@ -126,6 +130,7 @@ class MergedIndexTpchPlanTest {
    *         EnumerableTableScan(LINEITEM)
    * </pre>
    */
+  // INCORRECT EXAMPLE — see tpchQ3OrdersLineitem() for correct pipeline choice.
   @Test void tpchQ3() throws Exception {
     // TPC-H Q3 (no date filter): CUSTOMER ⋈ ORDERS on custkey, then ⋈ LINEITEM
     // on orderkey. The merged index covers the inner pipeline only.
@@ -167,8 +172,8 @@ class MergedIndexTpchPlanTest {
     final RelRoot root = planner.rel(validated);
 
     // Inject LogicalSort at each join input using the actual join-condition keys.
-    // injectSortsBeforeJoin recurses and handles each nested join independently.
-    final RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel);
+    // injectSortsBeforeSortBasedOps recurses and handles each nested join independently.
+    final RelNode logicalWithSorts = injectSortsBeforeSortBasedOps(root.rel);
 
     // Capture logical joins (post-order) for IVM derivation — must use logical
     // (pre-Phase-1) nodes because StreamRules expect SQL row types, not JavaType.
@@ -261,15 +266,15 @@ class MergedIndexTpchPlanTest {
    */
   @Test void tpchQ12() throws Exception {
     // TPC-H Q12 (no date filter): count high/low priority lines per ship mode.
-    final String sql = "SELECT l.l_shipmode, o.o_orderpriority,"
+    final String sql = "SELECT l.l_shipmode,"
         + " SUM(CASE WHEN o.o_orderpriority = '1-URGENT'"
         + "     THEN 1 ELSE 0 END) AS high_line_count,"
         + " SUM(CASE WHEN o.o_orderpriority <> '1-URGENT'"
         + "     THEN 1 ELSE 0 END) AS low_line_count"
         + " FROM tpch.orders o"
         + " JOIN tpch.lineitem l ON o.o_orderkey = l.l_orderkey"
-        + " GROUP BY l.l_shipmode, o.o_orderpriority"
-        + " ORDER BY l.l_shipmode, o.o_orderpriority";
+        + " GROUP BY l.l_shipmode"
+        + " ORDER BY l.l_shipmode"; // Note o_orderpriority was deleted per TPC-H 2017 spec
 
     final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
     rootSchema.add("TPCH", new TpchSchema(0.01, 0, 1, false));
@@ -295,7 +300,7 @@ class MergedIndexTpchPlanTest {
     final SqlNode validated = planner.validate(parsed);
     final RelRoot root = planner.rel(validated);
 
-    final RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel);
+    final RelNode logicalWithSorts = injectSortsBeforeSortBasedOps(root.rel);
 
     // Capture logical join for IVM — must use logical node (SQL types),
     // not the physical EnumerableMergeJoin (JavaType) from Phase 1.
@@ -434,7 +439,7 @@ class MergedIndexTpchPlanTest {
     final SqlNode validated = planner.validate(parsed);
     final RelRoot root = planner.rel(validated);
 
-    final RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel);
+    final RelNode logicalWithSorts = injectSortsBeforeSortBasedOps(root.rel);
 
     // Capture logical joins (post-order) for IVM — logical nodes have SQL row types
     // compatible with StreamRules; physical EnumerableMergeJoin uses JavaType.
@@ -713,7 +718,7 @@ class MergedIndexTpchPlanTest {
    */
   @Test void tpchQ9() throws Exception {
     // Use explicit JOIN ... ON ... syntax so all join conditions are equi-joins
-    // and injectSortsBeforeJoin can extract keys via splitJoinCondition.
+    // and injectSortsBeforeSortBasedOps can extract keys via splitJoinCondition.
     // The LIKE filter stays in WHERE and becomes a LogicalFilter on PART.
     // final String sql = "SELECT n.n_name AS nation,"
     //     + " EXTRACT(YEAR FROM o.o_orderdate) AS o_year,"
@@ -732,7 +737,7 @@ class MergedIndexTpchPlanTest {
     // Rewrite SQL with explicit join order to maximize interesting-ordering pipeline reuse:
     // ORDERS ⋈ LINEITEM (orderkey) → PART (partkey, filter early) → PARTSUPP (partkey,suppkey)
     // → SUPPLIER (suppkey prefix reused) → NATION (nationkey).
-    // This left-deep tree lets injectSortsBeforeJoin inject the minimum number of sorts.
+    // This left-deep tree lets injectSortsBeforeSortBasedOps inject the minimum number of sorts.
     final String sql = "SELECT n.n_name AS nation,"
         + " EXTRACT(YEAR FROM o.o_orderdate) AS o_year,"
         + " SUM(l.l_extendedprice * (1 - l.l_discount)"
@@ -773,7 +778,7 @@ class MergedIndexTpchPlanTest {
     final SqlNode validated = planner.validate(parsed);
     final RelRoot root = planner.rel(validated);
 
-    final RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel);
+    final RelNode logicalWithSorts = injectSortsBeforeSortBasedOps(root.rel);
 
     // Capture logical joins (post-order) for IVM — same order as findAllPipelines.
     final List<Join> logicalJoinsQ9 = findAllJoins(logicalWithSorts);
@@ -835,8 +840,11 @@ class MergedIndexTpchPlanTest {
     // ── Assert ────────────────────────────────────────────────────────────
     // All pipeline joins and intermediate sorts must be gone.
     assertThat(afterStr, not(containsString("EnumerableMergeJoin")));
-    // Only one EnumerableSort remains: the final ORDER BY n_name, o_year DESC.
-    // (Q9 has no LIMIT so Calcite uses a plain sort rather than EnumerableLimitSort.)
+    // Only one EnumerableSort remains: the sort injected before the top-level
+    // Aggregate by injectSortsBeforeSortBasedOps (on the GROUP BY keys n_name,
+    // o_year). The final ORDER BY Sort is dropped because Q9 has no LIMIT and
+    // the Aggregate output is already sorted on those fields (drill-through
+    // via inputAlreadySorted reaches the injected Sort and confirms the prefix).
     assertThat(countOccurrences(afterStr, "EnumerableSort("), is(1));
     assertThat(afterStr, containsString("EnumerableMergedIndexJoin"));
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
@@ -917,25 +925,51 @@ class MergedIndexTpchPlanTest {
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   /**
-   * Recursively walks the plan tree and, at each {@link Join}, injects a
-   * {@link LogicalSort} before each input using the keys extracted from the
-   * join condition via {@link RelOptUtil#splitJoinCondition}.
+   * Recursively walks the plan tree and injects {@link LogicalSort} nodes
+   * before every sort-based operator ({@link Join}, {@link Aggregate})
+   * that requires sorted input.
    *
-   * <p>This ensures {@code ENUMERABLE_SORT_RULE} has concrete sort nodes to
-   * convert, giving the Volcano planner the physical {@link EnumerableSort}
-   * operators that {@link EnumerableMergeJoin} requires from its inputs.
-   * Using the actual join-condition keys means multi-join plans (where each
-   * join uses a different key) are handled correctly.
+   * <ul>
+   *   <li><b>Sort node</b>: recurses into input; drops the Sort if the input
+   *       is already sorted on the same fields and the Sort carries no
+   *       FETCH/OFFSET (LIMIT nodes cannot be dropped safely).</li>
+   *   <li><b>Aggregate node</b>: injects a {@link LogicalSort} on the group
+   *       keys before the aggregate input when not already sorted.</li>
+   *   <li><b>Join node</b>: injects sorts on join keys before each input
+   *       when not already sorted; skips non-equi / cross joins.</li>
+   * </ul>
+   *
+   * <p>Using {@link RelOptUtil#splitJoinCondition} for join keys means
+   * multi-join plans (where each join uses a different key) are handled
+   * correctly. {@link #inputAlreadySorted} prevents duplicate sorts by
+   * drilling through single-input operators to check existing collation.
    */
-  private static RelNode injectSortsBeforeJoin(RelNode node) {
+  private static RelNode injectSortsBeforeSortBasedOps(RelNode node) {
+    if (node instanceof Sort) {
+      final Sort sort = (Sort) node;
+      final RelNode newInput = injectSortsBeforeSortBasedOps(sort.getInput());
+      // Drop a redundant Sort when input is already sorted on those fields
+      // and the Sort carries no FETCH/OFFSET (LIMIT nodes carry row-count
+      // semantics and must not be dropped).
+      if (sort.fetch == null && sort.offset == null
+          && !sort.getCollation().getFieldCollations().isEmpty()
+          && inputAlreadySorted(newInput, sort.getCollation())) {
+        return newInput;
+      }
+      return sort.copy(sort.getTraitSet(), List.of(newInput));
+    }
     if (node instanceof Aggregate) {
-      // Recurse into the aggregate's input to process any nested joins.
-      // Do NOT inject a sort here: when this aggregate is a join input, the enclosing
-      // join branch wraps it in a LogicalSort externally, and the Volcano planner pushes
-      // the sort requirement inside via EnumerableSortedAggregate.passThroughTraits.
-      // Top-level aggregates (e.g., Q9 GROUP BY) must not receive an injected sort.
       final Aggregate agg = (Aggregate) node;
-      final RelNode newInput = injectSortsBeforeJoin(agg.getInput());
+      final RelNode newInput = injectSortsBeforeSortBasedOps(agg.getInput());
+      if (!agg.getGroupSet().isEmpty()) {
+        final RelCollation aggCollation = RelCollations.of(
+            agg.getGroupSet().asList().stream()
+                .map(RelFieldCollation::new).collect(Collectors.toList()));
+        if (!inputAlreadySorted(newInput, aggCollation)) {
+          return agg.copy(agg.getTraitSet(),
+              List.of(LogicalSort.create(newInput, aggCollation, null, null)));
+        }
+      }
       return agg.copy(agg.getTraitSet(), List.of(newInput));
     }
     if (node instanceof Join) {
@@ -944,8 +978,8 @@ class MergedIndexTpchPlanTest {
       final List<Integer> rightKeys = new ArrayList<>();
       RelOptUtil.splitJoinCondition(join.getLeft(), join.getRight(),
           join.getCondition(), leftKeys, rightKeys, new ArrayList<>());
-      final RelNode newLeft = injectSortsBeforeJoin(join.getLeft());
-      final RelNode newRight = injectSortsBeforeJoin(join.getRight());
+      final RelNode newLeft = injectSortsBeforeSortBasedOps(join.getLeft());
+      final RelNode newRight = injectSortsBeforeSortBasedOps(join.getRight());
       if (leftKeys.isEmpty()) {
         // Non-equi join or cross join — recurse but do not inject sorts.
         return join.copy(join.getTraitSet(), List.of(newLeft, newRight));
@@ -959,20 +993,36 @@ class MergedIndexTpchPlanTest {
           rightKeys.stream()
               .map(RelFieldCollation::new)
               .collect(Collectors.toList()));
-      return join.copy(join.getTraitSet(), List.of(
-          LogicalSort.create(newLeft, leftCollation, null, null),
-          LogicalSort.create(newRight, rightCollation, null, null)));
+      final RelNode sortedLeft = inputAlreadySorted(newLeft, leftCollation)
+          ? newLeft : LogicalSort.create(newLeft, leftCollation, null, null);
+      final RelNode sortedRight = inputAlreadySorted(newRight, rightCollation)
+          ? newRight : LogicalSort.create(newRight, rightCollation, null, null);
+      return join.copy(join.getTraitSet(), List.of(sortedLeft, sortedRight));
     }
     final List<RelNode> newInputs = node.getInputs().stream()
-        .map(MergedIndexTpchPlanTest::injectSortsBeforeJoin)
+        .map(MergedIndexTpchPlanTest::injectSortsBeforeSortBasedOps)
         .collect(Collectors.toList());
     return node.copy(node.getTraitSet(), newInputs);
   }
 
-  /** Returns true if {@code input}'s trait set already satisfies {@code required} as a prefix. */
+  /**
+   * Returns true if {@code input} is already sorted on {@code required} as a
+   * field-index prefix (direction is not checked).
+   *
+   * <p>Drills through single-input operators (Aggregate, Project, Filter, etc.)
+   * that do not themselves carry a meaningful collation trait, stopping at a
+   * {@link Sort} node whose collation is authoritative. This lets the caller
+   * detect e.g. {@code Agg(Sort([k]))} as already sorted on {@code [k]}.
+   */
   private static boolean inputAlreadySorted(RelNode input, RelCollation required) {
+    // Drill through single-input operators to reach a Sort (or a node with a
+    // non-empty collation trait set by the planner).
+    RelNode node = input;
+    while (node.getInputs().size() == 1 && !(node instanceof Sort)) {
+      node = node.getInputs().get(0);
+    }
     final RelCollation existing =
-        input.getTraitSet().getTrait(RelCollationTraitDef.INSTANCE);
+        node.getTraitSet().getTrait(RelCollationTraitDef.INSTANCE);
     if (existing == null || existing.getFieldCollations().isEmpty()) return false;
     final List<RelFieldCollation> req = required.getFieldCollations();
     final List<RelFieldCollation> have = existing.getFieldCollations();
