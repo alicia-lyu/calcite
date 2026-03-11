@@ -418,7 +418,7 @@ class MergedIndexTpchPlanTest {
     final RelCollation sharedCollation;    // sort order shared by all ops in this pipeline
     final RelCollation boundaryCollation;  // collation of the Sort above this pipeline
                                            // (how this pipeline delivers data to its parent)
-    final double rowCount;
+    final double rowCount;           // estimated output row count at root 
     MergedIndex mergedIndex;               // set after registration
 
     Pipeline(RelNode root, List<Pipeline> sources,

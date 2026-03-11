@@ -4,7 +4,9 @@ I noticed a series of issues in the current code. Some false assumptions have be
 
 ## Inject sorts
 
-**Done.** Renamed `injectSortsBeforeJoin` → `injectSortsBeforeSortBasedOps`. Now handles:
+**Done.** Renamed `injectSortsBeforeJoin` → `injectSortsBeforeSortBasedOps`. It starts from the bottom side to allow proper recognition of sorted inputs of later operators.
+
+Now handles:
 
 - **Sort node**: recurses into input; drops the Sort when no FETCH/OFFSET and `inputAlreadySorted` confirms the input is already sorted. Note: `inputAlreadySorted` now checks both field index AND direction, so Q9's `ORDER BY n_name ASC, o_year DESC` is NOT dropped (Aggregate output is `[n_name ASC, o_year ASC]` — direction mismatch on `o_year`).
 - **Aggregate node**: injects `LogicalSort` on group keys before the aggregate input when not already sorted.
@@ -14,6 +16,7 @@ Enhanced `inputAlreadySorted` to drill through single-input operators (Aggregate
 
 **Not yet handled** (future work):
 
+- Sort-based operators which don't specify directions (ASC or DESC) can be executed with any directions, if later operator requires a certain direction(s), proactively use that direction(s).
 - **Window functions** (`OVER`): require sorting on PARTITION BY + ORDER BY keys.
 - **DISTINCT / set operators** (INTERSECT, EXCEPT): sort-based implementations need a sort on all output columns.
 - **Merge-sort joins with non-equi conditions**: currently skipped (cross/non-equi guard), but some could benefit from partial key injection.

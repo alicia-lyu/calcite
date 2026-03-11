@@ -199,6 +199,8 @@ in the query tier because the PART filter cannot be pushed below the assembled j
 
 ## Implementation Notes
 
+"Bottom side"/earlier refers to input side. "Top side"/later refers to output side. Use smaller number for bottom side.
+
 ### Two cases in PipelineToMergedIndexScanRule
 
 **Inner pipeline** — both sources are base tables (`RelOptTable`):

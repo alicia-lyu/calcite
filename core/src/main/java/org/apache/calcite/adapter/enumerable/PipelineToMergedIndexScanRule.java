@@ -136,7 +136,7 @@ public class PipelineToMergedIndexScanRule
    * the trait-set collation of the first input (e.g. when a
    * {@link EnumerableSortedAggregate} directly feeds the join).
    */
-  private static @Nullable RelCollation extractCollation(RelNode left, RelNode right) {
+  private static @Nullable RelCollation extractCollation(RelNode left, RelNode right) { // lwh future work: choose the most specific collation if multiple are present (both sides should be compatible but not necessarily identical)
     if (left instanceof EnumerableSort) {
       return ((EnumerableSort) left).getCollation();
     }
