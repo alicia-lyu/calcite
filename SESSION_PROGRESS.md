@@ -322,6 +322,8 @@ the merged index but the filter cannot be pushed below the assembled join result
 
 ## Maintenance Plan Generation (implemented 2026-03-10)
 
+Obsolete.
+
 `MergedIndex.maintenancePlan` stores the incremental IVM plan derived by
 `deriveIncrementalPlan(Join)` in `MergedIndexTpchPlanTest`.
 
@@ -412,24 +414,13 @@ cascade level.
 
 ### Short Term (next session)
 
-1. **MergedIndex ↔ Pipeline deduplication**
-   (files: `materialize/MergedIndex.java`, `materialize/MergedIndexRegistry.java`,
-    `MergedIndexTpchPlanTest.java`)
-   - Per `CHANGE PENDING` comment on `MergedIndex.java`: all info needed for a merged
-     index (sources, collation, rowCount) is already captured by Pipeline. MergedIndex
-     should reference back to Pipeline instead of duplicating fields.
-   - Move Pipeline from test class to `materialize/Pipeline.java` (production code).
-   - MergedIndex gets a `pipeline` back-reference; redundant fields delegate to Pipeline.
-   - MergedIndexRegistry sources become Pipelines (`sourceEquals` compares pipelines).
-   - Field redundancy table:
-     | MergedIndex field | Pipeline equivalent |
-     |---|---|
-     | `sources: List<Object>` | `sources: List<Pipeline>` (via `resolveSources`) |
-     | `tables: List<RelOptTable>` | derived from sources; tables abstracted at this level |
-     | `tableCollations: List<RelCollation>` | each `child.boundaryCollation` |
-     | `collation: RelCollation` | `sharedCollation` |
-     | `rowCount: double` | `rowCount` |
-     | `maintenancePlan: RelNode` | future `physicalPlan` field on Pipeline |
+1. ~~**MergedIndex ↔ Pipeline deduplication**~~ **DONE** (commit `33779964c`)
+   - Pipeline moved to `materialize/Pipeline.java` (production code).
+   - `MergedIndex(Pipeline)` constructor derives sources, collations, rowCount from pipeline.
+   - `resolveSources()` and `findLeafScan()` moved from test to `MergedIndex.java`.
+   - Test code simplified: `new MergedIndex(p)` replaces manual field assembly.
+   - `flattenPostOrder` reverted to `sources.size() >= 2` — `p.mergedIndex != null` doesn't
+     work at discovery time (mergedIndex is set after flattenPipelines runs).
 
 2. **Pipeline conversion / physicalPlan** (file: `MergedIndexTpchPlanTest.java`)
    - Per `overhaul-03-10.md` §Pipeline Conversion: create `physicalPlan` for each pipeline,
