@@ -211,6 +211,36 @@ The raw scan output needs a schema for records from heterogeneous source tables.
   Compact but loses column-level type safety.
 - **Per-source typed rows via Enumerable union**: each source produces its own typed
   enumerable; the scan merges and tags. Assembly knows each source's schema.
+- Define a type for each record type as the following did with `Formattable`. Maybe it can be called mergeable. Static code generation seems necessary here, what is the java equivalent / alternative to static. code generation?
+
+```java
+// Source - https://stackoverflow.com/a/79629091
+// Posted by Mr. Tea
+// Retrieved 2026-03-11, License - CC BY-SA 4.0
+
+public sealed interface Formattable permits StrFormat, IntFormat { 
+
+    String Format();
+
+}
+
+
+public record StrFormat implements Formattable(String val) {
+
+    public String Format() {
+        return String.format("String %s", val);
+    }
+
+}
+
+public record IntFormat implements Formattable(Integer val) {
+    
+    public String Format() {
+        return String.format("Integer %d", val);
+    }
+
+}
+```
 
 No conclusion yet — explore during implementation.
 
