@@ -21,8 +21,8 @@ import org.apache.calcite.linq4j.Enumerable;
 import org.apache.calcite.linq4j.Linq4j;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.MergedIndexRegistry;
+import org.apache.calcite.materialize.Pipeline;
 import org.apache.calcite.plan.ConventionTraitDef;
-import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.hep.HepPlanner;
@@ -148,14 +148,21 @@ public class PipelineToMergedIndexScanRuleTest {
     // ── Register merged index ───────────────────────────────────────────────
     EnumerableSort leftSort = (EnumerableSort) join.getLeft();
     EnumerableSort rightSort = (EnumerableSort) join.getRight();
-    RelOptTable tableA = ((EnumerableTableScan) leftSort.getInput()).getTable();
-    RelOptTable tableB = ((EnumerableTableScan) rightSort.getInput()).getTable();
     RelCollation collation = leftSort.getCollation();
     double rowCount = join.estimateRowCount(join.getCluster().getMetadataQuery());
-    MergedIndexRegistry.register(
-        new MergedIndex(List.of(tableA, tableB),
-            List.of(leftSort.getCollation(), rightSort.getCollation()),
-            collation, rowCount));
+
+    // Build Pipeline objects to wrap the table scans, then create a
+    // Pipeline for the join so MergedIndex(Pipeline) can be used.
+    Pipeline pLeft = new Pipeline(leftSort.getInput(), List.of(),
+        collation, collation, leftSort.getInput()
+            .estimateRowCount(join.getCluster().getMetadataQuery()));
+    Pipeline pRight = new Pipeline(rightSort.getInput(), List.of(),
+        collation, collation, rightSort.getInput()
+            .estimateRowCount(join.getCluster().getMetadataQuery()));
+    Pipeline pJoin = new Pipeline(join, List.of(pLeft, pRight),
+        collation, collation, rowCount);
+    new MergedIndex(pJoin);
+    MergedIndexRegistry.register(pJoin.mergedIndex);
 
     // ── Phase 2 ────────────────────────────────────────────────────────────
     // Use a HEP planner so the rule fires directly on the matched subtree

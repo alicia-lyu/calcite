@@ -168,8 +168,10 @@ class MergedIndexTpchPlanTest {
 
     // ── Discover pipelines and register merged index ──────────────────────
     final Pipeline pipelineTree = buildPipelineTree(phase1Plan);
-    final List<Pipeline> pipelines = flattenPipelines(pipelineTree);
-    assertThat("Expected 1 non-trivial pipeline for Q12", pipelines.size(), is(1));
+    final List<Pipeline> pipelines = flattenPipelines(pipelineTree).stream()
+        .filter(p -> p.sources.size() >= 2)
+        .collect(Collectors.toList());
+    assertThat("Expected 1 join pipeline for Q12", pipelines.size(), is(1));
 
     final Pipeline p = pipelines.get(0);
     new MergedIndex(p);
@@ -296,8 +298,10 @@ class MergedIndexTpchPlanTest {
     // flattenPipelines returns non-trivial pipelines in post-order
     // (inner first) so inner pipeline is registered before outer.
     final Pipeline pipelineTree = buildPipelineTree(phase1Plan);
-    final List<Pipeline> pipelines = flattenPipelines(pipelineTree);
-    assertThat("Expected 2 pipelines (inner orderkey + outer custkey)",
+    final List<Pipeline> pipelines = flattenPipelines(pipelineTree).stream()
+        .filter(p -> p.sources.size() >= 2)
+        .collect(Collectors.toList());
+    assertThat("Expected 2 join pipelines (inner orderkey + outer custkey)",
         pipelines.size(), is(2));
 
     // ── Register merged indexes bottom-up ─────────────────────────────────
@@ -693,10 +697,12 @@ class MergedIndexTpchPlanTest {
     System.out.println(beforeStr);
     writeDotFile("q9_before", phase1Plan);
 
-    // Discover all 5 pipelines bottom-up (inner first) and register nested MergedIndexes.
+    // Discover all 5 join pipelines bottom-up (inner first) and register nested MergedIndexes.
     final Pipeline pipelineTree = buildPipelineTree(phase1Plan);
-    final List<Pipeline> pipelines = flattenPipelines(pipelineTree);
-    assertThat("Expected 5 pipelines for Q9", pipelines.size(), is(5));
+    final List<Pipeline> pipelines = flattenPipelines(pipelineTree).stream()
+        .filter(p -> p.sources.size() >= 2)
+        .collect(Collectors.toList());
+    assertThat("Expected 5 join pipelines for Q9", pipelines.size(), is(5));
     for (int i = 0; i < pipelines.size(); i++) {
       final Pipeline p = pipelines.get(i);
       new MergedIndex(p);

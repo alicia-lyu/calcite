@@ -19,6 +19,7 @@ package org.apache.calcite.adapter.enumerable;
 import org.apache.calcite.linq4j.tree.BlockBuilder;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.materialize.MergedIndex;
+import org.apache.calcite.materialize.Pipeline;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptPlanner;
@@ -83,7 +84,7 @@ public class EnumerableMergedIndexDeltaScan extends AbstractRelNode
       RelDataType rowType) {
     final RelTraitSet traitSet =
         cluster.traitSetOf(EnumerableConvention.INSTANCE)
-            .replace(mergedIndex.collation);
+            .replace(mergedIndex.getCollation());
     return new EnumerableMergedIndexDeltaScan(cluster, traitSet, mergedIndex, rowType);
   }
 
@@ -93,31 +94,35 @@ public class EnumerableMergedIndexDeltaScan extends AbstractRelNode
 
   @Override public RelOptCost computeSelfCost(RelOptPlanner planner,
       RelMetadataQuery mq) {
-    double rc = mergedIndex.rowCount;
+    double rc = mergedIndex.getRowCount();
     return planner.getCostFactory().makeCost(rc, rc * 0.2, rc);
   }
 
   @Override public double estimateRowCount(RelMetadataQuery mq) {
-    return mergedIndex.rowCount;
+    return mergedIndex.getRowCount();
   }
 
   @Override public RelWriter explainTerms(RelWriter pw) {
     List<String> descs = new ArrayList<>();
-    for (int i = 0; i < mergedIndex.sources.size(); i++) {
-      Object src = mergedIndex.sources.get(i);
-      RelCollation tc = mergedIndex.tableCollations.get(i);
-      if (src instanceof RelOptTable) {
-        RelOptTable t = (RelOptTable) src;
-        int keyIdx = tc.getFieldCollations().get(0).getFieldIndex();
-        String keyName = t.getRowType().getFieldList().get(keyIdx).getName();
-        descs.add("delta:" + t.getQualifiedName() + ":" + keyName);
+    for (int i = 0; i < mergedIndex.getSources().size(); i++) {
+      Pipeline child = mergedIndex.getSources().get(i);
+      RelCollation tc = child.boundaryCollation;
+      if (child.mergedIndex != null) {
+        descs.add("delta:view(" + child.mergedIndex.getCollation() + ")");
       } else {
-        descs.add("delta:view(" + ((MergedIndex) src).collation + ")");
+        RelOptTable t = MergedIndex.findLeafScan(child.root);
+        if (t != null) {
+          int keyIdx = tc.getFieldCollations().get(0).getFieldIndex();
+          String keyName = t.getRowType().getFieldList().get(keyIdx).getName();
+          descs.add("delta:" + t.getQualifiedName() + ":" + keyName);
+        } else {
+          descs.add("delta:unknown");
+        }
       }
     }
     return super.explainTerms(pw)
         .item("tables", descs)
-        .item("collation", mergedIndex.collation);
+        .item("collation", mergedIndex.getCollation());
   }
 
   /**

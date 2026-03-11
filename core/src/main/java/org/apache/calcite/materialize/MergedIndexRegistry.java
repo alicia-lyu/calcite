@@ -22,17 +22,10 @@ import org.apache.calcite.rel.RelCollation;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.stream.Collectors;
 
 /**
  * Static singleton registry that maps a set of tables to the
  * {@link MergedIndex} instances that cover them.
- *
- * <p>Usage:
- * <pre>{@code
- * MergedIndexRegistry.register(new MergedIndex(List.of(tableA, tableB), collation, rowCount));
- * Optional<MergedIndex> idx = MergedIndexRegistry.findFor(List.of(tableA, tableB), collation);
- * }</pre>
  *
  * <p>The registry is process-global and thread-safe (registrations are
  * synchronized). It is intended for testing and proof-of-concept scenarios;
@@ -51,21 +44,23 @@ public final class MergedIndexRegistry {
   }
 
   /**
-   * Finds a registered {@link MergedIndex} whose sources match exactly
-   * {@code sources} (in any order) and whose collation satisfies
+   * Finds a registered {@link MergedIndex} whose pipeline sources match
+   * exactly {@code querySources} (in any order) and whose collation satisfies
    * {@code required}.
    *
-   * <p>Sources may be {@link RelOptTable} (matched by qualified name) or
-   * {@link MergedIndex} (matched by object identity).
+   * <p>Query sources may be {@link RelOptTable} (matched by qualified name
+   * against the leaf scan of a Pipeline source) or {@link MergedIndex}
+   * (matched by identity against a Pipeline source's {@code mergedIndex}).
    *
-   * @param sources  the sources participating in the pipeline
-   * @param required the collation that the pipeline requires
+   * @param querySources the sources extracted from the query pipeline
+   * @param required     the collation that the pipeline requires
    * @return the first matching index, or empty if none
    */
   public static synchronized Optional<MergedIndex> findFor(
-      List<Object> sources, RelCollation required) {
+      List<Object> querySources, RelCollation required) {
     for (MergedIndex index : INDEXES) {
-      if (sourcesMatch(index.pipeline.sources, sources) && index.satisfies(required)) {
+      if (sourcesMatch(index.pipeline.sources, querySources)
+          && index.satisfies(required)) {
         return Optional.of(index);
       }
     }
@@ -77,14 +72,19 @@ public final class MergedIndexRegistry {
     INDEXES.clear();
   }
 
-  private static boolean sourcesMatch(List<Object> a, List<Object> b) {
-    if (a.size() != b.size()) {
+  /**
+   * Checks whether the registered index's Pipeline sources match the query's
+   * extracted sources (RelOptTable or MergedIndex objects).
+   */
+  private static boolean sourcesMatch(List<Pipeline> indexSources,
+      List<Object> querySources) {
+    if (indexSources.size() != querySources.size()) {
       return false;
     }
     outer:
-    for (Object ai : a) {
-      for (Object bi : b) {
-        if (sourceEquals(ai, bi)) {
+    for (Pipeline pipelineSrc : indexSources) {
+      for (Object querySrc : querySources) {
+        if (pipelineMatchesSource(pipelineSrc, querySrc)) {
           continue outer;
         }
       }
@@ -93,13 +93,27 @@ public final class MergedIndexRegistry {
     return true;
   }
 
-  private static boolean sourceEquals(Object a, Object b) {
-    if (a instanceof RelOptTable && b instanceof RelOptTable) {
-      return ((RelOptTable) a).getQualifiedName()
-          .equals(((RelOptTable) b).getQualifiedName());
+  /**
+   * Matches a Pipeline child source against a query-extracted source.
+   *
+   * <ul>
+   *   <li>If the Pipeline child has a {@code mergedIndex} and the query source
+   *       is a {@code MergedIndex}: identity match.
+   *   <li>If the query source is a {@code RelOptTable}: find the leaf table
+   *       scan in the Pipeline child's root and compare qualified names.
+   * </ul>
+   */
+  private static boolean pipelineMatchesSource(Pipeline pipelineSrc,
+      Object querySrc) {
+    if (querySrc instanceof MergedIndex && pipelineSrc.mergedIndex != null) {
+      return pipelineSrc.mergedIndex == querySrc;
     }
-    if (a instanceof MergedIndex && b instanceof MergedIndex) {
-      return a == b; // identity: same Java object
+    if (querySrc instanceof RelOptTable) {
+      final RelOptTable leafTable = MergedIndex.findLeafScan(pipelineSrc.root);
+      if (leafTable != null) {
+        return leafTable.getQualifiedName()
+            .equals(((RelOptTable) querySrc).getQualifiedName());
+      }
     }
     return false;
   }

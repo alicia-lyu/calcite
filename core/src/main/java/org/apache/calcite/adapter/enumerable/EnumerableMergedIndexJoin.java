@@ -19,6 +19,7 @@ package org.apache.calcite.adapter.enumerable;
 import org.apache.calcite.linq4j.tree.BlockBuilder;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.materialize.MergedIndex;
+import org.apache.calcite.materialize.Pipeline;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelTraitSet;
@@ -86,7 +87,7 @@ public class EnumerableMergedIndexJoin extends SingleRel implements EnumerableRe
       JoinRelType joinType,
       RelNode input) {
     RelTraitSet traits = cluster.traitSetOf(EnumerableConvention.INSTANCE)
-        .replace(mergedIndex.collation);
+        .replace(mergedIndex.getCollation());
     return new EnumerableMergedIndexJoin(cluster, traits, input, mergedIndex, joinType);
   }
 
@@ -97,22 +98,25 @@ public class EnumerableMergedIndexJoin extends SingleRel implements EnumerableRe
 
   @Override public RelWriter explainTerms(RelWriter pw) {
     List<String> sourceDescs = new ArrayList<>();
-    for (int i = 0; i < mergedIndex.sources.size(); i++) {
-      Object src = mergedIndex.sources.get(i);
-      if (src instanceof RelOptTable) {
-        RelOptTable t = (RelOptTable) src;
-        int keyIdx = mergedIndex.tableCollations.get(i).getFieldCollations().get(0).getFieldIndex();
-        String keyName = t.getRowType().getFieldList().get(keyIdx).getName();
-        sourceDescs.add(t.getQualifiedName() + ":" + keyName);
+    for (int i = 0; i < mergedIndex.getSources().size(); i++) {
+      Pipeline child = mergedIndex.getSources().get(i);
+      if (child.mergedIndex != null) {
+        sourceDescs.add("view(" + child.mergedIndex.getCollation() + ")");
       } else {
-        MergedIndex inner = (MergedIndex) src;
-        sourceDescs.add("view(" + inner.collation + ")");
+        RelOptTable t = MergedIndex.findLeafScan(child.root);
+        if (t != null) {
+          int keyIdx = child.boundaryCollation.getFieldCollations().get(0).getFieldIndex();
+          String keyName = t.getRowType().getFieldList().get(keyIdx).getName();
+          sourceDescs.add(t.getQualifiedName() + ":" + keyName);
+        } else {
+          sourceDescs.add("unknown");
+        }
       }
     }
     return super.explainTerms(pw)
         .item("sources", sourceDescs)
         .item("joinType", joinType)
-        .item("collation", mergedIndex.collation);
+        .item("collation", mergedIndex.getCollation());
   }
 
   /**
