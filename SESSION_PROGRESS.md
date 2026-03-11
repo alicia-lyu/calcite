@@ -2,6 +2,8 @@
 
 ## Status
 
+NOTE: This is frozen and stale. The latest change is in `./overhaul-03-10.md`.
+
 | Item                                                                    | Status  |
 |-------------------------------------------------------------------------|---------|
 | `CLAUDE.md` + `main.md`                                                 | Done    |
