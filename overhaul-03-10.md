@@ -82,13 +82,23 @@ Also note that the code I provided you with above didn't explicit use join for p
 
 ## Pipeline Conversion
 
-Such a tree of pipelines breaks down a query into multiple stages, each pipeline is one stage. Following the pull-based Cascade framework, from upstream to downstream, the following stages are an example:
+The execution of a pipeline can be broken down into the following cases:
+
+The inputs/sources of a pipeline can be either data flow, e.g. full table scans, or delta flow, e.g., table inserts. This section only considers data flow.
+
+A tree of pipelines breaks down a query into multiple stages, each pipeline is one stage. Following the pull-based Cascade framework, from top to bottom (downstream operator calling `next` on upstream operator), here is an example:
 
 1. Final stage: query-time computation. Let the pipeline be `p1`. `p1.mergedIndex` in effect stores all records from `p1.sources`, so there is no real need to read those sources; they only signify the boundary of `p1`. We just scan this merged index and complete the steps between `p1.root` and `p1.sources`.
-2. Index creation final stage: Let the pipeline be `p2`. This pipeline is one source of `p1`. `p2.mergedIndex`in effect stores all records from `p2.sources`. We just scan this merged index and complete the steps of `p2.root` and `p2.sources` in this way: `while (true) {p1.mergedIndex.add(p2.physicalPlan.next())}`---pull-based/Cascade.
-3. Index creation initial stage:  Let the pipeline be `p3`. This pipeline is one source of `p2`. `p3.mergedIndex`in effect stores all records from `p3.sources`. We just scan this merged index and complete the steps of `p3.root` and `p3.sources` in this way: `while (true) {p2.mergedIndex.add(p3.physicalPlan.next())}`---pull-based/Cascade.
+2. Index creation final stage: Let the pipeline be `p2`. This pipeline is one source of `p1`. `p2.mergedIndex`in effect stores all records from `p2.sources`. We just scan this merged index and complete the steps of `p2.root` and `p2.sources`, producing result record one by one with `while (true) {p1.mergedIndex.add(p2.physicalPlan.next())}`---pull-based/Cascade, namely the `physicalPlan` is a enumerable.
+3. Index creation initial stage:  Similar to index creation final stage.
 
-As foreshadowed, we need to create `physicalPlan` for each pipeline, essentially converting the logical plan in `root` to a physical plan. It should be similar to the standard conversion, consisting of a series/tree of pull-based operators. The only exception is at the very upstream of the physical plan, because this operator must process a data flow interleaving different types of records, either to join them, join+aggregate them, or aggregate+join them---in short a kind of record assembly. Two example algorithms are Algorithm 1 and 2 in `./main.tex`. Your whole `PipelineToMergedIndexScanRule.java` must be overhauled.
+The only difference between query plan and index creation plan is that the former does not flow into yet another pipeline (with a merged index storing the result). A query plan produces the full query result as requested in a database (flow into the user).
+
+Regardless of query plan or index creation plan, we all need to produce the result of a pipeline based on the merged index (the sources of the pipeline is not actually read, more to signal the lower boundary of the current pipeline). 
+
+We need to create `physicalPlan` for each pipeline, essentially converting the logical plan between `root` and `sources` to a physical plan with `mergedIndex` as the input. It should be similar to the standard conversion, consisting of a series/tree of pull-based operators. The only exception is at the very upstream of the physical plan, because this operator must process a data flow interleaving different types of records, either to join them, join+aggregate them, or aggregate+join them---in short a kind of record assembly. Two example algorithms are Algorithm 1 and 2 in `./main.tex`. Your whole `PipelineToMergedIndexScanRule.java` must be overhauled. 
+
+How to provide a universal implementation for this bottom operator intaking interleaving records (regardless of whether it's join or join+aggregate), I don't have a clear idea yet, I think we need to first define such a stream. Explore and plan this part coarsely. Aside from this, plan the other parts (mainly the structure of cascading pipelines' physical plans) concretely.
 
 ## Maintenance plans
 
