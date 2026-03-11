@@ -415,30 +415,35 @@ cascade level.
 ### Short Term (next session)
 
 1. ~~**MergedIndex ↔ Pipeline deduplication**~~ **DONE** (commit `33779964c`)
-   - Pipeline moved to `materialize/Pipeline.java` (production code).
-   - `MergedIndex(Pipeline)` constructor derives sources, collations, rowCount from pipeline.
-   - `resolveSources()` and `findLeafScan()` moved from test to `MergedIndex.java`.
-   - Test code simplified: `new MergedIndex(p)` replaces manual field assembly.
-   - `flattenPostOrder` reverted to `sources.size() >= 2` — `p.mergedIndex != null` doesn't
-     work at discovery time (mergedIndex is set after flattenPipelines runs).
 
-2. **Pipeline conversion / physicalPlan** (file: `MergedIndexTpchPlanTest.java`)
-   - Per `overhaul-03-10.md` §Pipeline Conversion: create `physicalPlan` for each pipeline,
-     converting logical plan to physical pull-based operators. The upstream operator must
-     process interleaved records from the merged index (Algorithm 1/2 in `main.tex`).
-   - `physicalPlan` covers three execution modes (differ only in timing and data flow):
-     query-time (input data flow, final pipeline), index creation (input data flow,
-     non-final pipeline), maintenance-time (input delta flow, non-final pipeline).
-   - `PipelineToMergedIndexScanRule.java` needs overhaul per the doc.
+2. **Subtask 0: Assembly subtree identification** (files: `Pipeline.java`, test in `MergedIndexTpchPlanTest.java`)
+   - Implement `findAssemblySubtree(Pipeline)` — LCA-based algorithm to find the minimal
+     connected subgraph of operators between pipeline root and boundary Sorts.
+   - Add test validation: Q12 → subtree = {MergeJoin}; Q3-OL → subtree = {MergeJoin} per level.
+   - See `overhaul-03-10.md` §Subtask 0 for algorithm pseudo-code and examples.
 
-3. **Resolve outer pipeline delta leaf** (file: `MergedIndexTpchPlanTest.java`)
-   - Phase 2 maintenance should use `LogicalDelta(MI_OL)` for inner MI delta, not the
-     full inner pipeline subtree. This should become
-     `EnumerableMergedIndexDeltaScan(inner_MI)` at physical level.
+### Following Sessions
 
-4. **Maintenance plans overhaul** (file: `MergedIndexTpchPlanTest.java`)
-   - Per `overhaul-03-10.md` §Maintenance plans: maintenance plans process delta instead
-     of full data. Current `deriveIncrementalPlan` may need rework.
+3. **Subtask 1: Tagged interleaved row type** (new file or in `EnumerableMergedIndexScan.java`)
+   - Define how the raw scan outputs tagged records from heterogeneous source tables.
+   - Evaluate wide union vs. generic tagged row vs. per-source typed enumerables.
+
+4. **Subtask 3: `EnumerableMergedIndexAssemble` operator** (new file: `EnumerableMergedIndexAssemble.java`)
+   - Implement Algorithm 1 (N-way inner join: buffer per source, Cartesian product on key change).
+   - Assembly strategy parameterized by absorbed operator types from Subtask 0.
+
+5. **Subtask 2: `EnumerableMergedIndexScan.implement()`** (file: `EnumerableMergedIndexScan.java`)
+   - Produce interleaved tagged stream from source enumerables merged by sort key.
+
+6. **Subtask 4: Update `PipelineToMergedIndexScanRule`** (file: `PipelineToMergedIndexScanRule.java`)
+   - Rule produces `Assemble(Scan)` replacing the Assembly subtree.
+   - `EnumerableMergedIndexJoin` may become unnecessary.
+
+7. **Subtask 5: Index creation mode** (file: `Pipeline.java`)
+   - `physicalPlan` field on Pipeline; after HEP substitution, extract and store subtree.
+   - End-to-end: `while (hasNext) { parentMI.add(physicalPlan.next()) }`.
+
+8. **End-to-end test with actual row production** — Q12, Q3-OL, Q9.
 
 ### Medium Term
 

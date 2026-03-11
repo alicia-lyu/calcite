@@ -82,24 +82,202 @@ Also note that the code I provided you with above didn't explicit use join for p
 
 ## Pipeline Conversion
 
-The execution of a pipeline can be broken down into the following cases:
+### Architecture Decision: Option B — Separate Scan + Assembly Operators
 
-The inputs/sources of a pipeline can be either data flow, e.g. full table scans, or delta flow, e.g., table inserts. This section only considers data flow.
+For each pipeline, the AFTER query plan should look like:
 
-A tree of pipelines breaks down a query into multiple stages, each pipeline is one stage. Following the pull-based Cascade framework, from top to bottom (downstream operator calling `next` on upstream operator), here is an example:
+```text
+remaining operators (Aggregate, Filter, Project, ...)
+  EnumerableMergedIndexAssemble(sources=N, keyIndices=[...])
+    EnumerableMergedIndexScan(raw interleaved stream)
+```
 
-1. Final stage: query-time computation. Let the pipeline be `p1`. `p1.mergedIndex` in effect stores all records from `p1.sources`, so there is no real need to read those sources; they only signify the boundary of `p1`. We just scan this merged index and complete the steps between `p1.root` and `p1.sources`.
-2. Index creation final stage: Let the pipeline be `p2`. This pipeline is one source of `p1`. `p2.mergedIndex`in effect stores all records from `p2.sources`. We just scan this merged index and complete the steps of `p2.root` and `p2.sources`, producing result record one by one with `while (true) {p1.mergedIndex.add(p2.physicalPlan.next())}`---pull-based/Cascade, namely the `physicalPlan` is a enumerable.
-3. Index creation initial stage:  Similar to index creation final stage.
+The scan outputs **tagged interleaved records** (one row per source record, with a
+source-tag column). The assembly operator above it buffers per source and emits
+Cartesian products on key change (Algorithm 1 from `main.tex`).
 
-The only difference between query plan and index creation plan is that the former does not flow into yet another pipeline (with a merged index storing the result). A query plan produces the full query result as requested in a database (flow into the user).
+### Subtask 0: Identify the Assembly Subtree
 
-Regardless of query plan or index creation plan, we all need to produce the result of a pipeline based on the merged index (the sources of the pipeline is not actually read, more to signal the lower boundary of the current pipeline). 
+**Goal**: Given a pipeline, identify which operators should be absorbed into
+`EnumerableMergedIndexAssemble`. This is a tree search problem.
 
-We need to create `physicalPlan` for each pipeline, essentially converting the logical plan between `root` and `sources` to a physical plan with `mergedIndex` as the input. It should be similar to the standard conversion, consisting of a series/tree of pull-based operators. The only exception is at the very upstream of the physical plan, because this operator must process a data flow interleaving different types of records, either to join them, join+aggregate them, or aggregate+join them---in short a kind of record assembly. Two example algorithms are Algorithm 1 and 2 in `./main.tex`. Your whole `PipelineToMergedIndexScanRule.java` must be overhauled. 
+A pipeline's internal tree spans from `root` down to the boundary Sorts (exclusive).
+Not all operators belong to Assembly — operators above the Assembly subtree are
+"remaining operators" that execute normally on the Assembly's joined output.
 
-How to provide a universal implementation for this bottom operator intaking interleaving records (regardless of whether it's join or join+aggregate), I don't have a clear idea yet, I think we need to first define such a stream. Explore and plan this part coarsely. 
-Per `MergedIndexTpchPlanTest.java`, Calcite seems to tranform a logical plan to physical plan by `HEP`. I actually don't understand what it is and how it works, explore use of `HEP` for pipeline conversion as well.
+**Assembly subtree** = the minimal connected subgraph that includes all nodes directly
+consuming boundary Sorts as inputs.
+
+**Definitions**:
+- **Boundary Sort**: an `EnumerableSort` separating this pipeline from a child pipeline.
+- **Boundary consumer**: a node with a boundary Sort as a direct input.
+- **Assembly subtree root** = Lowest Common Ancestor (LCA) of all boundary consumers.
+- **Assembly subtree** = all nodes on paths from LCA down to boundary consumers (inclusive).
+
+**Examples**:
+
+Q12 (Assembly = just the MergeJoin):
+```text
+Pipeline root = EnumerableSort(l_shipmode)
+  EnumerableSortedAggregate        ← remaining operator
+    EnumerableMergeJoin(orderkey)  ← boundary consumer of BOTH Sorts → LCA → Assembly root
+      Sort(orderkey) → ORDERS      ← boundary Sort (source 0)
+      Sort(orderkey) → LINEITEM    ← boundary Sort (source 1)
+
+Assembly subtree = {MergeJoin}
+```
+
+Hypothetical — SortedAggregate between boundary Sort and join (no intermediate Sort):
+```text
+Pipeline root = MergeJoin(k)            ← boundary consumer of Sort→B
+  SortedAggregate(k)                    ← boundary consumer of Sort→A
+    Sort(k) → Scan(A)                   ← boundary Sort (source 0)
+  Sort(k) → Scan(B)                     ← boundary Sort (source 1)
+
+Assembly subtree = {MergeJoin, SortedAggregate}
+```
+
+This arises when `injectSortsBeforeSortBasedOps` skips injecting a Sort because both
+operators share the same key. Assembly must handle both join AND aggregation.
+
+3-way join same key, no intermediate re-sort:
+```text
+Pipeline root = MergeJoin_outer(k)
+  MergeJoin_inner(k)
+    Sort(k) → Scan(A)
+    Sort(k) → Scan(B)
+  Sort(k) → Scan(C)
+
+Assembly subtree = {MergeJoin_outer, MergeJoin_inner}
+```
+
+Note: current pipeline discovery does NOT produce multi-join pipelines because
+`injectSortsBeforeSortBasedOps` always injects Sorts before every join. But an
+optimizer that avoids redundant sorts could produce this case.
+
+**Algorithm** (pseudo-code):
+```java
+Set<RelNode> findAssemblySubtree(Pipeline pipeline) {
+    Set<RelNode> boundarySorts = collectBoundarySorts(pipeline);
+    Map<RelNode, Integer> descendantCount = new HashMap<>();
+    markDescendants(pipeline.root, boundarySorts, descendantCount);
+    RelNode lca = findLCA(pipeline.root, boundarySorts.size(), descendantCount);
+    Set<RelNode> subtree = new HashSet<>();
+    collectSubtree(lca, boundarySorts, subtree);
+    return subtree;
+}
+
+// Post-order: count how many boundary Sorts are reachable from each node
+int markDescendants(RelNode node, Set<RelNode> boundarySorts,
+                    Map<RelNode, Integer> counts) {
+    int count = 0;
+    for (RelNode input : node.getInputs()) {
+        if (boundarySorts.contains(input)) {
+            count++;  // this node directly consumes a boundary Sort
+        } else {
+            count += markDescendants(input, boundarySorts, counts);
+        }
+    }
+    counts.put(node, count);
+    return count;
+}
+
+// Walk down from LCA, including only nodes on paths to boundary Sorts
+void collectSubtree(RelNode node, Set<RelNode> boundarySorts,
+                    Set<RelNode> result) {
+    result.add(node);
+    for (RelNode input : node.getInputs()) {
+        if (boundarySorts.contains(input)) continue;
+        if (counts.get(input) > 0) {
+            collectSubtree(input, boundarySorts, result);
+        }
+    }
+}
+```
+
+**What the Assembly subtree determines**:
+- Subtree = {MergeJoin} → Algorithm 1 (N-way join, Cartesian product per key group)
+- Subtree = {MergeJoin, SortedAggregate} → Algorithm 2 (join + aggregate fusion)
+- Subtree = {MergeJoin_outer, MergeJoin_inner} → extended Algorithm 1 (3+ sources)
+
+### Subtask 1: Tagged Interleaved Row Type
+
+The raw scan output needs a schema for records from heterogeneous source tables. Options:
+
+- **Wide union row**: all columns from all sources concatenated + `sourceTag` int.
+  Simple but wasteful. For hierarchical keys, must either nest or replicate parent rows
+  (replication = implicit join, defeating modularization).
+- **Generic tagged row**: `(sortKey Object[], sourceTag int, payload Object[])`.
+  Compact but loses column-level type safety.
+- **Per-source typed rows via Enumerable union**: each source produces its own typed
+  enumerable; the scan merges and tags. Assembly knows each source's schema.
+
+No conclusion yet — explore during implementation.
+
+### Subtask 2: `EnumerableMergedIndexScan.implement()` — Interleaved Stream
+
+The scan obtains source enumerables (via table scans or inner MI scans),
+merge-interleaves them by sort key, and tags each record with source index. PoC can
+use a runtime helper method rather than full Janino codegen.
+
+### Subtask 3: `EnumerableMergedIndexAssemble` Operator
+
+New physical operator. Algorithm 1 logic (N-way inner join):
+```text
+buffers = new List<List<Object[]>>[sourceCount]
+currentKey = null
+
+for each record in input:
+  key = extractKey(record)
+  tag = record.sourceTag
+
+  if key != currentKey:
+    if currentKey != null: emit cartesianProduct(buffers)
+    clear all buffers
+    currentKey = key
+
+  buffers[tag].add(extractPayload(record, tag))
+
+// flush last key group
+emit cartesianProduct(buffers)
+```
+
+The assembly strategy is parameterized by the absorbed operator types (from Subtask 0):
+- Join-only → Algorithm 1 (Cartesian product per key group)
+- Join + aggregate → Algorithm 2 (aggregate during assembly)
+- Multi-level join → extended Algorithm 1 (3+ source buffers)
+
+### Subtask 4: Update `PipelineToMergedIndexScanRule`
+
+The rule produces `Assemble(Scan)` replacing the Assembly subtree. Both inner and outer
+pipelines use the same pattern. `EnumerableMergedIndexJoin` may become unnecessary
+(Assemble handles both cases uniformly).
+
+Rule's match pattern stays the same (match MergeJoin), but replacement now considers
+the Assembly subtree: replace LCA with `Assemble(Scan)`, leave operators above LCA.
+
+### Subtask 5: Index Creation Mode
+
+For non-final pipelines, the physicalPlan's output feeds into the parent merged index:
+`while (hasNext) { parentMI.add(physicalPlan.next()) }`.
+
+Needs `physicalPlan` field on `Pipeline.java`. After HEP substitution, extract the
+relevant subtree and store on the Pipeline.
+
+### Suggested Implementation Order
+
+1. Subtask 0 — Assembly subtree identification + test validation
+2. Subtask 1 — Tagged row type (foundation for scan and assembly)
+3. Subtask 3 — Assembly operator (Algorithm 1 implementation)
+4. Subtask 2 — Scan.implement with interleaved output
+5. Subtask 4 — Rule update (wires Assemble(Scan) into the plan)
+6. Subtask 5 — Index creation (physicalPlan field, end-to-end pipeline execution)
+7. Test with Q12, Q3-OL, Q9 — verify actual row production
+
+### Future Work: Maintenance Mode
+
+Same as index creation with `DeltaScan` replacing `Scan`. Reconcile with existing
+`deriveIncrementalPlan()` and `maintenancePlan` field.
 
 ## Maintenance plans
 
