@@ -337,44 +337,7 @@ public class PipelineToMergedIndexScanRuleTest {
     return null;
   }
 
-  /**
-   * Walks the plan tree and wraps each immediate input of every {@link Join}
-   * node in a {@link LogicalSort} with the given collation.
-   *
-   * <p>This ensures {@code ENUMERABLE_SORT_RULE} has concrete {@code LogicalSort}
-   * nodes to convert, giving the Volcano planner the physical sort operators
-   * that {@link EnumerableMergeJoin} requires from its inputs.
-   */
-  private static RelNode injectSortsBeforeJoin(RelNode node,
-      RelCollation collation) {
-    if (node instanceof Join) {
-      Join join = (Join) node;
-      RelNode sortedLeft =
-          LogicalSort.create(join.getLeft(), collation, null, null);
-      RelNode sortedRight =
-          LogicalSort.create(join.getRight(), collation, null, null);
-      return join.copy(join.getTraitSet(),
-          List.of(sortedLeft, sortedRight));
-    }
-    List<RelNode> newInputs = node.getInputs().stream()
-        .map(input -> injectSortsBeforeJoin(input, collation))
-        .collect(Collectors.toList());
-    return node.copy(node.getTraitSet(), newInputs);
-  }
-
-  /** Recursively finds the first {@link EnumerableMergeJoin} in the plan tree. */
-  private static @Nullable EnumerableMergeJoin findMergeJoin(RelNode node) {
-    if (node instanceof EnumerableMergeJoin) {
-      return (EnumerableMergeJoin) node;
-    }
-    for (RelNode input : node.getInputs()) {
-      EnumerableMergeJoin found = findMergeJoin(input);
-      if (found != null) {
-        return found;
-      }
-    }
-    return null;
-  }
+  // I believe the two deleted methods are rendered obsolete by pipeline identification in MergedIndexTPCHPlanTest. Instead of finding merge joins, we should find pipelines. Instead of injecting sorts before joins, we should inject them before any sort-based operator. Those helper methods are available in MergedIndexTpchPlanTest. Consider moving them to a common test utility class.
 
   /**
    * Two-table schema with {@code A(k INT, x INT)} and {@code B(k INT, y INT)}.
