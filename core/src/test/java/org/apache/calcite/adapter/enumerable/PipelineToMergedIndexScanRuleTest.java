@@ -27,13 +27,9 @@ import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgram;
-import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelCollationTraitDef;
-import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
-import org.apache.calcite.rel.core.Join;
-import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.schema.ScannableTable;
@@ -47,6 +43,7 @@ import org.apache.calcite.sql.SqlExplainFormat;
 import org.apache.calcite.sql.SqlExplainLevel;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.parser.SqlParser;
+import org.apache.calcite.test.MergedIndexTestUtil;
 import org.apache.calcite.tools.FrameworkConfig;
 import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.Planner;
@@ -61,7 +58,6 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -118,7 +114,9 @@ public class PipelineToMergedIndexScanRuleTest {
                 EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
                 EnumerableRules.ENUMERABLE_PROJECT_RULE,
                 EnumerableRules.ENUMERABLE_SORT_RULE,
-                EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE)))
+                EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
+                EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
+                EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE)))
         .build();
 
     Planner planner = Frameworks.getPlanner(config);
@@ -126,50 +124,30 @@ public class PipelineToMergedIndexScanRuleTest {
     SqlNode validated = planner.validate(parsed);
     RelRoot root = planner.rel(validated);
 
-    // Inject LogicalSort(k ASC) at each join input so that ENUMERABLE_SORT_RULE
-    // can convert them to EnumerableSort nodes in phase 1.
-    // Without this, ENUMERABLE_SORT_RULE has no LogicalSort to work with, and
-    // the Volcano planner cannot satisfy the merge-join's collation requirement.
-    RelCollation joinKeyCollation = RelCollations.of(0);
-    RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel, joinKeyCollation);
+    // Inject LogicalSort at each sort-based operator input so that
+    // ENUMERABLE_SORT_RULE can convert them to EnumerableSort nodes in phase 1.
+    RelNode logicalWithSorts =
+        MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
 
     RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
 
     // ── Phase 1 ────────────────────────────────────────────────────────────
-    // Expected shape: (EnumerableProject →) EnumerableMergeJoin
-    //                   → EnumerableSort(k) → EnumerableTableScan(A)
-    //                   → EnumerableSort(k) → EnumerableTableScan(B)
     RelNode phase1Plan = planner.transform(0, desiredTraits, logicalWithSorts);
 
-    // Navigate through any wrapping Project to locate the MergeJoin.
-    EnumerableMergeJoin join = Objects.requireNonNull(
-        findMergeJoin(phase1Plan),
-        "Phase 1 plan does not contain an EnumerableMergeJoin: " + phase1Plan);
+    // ── Discover pipeline and register merged index ────────────────────────
+    Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    List<Pipeline> pipelines =
+        MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
+            .filter(p -> p.sources.size() >= 2)
+            .collect(Collectors.toList());
+    assertThat("Expected 1 join pipeline", pipelines.size(), is(1));
 
-    // ── Register merged index ───────────────────────────────────────────────
-    EnumerableSort leftSort = (EnumerableSort) join.getLeft();
-    EnumerableSort rightSort = (EnumerableSort) join.getRight();
-    RelCollation collation = leftSort.getCollation();
-    double rowCount = join.estimateRowCount(join.getCluster().getMetadataQuery());
-
-    // Build Pipeline objects to wrap the table scans, then create a
-    // Pipeline for the join so MergedIndex(Pipeline) can be used.
-    Pipeline pLeft = new Pipeline(leftSort.getInput(), List.of(),
-        collation, collation, leftSort.getInput()
-            .estimateRowCount(join.getCluster().getMetadataQuery()));
-    Pipeline pRight = new Pipeline(rightSort.getInput(), List.of(),
-        collation, collation, rightSort.getInput()
-            .estimateRowCount(join.getCluster().getMetadataQuery()));
-    Pipeline pJoin = new Pipeline(join, List.of(pLeft, pRight),
-        collation, collation, rowCount);
-    new MergedIndex(pJoin);
-    MergedIndexRegistry.register(pJoin.mergedIndex);
+    Pipeline p = pipelines.get(0);
+    new MergedIndex(p);
+    MergedIndexRegistry.register(p.mergedIndex);
 
     // ── Phase 2 ────────────────────────────────────────────────────────────
-    // Use a HEP planner so the rule fires directly on the matched subtree
-    // without cost-model complications from the Volcano planner running with
-    // only a single rule.
     HepProgram hepProgram = HepProgram.builder()
         .addRuleInstance(EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
         .build();
@@ -244,8 +222,8 @@ public class PipelineToMergedIndexScanRuleTest {
     SqlNode validated = planner.validate(parsed);
     RelRoot root = planner.rel(validated);
 
-    RelCollation joinKeyCollation = RelCollations.of(0);
-    RelNode logicalWithSorts = injectSortsBeforeJoin(root.rel, joinKeyCollation);
+    RelNode logicalWithSorts =
+        MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
 
     RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
@@ -257,63 +235,35 @@ public class PipelineToMergedIndexScanRuleTest {
     System.out.println(planStr);
 
     // ── Case 1: Aggregate above join (standard planner output) ────────────
-    // Pipeline root = SortedAggregate (or Aggregate), boundaries = 2 Sorts
-    // under the MergeJoin. Assembly = {MergeJoin} only — the aggregate is
-    // a remaining operator because it has no boundary Sort as a direct input.
-    EnumerableMergeJoin join = Objects.requireNonNull(
-        findMergeJoin(phase1Plan),
-        "Plan must contain EnumerableMergeJoin: " + planStr);
-    EnumerableSort leftSort = (EnumerableSort) join.getLeft();
-    EnumerableSort rightSort = (EnumerableSort) join.getRight();
-    RelCollation collation = leftSort.getCollation();
+    // Use pipeline discovery to find the join pipeline.
+    Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    List<Pipeline> pipelines =
+        MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
+            .filter(p -> p.sources.size() >= 2)
+            .collect(Collectors.toList());
+    assertThat("Expected 1 join pipeline", pipelines.size(), is(1));
 
-    // Build pipeline with root = join's parent (aggregate or project)
-    Pipeline pLeft = new Pipeline(leftSort.getInput(), List.of(),
-        collation, collation, 10.0);
-    Pipeline pRight = new Pipeline(rightSort.getInput(), List.of(),
-        collation, collation, 10.0);
-    Pipeline pJoin = new Pipeline(join, List.of(pLeft, pRight),
-        collation, collation, 10.0);
+    Pipeline pJoin = pipelines.get(0);
     Pipeline.AssemblySubtree asm1 = pJoin.findAssemblySubtree();
     assertThat("Assembly subtree should exist", asm1 != null, is(true));
-    assertThat("LCA should be the MergeJoin", asm1.lca, is(join));
+    assertThat("LCA should be MergeJoin",
+        asm1.lca, instanceOf(EnumerableMergeJoin.class));
     assertThat("Assembly should contain only MergeJoin",
         asm1.nodes.size(), is(1));
     assertThat("Should have 2 boundary sorts",
         asm1.boundarySorts.size(), is(2));
 
     // ── Case 2: Hypothetical multi-operator assembly ──────────────────────
-    // Construct a Pipeline where MergeJoin's left input is
-    // SortedAggregate → Sort(boundary) instead of Sort(boundary) → Scan.
-    // This simulates the case where an optimizer removed the redundant Sort
-    // between the SortedAggregate and MergeJoin because they share key k.
-    //
-    // We find the Sort below the left side of the join — that will become
-    // the "inner" boundary sort that sits below a SortedAggregate in the
-    // hypothetical plan tree.
-    //
-    // Actual tree: join → leftSort → Scan(A)
-    //                   → rightSort → Scan(B)
-    // We pretend:  join → SortedAgg → leftSort → Scan(A)   (no outer Sort)
-    //                   → rightSort → Scan(B)
-    //
-    // Since findAssemblySubtree walks the actual tree from pipeline.root,
-    // we need an actual SortedAggregate node in the tree. Find one from
-    // the phase1 plan (above the join) and use it to construct a pipeline.
+    // Construct a Pipeline rooted at the aggregate (parent of the join).
+    // The assembly subtree should still be {MergeJoin} because the
+    // SortedAggregate doesn't directly consume a boundary Sort.
     RelNode aggNode = findSortedAggregate(phase1Plan);
     if (aggNode != null) {
-      // The aggregate sits above the join: Agg → Sort → MergeJoin → ...
-      // or Agg → MergeJoin → ... (if Sort was removed).
-      // Build pipeline with root = aggNode, where boundaries are the two
-      // Sorts directly under the MergeJoin. The assembly subtree should
-      // still be {MergeJoin} because the SortedAggregate doesn't directly
-      // consume a boundary Sort.
-      Pipeline pAgg = new Pipeline(aggNode, List.of(pLeft, pRight),
-          collation, collation, 10.0);
+      Pipeline pAgg = new Pipeline(aggNode, pJoin.sources,
+          pJoin.sharedCollation, pJoin.sharedCollation, 10.0);
       Pipeline.AssemblySubtree asm2 = pAgg.findAssemblySubtree();
       assertThat("Aggregate-rooted assembly subtree should exist",
           asm2 != null, is(true));
-      // LCA is still MergeJoin: it's the deepest node reaching both boundaries
       assertThat("LCA should be MergeJoin even with Aggregate as root",
           asm2.lca, instanceOf(EnumerableMergeJoin.class));
       assertThat("Assembly should contain only MergeJoin",
@@ -336,8 +286,6 @@ public class PipelineToMergedIndexScanRuleTest {
     }
     return null;
   }
-
-  // I believe the two deleted methods are rendered obsolete by pipeline identification in MergedIndexTPCHPlanTest. Instead of finding merge joins, we should find pipelines. Instead of injecting sorts before joins, we should inject them before any sort-based operator. Those helper methods are available in MergedIndexTpchPlanTest. Consider moving them to a common test utility class.
 
   /**
    * Two-table schema with {@code A(k INT, x INT)} and {@code B(k INT, y INT)}.

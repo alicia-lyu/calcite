@@ -18,11 +18,8 @@ package org.apache.calcite.adapter.tpch;
 
 import org.apache.calcite.adapter.enumerable.EnumerableConvention;
 import org.apache.calcite.adapter.enumerable.EnumerableMergeJoin;
-import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexDeltaScan;
 import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan;
 import org.apache.calcite.adapter.enumerable.EnumerableRules;
-import org.apache.calcite.adapter.enumerable.EnumerableSort;
-import org.apache.calcite.adapter.enumerable.EnumerableSortedAggregate;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.MergedIndexRegistry;
 import org.apache.calcite.materialize.Pipeline;
@@ -31,31 +28,25 @@ import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgram;
-import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelCollationTraitDef;
-import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
-import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Join;
-import org.apache.calcite.rel.core.Sort;
-import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalUnion;
 import org.apache.calcite.rel.stream.LogicalDelta;
-import org.apache.calcite.rel.stream.StreamRules;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.sql.SqlExplainFormat;
 import org.apache.calcite.sql.SqlExplainLevel;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.parser.SqlParser;
+import org.apache.calcite.test.MergedIndexTestUtil;
 import org.apache.calcite.tools.FrameworkConfig;
 import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.Planner;
 import org.apache.calcite.tools.Programs;
 import org.apache.calcite.tools.RuleSets;
 
-import org.checkerframework.checker.nullness.qual.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.Execution;
@@ -151,11 +142,13 @@ class MergedIndexTpchPlanTest {
     final SqlNode validated = planner.validate(parsed);
     final RelRoot root = planner.rel(validated);
 
-    final RelNode logicalWithSorts = injectSortsBeforeSortBasedOps(root.rel);
+    final RelNode logicalWithSorts =
+        MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
 
     // Capture logical join for IVM — must use logical node (SQL types),
     // not the physical EnumerableMergeJoin (JavaType) from Phase 1.
-    final Join logicalJoinQ12 = findAllJoins(logicalWithSorts).get(0);
+    final Join logicalJoinQ12 =
+        MergedIndexTestUtil.findAllJoins(logicalWithSorts).get(0);
 
     final RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
@@ -169,8 +162,8 @@ class MergedIndexTpchPlanTest {
     writeDotFile("q12_before", phase1Plan);
 
     // ── Discover pipelines and register merged index ──────────────────────
-    final Pipeline pipelineTree = buildPipelineTree(phase1Plan);
-    final List<Pipeline> pipelines = flattenPipelines(pipelineTree).stream()
+    final Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    final List<Pipeline> pipelines = MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
         .filter(p -> p.sources.size() >= 2)
         .collect(Collectors.toList());
     assertThat("Expected 1 join pipeline for Q12", pipelines.size(), is(1));
@@ -217,8 +210,8 @@ class MergedIndexTpchPlanTest {
     final String maintStr12 = dumpText(p.mergedIndex.getMaintenancePlan());
     assertThat(maintStr12, containsString("LogicalUnion"));
     // Each source inserts independently — no join needed in the maintenance plan.
-    assertThat(countOccurrences(maintStr12, "LogicalJoin"), is(0));
-    assertThat(countOccurrences(maintStr12, "LogicalDelta"), is(2));
+    assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalJoin"), is(0));
+    assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalDelta"), is(2));
   }
 
   /**
@@ -287,11 +280,13 @@ class MergedIndexTpchPlanTest {
     final SqlNode validated = planner.validate(parsed);
     final RelRoot root = planner.rel(validated);
 
-    final RelNode logicalWithSorts = injectSortsBeforeSortBasedOps(root.rel);
+    final RelNode logicalWithSorts =
+        MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
 
     // Capture logical joins (post-order) for IVM — logical nodes have SQL row types
     // compatible with StreamRules; physical EnumerableMergeJoin uses JavaType.
-    final List<Join> logicalJoinsOL = findAllJoins(logicalWithSorts);
+    final List<Join> logicalJoinsOL =
+        MergedIndexTestUtil.findAllJoins(logicalWithSorts);
 
     final RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
@@ -309,8 +304,8 @@ class MergedIndexTpchPlanTest {
     // buildPipelineTree walks top-down, cutting at Sort boundaries.
     // flattenPipelines returns non-trivial pipelines in post-order
     // (inner first) so inner pipeline is registered before outer.
-    final Pipeline pipelineTree = buildPipelineTree(phase1Plan);
-    final List<Pipeline> pipelines = flattenPipelines(pipelineTree).stream()
+    final Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    final List<Pipeline> pipelines = MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
         .filter(p -> p.sources.size() >= 2)
         .collect(Collectors.toList());
     assertThat("Expected 2 join pipelines (inner orderkey + outer custkey)",
@@ -402,7 +397,7 @@ class MergedIndexTpchPlanTest {
       assertThat("Q3-OL pipeline missing maintenance plan",
           p.mergedIndex.getMaintenancePlan() != null, is(true));
       final String m = dumpText(p.mergedIndex.getMaintenancePlan());
-      assertThat(countOccurrences(m, "LogicalDelta"), is(2));
+      assertThat(MergedIndexTestUtil.countOccurrences(m, "LogicalDelta"), is(2));
     }
 
     // ── Verify DeltaToMergedIndexDeltaScanRule ────────────────────────────
@@ -423,173 +418,6 @@ class MergedIndexTpchPlanTest {
     final RelNode resolvedDeltaPlan = deltaPlanner.findBestExp();
     assertThat(dumpText(resolvedDeltaPlan), containsString("EnumerableMergedIndexDeltaScan"));
   }
-
-  // ── Pipeline discovery helpers ────────────────────────────────────────────
-
-  /**
-   * Holds one interesting-ordering pipeline identified by Sort boundaries.
-   *
-   * <p>A pipeline is a maximal connected subgraph of the plan where all
-   * operators share a compatible sort order. Sort operators mark transitions
-   * between pipelines — each Sort at the lower boundary feeds data into
-   * this pipeline from a child pipeline:
-   *
-   * <pre>
-   *   ┌── Pipeline (custkey) ──┐
-   *   │  MergeJoin(custkey)    │
-   *   │    ↑            ↑      │
-   *   └────┼────────────┼──────┘
-   *     Sort(custkey) Sort(custkey)   ← boundaries (not part of this pipeline)
-   *        │              │
-   *   ┌────┴────┐    ┌───┴───┐
-   *   │Pipeline │    │Pipeline│
-   *   │(orderkey)│   │(leaf)  │
-   *   └─────────┘    └───────┘
-   * </pre>
-   *
-   * <p>After registration, {@link #mergedIndex} stores the interleaved
-   * records from all {@link #sources}. The operators between {@link #root}
-   * and the source boundaries execute at query time over a single scan.
-   */
-  /**
-   * Builds a pipeline tree from the Phase 1 physical plan by identifying
-   * {@link EnumerableSort} operators as boundaries between pipelines.
-   *
-   * <p>Walks top-down from the plan root. When an {@link EnumerableSort}
-   * is encountered (without FETCH/OFFSET), it marks a boundary: the Sort's
-   * input becomes the root of a child pipeline. Non-Sort nodes are part of
-   * the current pipeline, and the algorithm recurses into their inputs.
-   *
-   * @param planRoot the Phase 1 physical plan root
-   * @return the root pipeline of the pipeline tree
-   */
-  private static Pipeline buildPipelineTree(RelNode planRoot) {
-    return buildPipeline(planRoot);
-  }
-
-  /**
-   * Recursively builds a single pipeline rooted at {@code node}.
-   * Collects child pipelines by finding Sort boundaries among descendants.
-   */
-  private static Pipeline buildPipeline(RelNode node) {
-    final List<Pipeline> childPipelines = new ArrayList<>();
-    collectChildPipelines(node, childPipelines);
-    // Shared collation: prefer the first boundary Sort's collation (the ordering
-    // that the pipeline's internal operators, e.g. MergeJoin, actually share).
-    // Fall back to inferCollation from the root node for leaf/trivial pipelines.
-    final RelCollation collation;
-    if (!childPipelines.isEmpty()
-        && !childPipelines.get(0).boundaryCollation.getFieldCollations()
-            .isEmpty()) {
-      collation = childPipelines.get(0).boundaryCollation;
-    } else {
-      collation = inferCollation(node);
-    }
-    final double rowCount =
-        node.estimateRowCount(node.getCluster().getMetadataQuery());
-    return new Pipeline(node, childPipelines, collation, collation, rowCount);
-  }
-
-  /**
-   * Recurses into {@code node}'s inputs looking for Sort boundaries.
-   *
-   * <p>When hitting an {@link EnumerableSort} that qualifies as a boundary
-   * (non-empty collation, no FETCH/OFFSET), creates a child Pipeline rooted
-   * at the Sort's input and stops recursing. The child pipeline's
-   * {@link Pipeline#sharedCollation} is set to the Sort's collation (the
-   * order it produces for consumption by the parent pipeline).
-   *
-   * <p>When hitting a non-Sort node, it is considered part of the current
-   * pipeline, and recursion continues into its inputs.
-   */
-  private static void collectChildPipelines(RelNode node,
-      List<Pipeline> result) {
-    for (RelNode input : node.getInputs()) {
-      if (isBoundarySort(input)) {
-        final EnumerableSort sort = (EnumerableSort) input;
-        final RelNode below = sort.getInput();
-        // Build child pipeline from the Sort's input
-        final Pipeline child = buildPipeline(below);
-        // Keep the child's internal sharedCollation; store the Sort's
-        // collation as boundaryCollation (how the parent sees this child).
-        result.add(new Pipeline(below, child.sources,
-            child.sharedCollation, sort.getCollation(), child.rowCount));
-      } else {
-        // This input is inside the current pipeline — keep recursing
-        collectChildPipelines(input, result);
-      }
-    }
-  }
-
-  /**
-   * Delegates to {@link Pipeline#isBoundarySort(RelNode)}.
-   */
-  private static boolean isBoundarySort(RelNode node) {
-    return Pipeline.isBoundarySort(node);
-  }
-
-  /**
-   * Infers the shared collation for a pipeline rooted at {@code node}.
-   *
-   * <p>First checks the node's own trait set. If empty, drills through
-   * single-input operators to find a Sort node whose collation is
-   * authoritative (same pattern as {@link #inputAlreadySorted}).
-   */
-  private static RelCollation inferCollation(RelNode node) {
-    final RelCollation c = safeGetCollation(node);
-    if (c != null && !c.getFieldCollations().isEmpty()) {
-      return c;
-    }
-    // Drill through single-input ops to find an authoritative Sort
-    RelNode cur = node;
-    while (cur.getInputs().size() == 1 && !(cur instanceof Sort)) {
-      cur = cur.getInputs().get(0);
-    }
-    if (cur instanceof Sort) {
-      return ((Sort) cur).getCollation();
-    }
-    final RelCollation deep = safeGetCollation(cur);
-    if (deep != null && !deep.getFieldCollations().isEmpty()) {
-      return deep;
-    }
-    return RelCollations.EMPTY;
-  }
-
-  /**
-   * Safely extracts the first {@link RelCollation} from a node's trait set.
-   * Uses {@code getTraits(RelCollationTraitDef.INSTANCE)} which correctly
-   * handles composite traits (unlike {@code getCollations()} which has a
-   * cast bug when the trait is a package-private {@code RelCompositeTrait}).
-   */
-  private static @Nullable RelCollation safeGetCollation(RelNode node) {
-    final List<RelCollation> collations =
-        node.getTraitSet().getTraits(RelCollationTraitDef.INSTANCE);
-    if (collations == null || collations.isEmpty()) {
-      return null;
-    }
-    return collations.get(0);
-  }
-
-  /**
-   * Post-order flattening of the pipeline tree: leaves first, root last.
-   * Excludes leaf pipelines
-   */
-  private static List<Pipeline> flattenPipelines(Pipeline root) {
-    final List<Pipeline> result = new ArrayList<>();
-    flattenPostOrder(root, result);
-    return result;
-  }
-
-  private static void flattenPostOrder(Pipeline p, List<Pipeline> result) {
-    for (Pipeline child : p.sources) {
-      flattenPostOrder(child, result);
-    }
-    // Trivial table sources have no sources (root is the table scan, make sure the current implementation of pipeline follows this)
-    if (p.sources.size() >= 1) {
-      result.add(p);
-    }
-  }
-
 
   /**
    * TPC-H Q9 (no color filter on part name): 6-table join
@@ -708,10 +536,12 @@ class MergedIndexTpchPlanTest {
     final SqlNode validated = planner.validate(parsed);
     final RelRoot root = planner.rel(validated);
 
-    final RelNode logicalWithSorts = injectSortsBeforeSortBasedOps(root.rel);
+    final RelNode logicalWithSorts =
+        MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
 
     // Capture logical joins (post-order) for IVM — same order as findAllPipelines.
-    final List<Join> logicalJoinsQ9 = findAllJoins(logicalWithSorts);
+    final List<Join> logicalJoinsQ9 =
+        MergedIndexTestUtil.findAllJoins(logicalWithSorts);
 
     final RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
@@ -726,8 +556,8 @@ class MergedIndexTpchPlanTest {
     writeDotFile("q9_before", phase1Plan);
 
     // Discover all 5 join pipelines bottom-up (inner first) and register nested MergedIndexes.
-    final Pipeline pipelineTree = buildPipelineTree(phase1Plan);
-    final List<Pipeline> pipelines = flattenPipelines(pipelineTree).stream()
+    final Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    final List<Pipeline> pipelines = MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
         .filter(p -> p.sources.size() >= 2)
         .collect(Collectors.toList());
     assertThat("Expected 5 join pipelines for Q9", pipelines.size(), is(5));
@@ -790,7 +620,7 @@ class MergedIndexTpchPlanTest {
     //    This cannot be dropped because the Aggregate output is sorted
     //    (n_name ASC, o_year ASC) which differs in direction from the required
     //    (n_name ASC, o_year DESC).
-    assertThat(countOccurrences(afterStr, "EnumerableSort("), is(2));
+    assertThat(MergedIndexTestUtil.countOccurrences(afterStr, "EnumerableSort("), is(2));
     assertThat(afterStr, containsString("EnumerableMergedIndexJoin"));
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
     // All pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.
@@ -799,7 +629,7 @@ class MergedIndexTpchPlanTest {
       assertThat("Q9 pipeline missing maintenance plan",
           p.mergedIndex.getMaintenancePlan() != null, is(true));
       final String m = dumpText(p.mergedIndex.getMaintenancePlan());
-      assertThat(countOccurrences(m, "LogicalDelta"), is(2));
+      assertThat(MergedIndexTestUtil.countOccurrences(m, "LogicalDelta"), is(2));
     }
   }
 
@@ -847,148 +677,7 @@ class MergedIndexTpchPlanTest {
     }
   }
 
-  /**
-   * Collects all {@link Join} nodes in post-order (innermost first).
-   *
-   * <p>Used to find logical joins from a pre-Phase-1 plan for IVM derivation.
-   * Logical joins ({@link org.apache.calcite.rel.logical.LogicalJoin}) have SQL
-   * row types (e.g., {@code VARCHAR}) that are compatible with {@link StreamRules},
-   * whereas physical {@link EnumerableMergeJoin} nodes carry {@code JavaType} row
-   * types that cause a type mismatch in {@link StreamRules.DeltaJoinTransposeRule}.
-   */
-  private static List<Join> findAllJoins(RelNode node) {
-    final List<Join> result = new ArrayList<>();
-    for (RelNode input : node.getInputs()) {
-      result.addAll(findAllJoins(input));
-    }
-    if (node instanceof Join) {
-      result.add((Join) node);
-    }
-    return result;
-  }
-
   // ── Helpers ───────────────────────────────────────────────────────────────
-
-  /**
-   * Recursively walks the plan tree and injects {@link LogicalSort} nodes
-   * before every sort-based operator ({@link Join}, {@link Aggregate})
-   * that requires sorted input.
-   *
-   * <ul>
-   *   <li><b>Sort node</b>: recurses into input; drops the Sort if the input
-   *       is already sorted on the same fields and the Sort carries no
-   *       FETCH/OFFSET (LIMIT nodes cannot be dropped safely).</li>
-   *   <li><b>Aggregate node</b>: injects a {@link LogicalSort} on the group
-   *       keys before the aggregate input when not already sorted.</li>
-   *   <li><b>Join node</b>: injects sorts on join keys before each input
-   *       when not already sorted; skips non-equi / cross joins.</li>
-   * </ul>
-   *
-   * <p>Using {@link RelOptUtil#splitJoinCondition} for join keys means
-   * multi-join plans (where each join uses a different key) are handled
-   * correctly. {@link #inputAlreadySorted} prevents duplicate sorts by
-   * drilling through single-input operators to check existing collation.
-   */
-  private static RelNode injectSortsBeforeSortBasedOps(RelNode node) {
-    if (node instanceof Sort) {
-      final Sort sort = (Sort) node;
-      final RelNode newInput = injectSortsBeforeSortBasedOps(sort.getInput());
-      // Drop a redundant Sort when input is already sorted on those fields
-      // and the Sort carries no FETCH/OFFSET (LIMIT nodes carry row-count
-      // semantics and must not be dropped).
-      if (sort.fetch == null && sort.offset == null
-          && !sort.getCollation().getFieldCollations().isEmpty()
-          && inputAlreadySorted(newInput, sort.getCollation())) {
-        return newInput;
-      }
-      return sort.copy(sort.getTraitSet(), List.of(newInput));
-    }
-    if (node instanceof Aggregate) {
-      final Aggregate agg = (Aggregate) node;
-      final RelNode newInput = injectSortsBeforeSortBasedOps(agg.getInput());
-      if (!agg.getGroupSet().isEmpty()) {
-        final RelCollation aggCollation = RelCollations.of(
-            agg.getGroupSet().asList().stream()
-                .map(RelFieldCollation::new).collect(Collectors.toList()));
-        if (!inputAlreadySorted(newInput, aggCollation)) {
-          return agg.copy(agg.getTraitSet(),
-              List.of(LogicalSort.create(newInput, aggCollation, null, null)));
-        }
-      }
-      return agg.copy(agg.getTraitSet(), List.of(newInput));
-    }
-    if (node instanceof Join) {
-      final Join join = (Join) node;
-      final List<Integer> leftKeys = new ArrayList<>();
-      final List<Integer> rightKeys = new ArrayList<>();
-      RelOptUtil.splitJoinCondition(join.getLeft(), join.getRight(),
-          join.getCondition(), leftKeys, rightKeys, new ArrayList<>());
-      final RelNode newLeft = injectSortsBeforeSortBasedOps(join.getLeft());
-      final RelNode newRight = injectSortsBeforeSortBasedOps(join.getRight());
-      if (leftKeys.isEmpty()) {
-        // Non-equi join or cross join — recurse but do not inject sorts.
-        return join.copy(join.getTraitSet(), List.of(newLeft, newRight));
-      }
-      // Build multi-column collations from all equi-join keys.
-      final RelCollation leftCollation = RelCollations.of(
-          leftKeys.stream()
-              .map(RelFieldCollation::new)
-              .collect(Collectors.toList()));
-      final RelCollation rightCollation = RelCollations.of(
-          rightKeys.stream()
-              .map(RelFieldCollation::new)
-              .collect(Collectors.toList()));
-      final RelNode sortedLeft = inputAlreadySorted(newLeft, leftCollation)
-          ? newLeft : LogicalSort.create(newLeft, leftCollation, null, null);
-      final RelNode sortedRight = inputAlreadySorted(newRight, rightCollation)
-          ? newRight : LogicalSort.create(newRight, rightCollation, null, null);
-      return join.copy(join.getTraitSet(), List.of(sortedLeft, sortedRight));
-    }
-    final List<RelNode> newInputs = node.getInputs().stream()
-        .map(MergedIndexTpchPlanTest::injectSortsBeforeSortBasedOps)
-        .collect(Collectors.toList());
-    return node.copy(node.getTraitSet(), newInputs);
-  }
-
-  /**
-   * Returns true if {@code input} is already sorted on {@code required} as a
-   * field-index prefix (direction is not checked).
-   *
-   * <p>Drills through single-input operators (Aggregate, Project, Filter, etc.)
-   * that do not themselves carry a meaningful collation trait, stopping at a
-   * {@link Sort} node whose collation is authoritative. This lets the caller
-   * detect e.g. {@code Agg(Sort([k]))} as already sorted on {@code [k]}.
-   */
-  private static boolean inputAlreadySorted(RelNode input, RelCollation required) {
-    // Drill through single-input operators to reach a Sort (or a node with a
-    // non-empty collation trait set by the planner).
-    RelNode node = input;
-    while (node.getInputs().size() == 1 && !(node instanceof Sort)) {
-      node = node.getInputs().get(0);
-    }
-    final RelCollation existing =
-        node.getTraitSet().getTrait(RelCollationTraitDef.INSTANCE);
-    if (existing == null || existing.getFieldCollations().isEmpty()) return false;
-    final List<RelFieldCollation> req = required.getFieldCollations();
-    final List<RelFieldCollation> have = existing.getFieldCollations();
-    if (have.size() < req.size()) return false;
-    for (int i = 0; i < req.size(); i++) {
-      if (req.get(i).getFieldIndex() != have.get(i).getFieldIndex()) return false;
-      if (req.get(i).getDirection() != have.get(i).getDirection()) return false;
-    }
-    return true;
-  }
-
-  /** Counts non-overlapping occurrences of {@code sub} in {@code text}. */
-  private static int countOccurrences(String text, String sub) {
-    int count = 0;
-    int idx = 0;
-    while ((idx = text.indexOf(sub, idx)) != -1) {
-      count++;
-      idx += sub.length();
-    }
-    return count;
-  }
 
   /**
    * Writes two Graphviz DOT plan files to {@code test-dot-output/}:
