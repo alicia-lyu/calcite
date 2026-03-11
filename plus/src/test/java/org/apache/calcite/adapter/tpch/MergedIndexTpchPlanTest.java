@@ -552,15 +552,11 @@ class MergedIndexTpchPlanTest {
     for (Pipeline child : p.sources) {
       flattenPostOrder(child, result);
     }
-    // Use sources.size() >= 2 at discovery time because mergedIndex is not yet
-    // set (it's created from the discovered pipelines). Future work: include
-    // single-source pipelines too (single-table traditional indexes follow the
-    // same logic and are views, not trivial table sources).
-    if (p.sources.size() >= 2) {
+    // Trivial table sources have no sources (root is the table scan, make sure the current implementation of pipeline follows this)
+    if (p.sources.size() >= 1) {
       result.add(p);
     }
   }
-
 
 
   /**

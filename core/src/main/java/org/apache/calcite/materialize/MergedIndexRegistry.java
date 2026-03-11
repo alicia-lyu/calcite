@@ -65,7 +65,7 @@ public final class MergedIndexRegistry {
   public static synchronized Optional<MergedIndex> findFor(
       List<Object> sources, RelCollation required) {
     for (MergedIndex index : INDEXES) {
-      if (sourcesMatch(index.sources, sources) && index.satisfies(required)) {
+      if (sourcesMatch(index.pipeline.sources, sources) && index.satisfies(required)) {
         return Optional.of(index);
       }
     }

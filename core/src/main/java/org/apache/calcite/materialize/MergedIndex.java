@@ -30,7 +30,7 @@ import java.util.stream.Stream;
 
 /**
  * Descriptor for a <em>merged index</em> — a multi-table interleaved B-tree
- * that stores records from several tables sorted by a shared key.
+ * that stores records from several tables/views sorted by a shared key.
  *
  * <p>A merged index on tables (A, B) with collation {@code k ASC} physically
  * interleaves rows from A and B ordered by {@code k}, so that a single
@@ -47,48 +47,49 @@ import java.util.stream.Stream;
 public class MergedIndex {
 
   /**
-   * The pipeline that this merged index backs. Null for indexes created
-   * directly without pipeline discovery (e.g. simple unit tests).
+   * The pipeline that this merged index backs.
    */
-  public final @Nullable Pipeline pipeline;
+  public final @Nullable Pipeline pipeline; // perhaps should not be Nullable
+
+  // pipeline is the only field needed. All other information should be wrapped in getter methods that access the pipeline. The type of some fields of pipeline may not be compatible with the user classes of MergedIndex. In such conflict, Pipeline's definition triumphs, the user classes should adapt to it.
 
   /**
    * Each element is a {@link RelOptTable} (base table) or a
    * {@link MergedIndex} (inner pipeline view).
    */
-  public final ImmutableList<Object> sources;
+  // public final ImmutableList<Object> sources;
 
   /**
    * The participating base tables, in pipeline order (flat list expanding
    * any inner {@link MergedIndex} views to their constituent tables).
    */
-  public final ImmutableList<RelOptTable> tables;
+  // public final ImmutableList<RelOptTable> tables;
 
   /**
    * Per-source sort collation: {@code tableCollations.get(i)} is the collation
    * of the {@link org.apache.calcite.adapter.enumerable.EnumerableSort} that
    * feeds source {@code i} into the pipeline.
    */
-  public final ImmutableList<RelCollation> tableCollations;
+  // public final ImmutableList<RelCollation> tableCollations;
 
   /**
    * The shared sort key used by all operators in the pipeline
    * (merge joins and sorted aggregations).
    */
-  public final RelCollation collation;
+  // public final RelCollation collation;
 
   /**
    * Estimated total row count across all tables in the index.
    * Used by the cost model in {@code EnumerableMergedIndexScan}.
    */
-  public final double rowCount;
+  // public final double rowCount;
 
   /**
    * Incremental maintenance plan derived by applying {@code DeltaJoinTransposeRule}
    * to this pipeline's join node. Null for manually registered indexes that do not
    * go through the Pipeline discovery path.
    */
-  public @Nullable RelNode maintenancePlan;
+  // public @Nullable RelNode maintenancePlan;
 
   /**
    * Creates a MergedIndex from a {@link Pipeline}. Sources, collation, and
@@ -99,70 +100,12 @@ public class MergedIndex {
    */
   public MergedIndex(Pipeline pipeline) {
     this.pipeline = pipeline;
-    this.sources = resolveSources(pipeline);
-    this.tables = expandTables(this.sources);
-    this.tableCollations = pipeline.sources.stream()
-        .map(child -> child.boundaryCollation)
-        .collect(ImmutableList.toImmutableList());
-    this.collation = pipeline.sharedCollation;
-    this.rowCount = pipeline.rowCount;
-    pipeline.mergedIndex = this;
   }
 
-  /**
-   * Constructor for base-table-only pipelines (most common case).
-   * Does not associate a Pipeline (legacy path for simple unit tests).
-   *
-   * @param tables           base tables in pipeline order
-   * @param tableCollations  per-table sort collations
-   * @param collation        shared sort key of the pipeline
-   * @param rowCount         estimated total row count
-   */
-  public MergedIndex(List<RelOptTable> tables,
-      List<RelCollation> tableCollations,
-      RelCollation collation, double rowCount) {
-    this.pipeline = null;
-    this.sources = tables.stream().map(t -> (Object) t)
-        .collect(ImmutableList.toImmutableList());
-    this.tables = ImmutableList.copyOf(tables);
-    this.tableCollations = ImmutableList.copyOf(tableCollations);
-    this.collation = collation;
-    this.rowCount = rowCount;
-  }
-
-  /**
-   * Static factory for pipelines with mixed base-table / view sources.
-   * Use this when any source is a {@link MergedIndex} inner pipeline view.
-   * Does not associate a Pipeline (legacy path).
-   *
-   * @param sources          each element is a {@link RelOptTable} or a
-   *                         {@link MergedIndex} (inner pipeline view)
-   * @param sourceCollations per-source sort collations
-   * @param collation        shared sort key of the pipeline
-   * @param rowCount         estimated total row count
-   */
-  public static MergedIndex of(List<Object> sources,
-      List<RelCollation> sourceCollations,
-      RelCollation collation, double rowCount) {
-    ImmutableList<RelOptTable> tables = expandTables(
-        ImmutableList.copyOf(sources));
-    return new MergedIndex(null,
-        ImmutableList.copyOf(sources), tables,
-        ImmutableList.copyOf(sourceCollations), collation, rowCount);
-  }
+  // no place holder constructor. We always test MergedIndex with a Pipeline. Previous tests that do not use Pipeline should be deleted or adapted.
 
   /** Private constructor used by {@link #of} and legacy paths. */
-  private MergedIndex(@Nullable Pipeline pipeline,
-      ImmutableList<Object> sources,
-      ImmutableList<RelOptTable> tables,
-      ImmutableList<RelCollation> tableCollations,
-      RelCollation collation, double rowCount) {
-    this.pipeline = pipeline;
-    this.sources = sources;
-    this.tables = tables;
-    this.tableCollations = tableCollations;
-    this.collation = collation;
-    this.rowCount = rowCount;
+  private MergedIndex(@Nullable Pipeline pipeline) {
   }
 
   /**
@@ -226,7 +169,7 @@ public class MergedIndex {
   public @Nullable RelNode getMaintenancePlan() { return maintenancePlan; }
 
   public boolean satisfies(RelCollation required) {
-    List<RelFieldCollation> indexFields = collation.getFieldCollations();
+    List<RelFieldCollation> indexFields = getCollation().collation.getFieldCollations();
     List<RelFieldCollation> requiredFields = required.getFieldCollations();
     if (indexFields.isEmpty()) {
       return false;
@@ -249,6 +192,6 @@ public class MergedIndex {
   }
 
   @Override public String toString() {
-    return "MergedIndex{tables=" + tables + ", collation=" + collation + "}";
+    return "MergedIndex{tables/views=" + tables + ", collation=" + collation + "}"; // always mention the possibility of views in merged indexes, as this is a common confusion
   }
 }
