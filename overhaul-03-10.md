@@ -98,7 +98,8 @@ Regardless of query plan or index creation plan, we all need to produce the resu
 
 We need to create `physicalPlan` for each pipeline, essentially converting the logical plan between `root` and `sources` to a physical plan with `mergedIndex` as the input. It should be similar to the standard conversion, consisting of a series/tree of pull-based operators. The only exception is at the very upstream of the physical plan, because this operator must process a data flow interleaving different types of records, either to join them, join+aggregate them, or aggregate+join them---in short a kind of record assembly. Two example algorithms are Algorithm 1 and 2 in `./main.tex`. Your whole `PipelineToMergedIndexScanRule.java` must be overhauled. 
 
-How to provide a universal implementation for this bottom operator intaking interleaving records (regardless of whether it's join or join+aggregate), I don't have a clear idea yet, I think we need to first define such a stream. Explore and plan this part coarsely. Aside from this, plan the other parts (mainly the structure of cascading pipelines' physical plans) concretely.
+How to provide a universal implementation for this bottom operator intaking interleaving records (regardless of whether it's join or join+aggregate), I don't have a clear idea yet, I think we need to first define such a stream. Explore and plan this part coarsely. 
+Per `MergedIndexTpchPlanTest.java`, Calcite seems to tranform a logical plan to physical plan by `HEP`. I actually don't understand what it is and how it works, explore use of `HEP` for pipeline conversion as well.
 
 ## Maintenance plans
 
