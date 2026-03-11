@@ -4,7 +4,18 @@ I noticed a series of issues in the current code. Some false assumptions have be
 
 ## Inject sorts
 
-Currently in `injectSortsBeforeJoin`, you manually decided that no sort is needed for agg, but that was only for two queries tested here, when such a decision can be automated by `inputAlreadySorted`. Your code doesn't have generality. Effectively you only inject before joins. There are multiple logical operators in SQL that can be executed using a sort based algorithm. Please list them all and inject sorts before all of them.
+**Done.** Renamed `injectSortsBeforeJoin` → `injectSortsBeforeSortBasedOps`. Now handles:
+
+- **Sort node**: recurses into input; drops the Sort when no FETCH/OFFSET and `inputAlreadySorted` confirms the input is already sorted (e.g. Q9's ORDER BY is dropped because the Aggregate output is sorted on GROUP BY keys).
+- **Aggregate node**: injects `LogicalSort` on group keys before the aggregate input when not already sorted.
+- **Join node**: guards each injection with `inputAlreadySorted` to skip wrapping an already-sorted input.
+
+Enhanced `inputAlreadySorted` to drill through single-input operators (Aggregate, Project, Filter, etc.) to reach an authoritative `Sort` node, enabling detection of e.g. `Agg(Sort([k]))` as already sorted on `[k]`.
+
+**Not yet handled** (future work):
+- **Window functions** (`OVER`): require sorting on PARTITION BY + ORDER BY keys.
+- **DISTINCT / set operators** (INTERSECT, EXCEPT): sort-based implementations need a sort on all output columns.
+- **Merge-sort joins with non-equi conditions**: currently skipped (cross/non-equi guard), but some could benefit from partial key injection.
 
 ## Pipeline & Pipeline Identification
 
