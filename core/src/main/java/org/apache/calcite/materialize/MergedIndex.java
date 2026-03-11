@@ -44,6 +44,7 @@ import java.util.stream.Stream;
  * <p>See: "Storing and Indexing Multiple Tables by Interesting Orderings",
  * Wenhui Lyu &amp; Goetz Graefe, VLDB 2026.
  */
+// CHANGE PENDING: info of merged index is redundant with {@link Pipeline}. All info needed for a merged index (its sources, collation, row count) is already captured by the corresponding Pipeline, in which the merged index is a field. Here, we can just reference back to the Pipeline instead of duplicating the info. In the future, maintenance plan or query plan (the difference only lies in execution time and data flow vs delta flow) will also be generated within the pipeline (field PhysicalPlan). Delete redundant methods here.
 public class MergedIndex {
 
   /**
