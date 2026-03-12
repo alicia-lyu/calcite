@@ -231,7 +231,7 @@ type conversion between physical bytes and TaggedRow, or can assume TaggedRow di
 ### Subtask 2: `EnumerableMergedIndexScan.implement()` — Interleaved Stream
 
 The scan obtains source enumerables (via MI scans).
-The physical implementation of merged index should already use a record structure similar to the tagged interleaved row---basically byte strings which lay out the object array contiguously. Explore whether we need to handle the type conversion between the physical bytes and TaggedRow in Calcite, or we could simply assume that we can get TaggedRow from a merged index.
+The physical implementation of merged index should already use a record structure similar to the interleaved tagged rows---basically byte strings which lay out the object array contiguously. One row of a type is emitted at a time. Explore whether we need to handle the type conversion between the physical bytes and TaggedRow in Calcite, or we could simply assume that we can get TaggedRow from a merged index.
 
 ### Subtask 3: `EnumerableMergedIndexAssemble` Operator
 
