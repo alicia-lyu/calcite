@@ -16,6 +16,8 @@
  */
 package org.apache.calcite.materialize;
 
+import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.Linq4j;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelFieldCollation;
@@ -54,6 +56,14 @@ public class MergedIndex {
    * the pipeline.
    */
   public final Pipeline pipeline;
+
+  /**
+   * Pre-populated tagged row data. Set during index creation (Subtask 5)
+   * or manually in tests. At query time, {@link #scanData()} reads this
+   * directly. A real storage engine would replace this with a B-tree
+   * range scan.
+   */
+  private @Nullable List<Object[]> data;
 
   /**
    * Incremental maintenance plan derived by applying {@code DeltaJoinTransposeRule}
@@ -102,6 +112,27 @@ public class MergedIndex {
   /** Returns the tagged row schema for this merged index's sources. */
   public TaggedRowSchema getTaggedRowSchema() {
     return new TaggedRowSchema(this);
+  }
+
+  /** Sets the pre-populated tagged row data for PoC testing. */
+  public void setData(List<Object[]> data) {
+    this.data = data;
+  }
+
+  /** Returns the pre-populated tagged row data, or null if not set. */
+  public @Nullable List<Object[]> getData() {
+    return data;
+  }
+
+  /**
+   * Called from generated code. Returns the pre-populated tagged row stream.
+   * A real storage engine would do a sequential B-tree range scan here.
+   */
+  public Enumerable<Object[]> scanData() {
+    if (data == null) {
+      return Linq4j.emptyEnumerable();
+    }
+    return Linq4j.asEnumerable(data);
   }
 
   public void setMaintenancePlan(RelNode plan) {

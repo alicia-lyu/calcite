@@ -17,9 +17,12 @@
 package org.apache.calcite.adapter.enumerable;
 
 import org.apache.calcite.linq4j.tree.BlockBuilder;
+import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
+import org.apache.calcite.linq4j.tree.Types;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.Pipeline;
+import org.apache.calcite.materialize.TaggedRowSchema;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptPlanner;
@@ -30,7 +33,6 @@ import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
-import org.apache.calcite.util.BuiltInMethod;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -137,21 +139,37 @@ public class EnumerableMergedIndexScan extends AbstractRelNode
   }
 
   /**
-   * Code generation (proof-of-concept): reads from the primary table's
-   * enumerable expression. In a real implementation this would invoke the
-   * merged-index storage engine to do a sequential range scan.
+   * Code generation: stashes the {@link MergedIndex} instance and generates
+   * a call to {@link MergedIndex#scanData()} which returns the pre-populated
+   * tagged row stream as {@code Enumerable<Object[]>}.
+   *
+   * <p>The PhysType uses the tagged row schema (from {@link TaggedRowSchema
+   * #toRelDataType}) so that downstream operators see the correct field count.
+   * The plan-level {@code deriveRowType()} still returns the join row type for
+   * compatibility with existing plan-only tests; Assembly (Subtask 4) will
+   * reconcile the two.
    */
   @Override public Result implement(EnumerableRelImplementor implementor,
       Prefer pref) {
     final BlockBuilder builder = new BlockBuilder();
+    final TaggedRowSchema schema = mergedIndex.getTaggedRowSchema();
+    final RelDataType taggedType =
+        schema.toRelDataType(implementor.getTypeFactory());
     final PhysType physType =
-        PhysTypeImpl.of(implementor.getTypeFactory(), rowType,
-            pref.preferArray());
-    // PoC: return an empty enumerable of the correct type.
-    // A production implementation would call into the merged-index storage layer.
+        PhysTypeImpl.of(implementor.getTypeFactory(), taggedType,
+            JavaRowFormat.ARRAY);
+
+    // Stash the MergedIndex for runtime access (same pattern as
+    // EnumerableInterpreter stashing a RelNode).
+    final Expression miExpr =
+        implementor.stash(mergedIndex, MergedIndex.class);
+
+    // Generate: mergedIndex.scanData()
     builder.add(
         Expressions.return_(null,
-            Expressions.call(BuiltInMethod.EMPTY_ENUMERABLE.method)));
+            Expressions.call(miExpr,
+                Types.lookupMethod(MergedIndex.class, "scanData"))));
+
     return implementor.result(physType, builder.toBlock());
   }
 }

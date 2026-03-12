@@ -17,7 +17,9 @@
 package org.apache.calcite.adapter.enumerable;
 
 import org.apache.calcite.DataContext;
+import org.apache.calcite.DataContexts;
 import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.Enumerator;
 import org.apache.calcite.linq4j.Linq4j;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.MergedIndexRegistry;
@@ -33,6 +35,7 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.runtime.Bindable;
 import org.apache.calcite.schema.ScannableTable;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.schema.Statistic;
@@ -52,6 +55,9 @@ import org.apache.calcite.tools.Programs;
 import org.apache.calcite.tools.RuleSets;
 
 import com.google.common.collect.ImmutableMap;
+
+import java.util.ArrayList;
+import java.util.HashMap;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.junit.jupiter.api.AfterEach;
@@ -373,6 +379,160 @@ public class PipelineToMergedIndexScanRuleTest {
     assertThat("getSourceId(taggedA)", schema.getSourceId(taggedA), is((byte) 0));
     assertThat("getSourceId(taggedB)", schema.getSourceId(taggedB), is((byte) 1));
     assertThat("getPayloadStartSlot", schema.getPayloadStartSlot(), is(4));
+  }
+
+  /**
+   * Executes the scan operator and verifies it produces the pre-populated
+   * tagged rows from the {@link MergedIndex}.
+   *
+   * <p>Steps:
+   * <ol>
+   *   <li>Set up 2-table schema A(k, x) join B(k, y)</li>
+   *   <li>Run phase 1 + phase 2 to get plan with {@code EnumerableMergedIndexScan}</li>
+   *   <li>Pre-populate the MergedIndex with tagged rows in interleaved key order</li>
+   *   <li>Execute via {@code Bindable.bind(DataContext).enumerator()}</li>
+   *   <li>Verify each output row: domain tags, key values, source IDs, payload</li>
+   * </ol>
+   */
+  @Test void scanProducesTaggedRows() throws Exception {
+    final String sql =
+        "SELECT \"a\".\"x\", \"b\".\"y\""
+            + " FROM \"A\" \"a\""
+            + " JOIN \"B\" \"b\" ON \"a\".\"k\" = \"b\".\"k\"";
+
+    final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
+    final SchemaPlus defSchema = rootSchema.add("s", new TwoTableSchema());
+
+    final FrameworkConfig config = Frameworks.newConfigBuilder()
+        .parserConfig(SqlParser.Config.DEFAULT)
+        .defaultSchema(defSchema)
+        .traitDefs(ConventionTraitDef.INSTANCE, RelCollationTraitDef.INSTANCE)
+        .programs(
+            Programs.of(RuleSets.ofList(
+                EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
+                EnumerableRules.ENUMERABLE_PROJECT_RULE,
+                EnumerableRules.ENUMERABLE_SORT_RULE,
+                EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
+                EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
+                EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE)))
+        .build();
+
+    Planner planner = Frameworks.getPlanner(config);
+    SqlNode parsed = planner.parse(sql);
+    SqlNode validated = planner.validate(parsed);
+    RelRoot root = planner.rel(validated);
+
+    RelNode logicalWithSorts =
+        MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
+    RelTraitSet desiredTraits =
+        root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
+
+    // Phase 1
+    RelNode phase1Plan = planner.transform(0, desiredTraits, logicalWithSorts);
+
+    // Discover pipeline and register merged index
+    Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    List<Pipeline> pipelines =
+        MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
+            .filter(p -> p.sources.size() >= 2)
+            .collect(Collectors.toList());
+    assertThat(pipelines.size(), is(1));
+
+    Pipeline p = pipelines.get(0);
+    MergedIndex mi = new MergedIndex(p);
+    MergedIndexRegistry.register(mi);
+
+    // Phase 2: replace pipeline with MergedIndexScan
+    HepProgram hepProgram = HepProgram.builder()
+        .addRuleInstance(
+            EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
+        .build();
+    HepPlanner hepPlanner = new HepPlanner(hepProgram);
+    hepPlanner.setRoot(phase1Plan);
+    RelNode phase2Plan = hepPlanner.findBestExp();
+
+    String planStr = RelOptUtil.dumpPlan(
+        "", phase2Plan, SqlExplainFormat.TEXT, SqlExplainLevel.DIGEST_ATTRIBUTES);
+    assertThat(planStr, containsString("EnumerableMergedIndexScan"));
+
+    // Find the scan node (under the EnumerableProject) — execute just the
+    // scan, not the full plan. The EnumerableProject above cannot handle the
+    // tagged row PhysType; Assembly (Subtask 4) will reconcile the two.
+    RelNode scanNode = findMergedIndexScan(phase2Plan);
+    assertThat("Should find EnumerableMergedIndexScan",
+        scanNode, instanceOf(EnumerableMergedIndexScan.class));
+
+    // Pre-populate the MergedIndex with tagged rows (interleaved by key order)
+    TaggedRowSchema schema = mi.getTaggedRowSchema();
+    List<Object[]> data = new ArrayList<>();
+    data.add(schema.toTaggedRow(0, new Object[]{1, 10}));   // A: k=1, x=10
+    data.add(schema.toTaggedRow(1, new Object[]{1, 100}));  // B: k=1, y=100
+    data.add(schema.toTaggedRow(0, new Object[]{2, 20}));   // A: k=2, x=20
+    data.add(schema.toTaggedRow(1, new Object[]{2, 200}));  // B: k=2, y=200
+    mi.setData(data);
+
+    // Execute just the scan node directly.
+    // The parameters map receives stashed objects during toBindable();
+    // pass it to DataContexts.of() so the generated code can retrieve them.
+    Map<String, Object> parameters = new HashMap<>();
+    @SuppressWarnings("unchecked")
+    Bindable<Object[]> bindable =
+        (Bindable<Object[]>) EnumerableInterpretable.toBindable(
+            parameters,
+            null,  // no Spark handler
+            (EnumerableRel) scanNode,
+            EnumerableRel.Prefer.ARRAY);
+    Enumerable<Object[]> result = bindable.bind(DataContexts.of(parameters));
+    Enumerator<Object[]> enumerator = result.enumerator();
+
+    // Verify the 4 tagged rows come back in order
+    List<Object[]> output = new ArrayList<>();
+    while (enumerator.moveNext()) {
+      output.add(enumerator.current().clone());
+    }
+    enumerator.close();
+
+    assertThat("Should produce 4 tagged rows", output.size(), is(4));
+
+    // Row 0: A, k=1, x=10 → [(byte)1, 1, (byte)0, (byte)0, 10]
+    Object[] r0 = output.get(0);
+    assertThat("r0 domain tag", r0[0], is((byte) 1));
+    assertThat("r0 key value", r0[1], is(1));
+    assertThat("r0 index tag", r0[2], is((byte) 0));
+    assertThat("r0 source id", r0[3], is((byte) 0));
+    assertThat("r0 payload", r0[4], is(10));
+
+    // Row 1: B, k=1, y=100 → [(byte)1, 1, (byte)0, (byte)1, 100]
+    Object[] r1 = output.get(1);
+    assertThat("r1 key value", r1[1], is(1));
+    assertThat("r1 source id", r1[3], is((byte) 1));
+    assertThat("r1 payload", r1[4], is(100));
+
+    // Row 2: A, k=2, x=20
+    Object[] r2 = output.get(2);
+    assertThat("r2 key value", r2[1], is(2));
+    assertThat("r2 source id", r2[3], is((byte) 0));
+    assertThat("r2 payload", r2[4], is(20));
+
+    // Row 3: B, k=2, y=200
+    Object[] r3 = output.get(3);
+    assertThat("r3 key value", r3[1], is(2));
+    assertThat("r3 source id", r3[3], is((byte) 1));
+    assertThat("r3 payload", r3[4], is(200));
+  }
+
+  /** Finds the first {@link EnumerableMergedIndexScan} in the tree. */
+  private static @Nullable RelNode findMergedIndexScan(RelNode node) {
+    if (node instanceof EnumerableMergedIndexScan) {
+      return node;
+    }
+    for (RelNode input : node.getInputs()) {
+      RelNode found = findMergedIndexScan(input);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
   }
 
   /** Finds the first {@link EnumerableSortedAggregate} in the tree. */

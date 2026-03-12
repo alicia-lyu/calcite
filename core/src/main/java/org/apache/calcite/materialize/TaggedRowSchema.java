@@ -20,7 +20,9 @@ import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.metadata.RelMdSize;
 import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.sql.type.SqlTypeName;
 
 import com.google.common.collect.ImmutableList;
 
@@ -296,6 +298,57 @@ public class TaggedRowSchema {
    */
   public int taggedRowSlotCount(int sourceTag) {
     return 2 * keyFieldCount + 2 + payloadFieldCounts.get(sourceTag);
+  }
+
+  // -- Schema construction helpers ----------------------------------------
+
+  /**
+   * Returns the maximum tagged row slot count across all sources.
+   * Used for the plan-level {@code RelDataType} (Calcite requires a fixed schema).
+   */
+  public int maxTaggedRowSlotCount() {
+    int max = 0;
+    for (int s = 0; s < sourceCount; s++) {
+      max = Math.max(max, taggedRowSlotCount(s));
+    }
+    return max;
+  }
+
+  /**
+   * Builds a {@link RelDataType} for the tagged row format.
+   *
+   * <p>Layout: {@code 2*K} fields for key domain tags (TINYINT) and key values
+   * (actual key types), 2 fields for index tag (TINYINT) and source ID (TINYINT),
+   * then {@code maxPayload} nullable ANY fields for payload slots.
+   *
+   * <p>Total width: {@link #maxTaggedRowSlotCount()} fields.
+   *
+   * @param typeFactory the type factory to use
+   * @return the tagged row RelDataType
+   */
+  public RelDataType toRelDataType(RelDataTypeFactory typeFactory) {
+    final RelDataTypeFactory.Builder builder =
+        new RelDataTypeFactory.Builder(typeFactory);
+
+    // Key fields with domain tags
+    for (int k = 0; k < keyFieldCount; k++) {
+      builder.add("tag_k" + k, SqlTypeName.TINYINT);
+      builder.add("k" + k, keyFieldTypes.get(k));
+    }
+
+    // Index identifier: domain tag + source ID
+    builder.add("idx_tag", SqlTypeName.TINYINT);
+    builder.add("src_id", SqlTypeName.TINYINT);
+
+    // Payload: max payload slots, typed as nullable ANY
+    final int maxPayload = maxTaggedRowSlotCount() - getPayloadStartSlot();
+    for (int p = 0; p < maxPayload; p++) {
+      builder.add("p" + p,
+          typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.ANY), true));
+    }
+
+    return builder.build();
   }
 
   // -- Size estimation helper ---------------------------------------------
