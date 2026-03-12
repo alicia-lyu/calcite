@@ -195,7 +195,10 @@ in the query tier because the PART filter cannot be pushed below the assembled j
 | `adapter/enumerable/EnumerableMergedIndexJoin.java` | Query-time assembly operator for outer pipeline (wraps a scan) |
 | `adapter/enumerable/PipelineToMergedIndexScanRule.java` | Planner rule: inner pipeline → scan; outer pipeline → join+scan |
 | `core/src/test/java/org/apache/calcite/adapter/enumerable/PipelineToMergedIndexScanRuleTest.java` | Unit tests for the rule (2-table, simple schema) |
+| `materialize/TaggedRowSchema.java` | Tagged interleaved row metadata: slot positions, byte widths, `toTaggedRow()` conversion |
+| `materialize/Pipeline.java` | Order-based pipeline descriptor (root, sources, collation) |
 | `plus/src/test/java/org/apache/calcite/adapter/tpch/MergedIndexTpchPlanTest.java` | TPC-H plan tests: Q3 (partial), Q12 (full), Q3-OL (full 3-table), Q9 (6-table) |
+| `testkit/src/main/java/org/apache/calcite/test/MergedIndexTestUtil.java` | Shared test helpers: sort injection, pipeline discovery, tree search |
 
 ## Implementation Notes
 

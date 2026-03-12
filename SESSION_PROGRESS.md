@@ -22,6 +22,8 @@
 | Rule generalization: accept SortedAggregate inputs                       | Done ✓  |
 | `inputAlreadySorted` direction check fix                                 | Done ✓  |
 | `flattenPipelines`: `p.mergedIndex != null` (not source count)           | Done ✓  |
+| `MergedIndexTestUtil` — shared test helpers extracted to `testkit`        | Done ✓  |
+| `TaggedRowSchema` — tagged interleaved row metadata (Subtask 1)          | Done ✓  |
 
 ## Terminology
 
@@ -412,38 +414,41 @@ cascade level.
 
 ## Next Steps
 
-### Short Term (next session)
+### Completed
 
 1. ~~**MergedIndex ↔ Pipeline deduplication**~~ **DONE** (commit `33779964c`)
+2. ~~**Subtask 0: Assembly subtree identification**~~ **DONE** (commit `f8c8981f8`)
+3. ~~**Subtask 1: Tagged interleaved row type**~~ **DONE** (commit `c3a048e11`)
+   - `TaggedRowSchema` in `materialize/TaggedRowSchema.java`. Tracks per-source key/payload
+     structure, byte widths, slot-based accessors, `toTaggedRow()` conversion.
+   - Wired into `MergedIndex.getTaggedRowSchema()`.
+   - Tests: 2-table A⋈B round-trip + TPC-H Q12 ORDERS⋈LINEITEM byte-width validation.
+4. ~~**Test helpers extraction**~~ **DONE** (commit `cbd4908bb`)
+   - `MergedIndexTestUtil` in `testkit/` — `injectSortsBeforeSortBasedOps`, `inputAlreadySorted`,
+     `buildPipelineTree`, `flattenPipelines`, `findAllJoins`, `countOccurrences`.
 
-2. **Subtask 0: Assembly subtree identification** (files: `Pipeline.java`, test in `MergedIndexTpchPlanTest.java`)
-   - Implement `findAssemblySubtree(Pipeline)` — LCA-based algorithm to find the minimal
-     connected subgraph of operators between pipeline root and boundary Sorts.
-   - Add test validation: Q12 → subtree = {MergeJoin}; Q3-OL → subtree = {MergeJoin} per level.
-   - See `overhaul-03-10.md` §Subtask 0 for algorithm pseudo-code and examples.
+### Short Term (next session)
 
-### Following Sessions
-
-3. **Subtask 1: Tagged interleaved row type** (new file or in `EnumerableMergedIndexScan.java`)
-   - Define how the raw scan outputs tagged records from heterogeneous source tables.
-   - Evaluate wide union vs. generic tagged row vs. per-source typed enumerables.
-
-4. **Subtask 3: `EnumerableMergedIndexAssemble` operator** (new file: `EnumerableMergedIndexAssemble.java`)
+1. **Subtask 3: `EnumerableMergedIndexAssemble` operator** (new file: `EnumerableMergedIndexAssemble.java`)
    - Implement Algorithm 1 (N-way inner join: buffer per source, Cartesian product on key change).
    - Assembly strategy parameterized by absorbed operator types from Subtask 0.
 
-5. **Subtask 2: `EnumerableMergedIndexScan.implement()`** (file: `EnumerableMergedIndexScan.java`)
-   - Produce interleaved tagged stream from source enumerables merged by sort key.
+2. **Subtask 2: `EnumerableMergedIndexScan.implement()`** (file: `EnumerableMergedIndexScan.java`)
+   - The physical MI should already store records in tagged interleaved format (byte strings
+     laying out the Object[] contiguously). Explore whether type conversion between physical
+     bytes and TaggedRow is needed in Calcite, or we can assume TaggedRow directly from MI.
 
-6. **Subtask 4: Update `PipelineToMergedIndexScanRule`** (file: `PipelineToMergedIndexScanRule.java`)
+### Following Sessions
+
+3. **Subtask 4: Update `PipelineToMergedIndexScanRule`** (file: `PipelineToMergedIndexScanRule.java`)
    - Rule produces `Assemble(Scan)` replacing the Assembly subtree.
    - `EnumerableMergedIndexJoin` may become unnecessary.
 
-7. **Subtask 5: Index creation mode** (file: `Pipeline.java`)
+4. **Subtask 5: Index creation mode** (file: `Pipeline.java`)
    - `physicalPlan` field on Pipeline; after HEP substitution, extract and store subtree.
    - End-to-end: `while (hasNext) { parentMI.add(physicalPlan.next()) }`.
 
-8. **End-to-end test with actual row production** — Q12, Q3-OL, Q9.
+5. **End-to-end test with actual row production** — Q12, Q3-OL, Q9.
 
 ### Medium Term
 

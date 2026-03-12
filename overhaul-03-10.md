@@ -202,47 +202,31 @@ void collectSubtree(RelNode node, Set<RelNode> boundarySorts,
 
 ### Subtask 1: Tagged Interleaved Row Type
 
-The raw scan output needs a schema for records from heterogeneous source tables. Options:
+**Done.** Implemented as `TaggedRowSchema` in `materialize/TaggedRowSchema.java` (commit `c3a048e11`).
 
-- **Wide union row**: all columns from all sources concatenated + `sourceTag` int.
-  Simple but wasteful. For hierarchical keys, must either nest or replicate parent rows
-  (replication = implicit join, defeating modularization).
-- **Generic tagged row**: `(sortKey Object[], sourceTag int, payload Object[])`.
-  Compact but loses column-level type safety.
-- **Per-source typed rows via Enumerable union**: each source produces its own typed
-  enumerable; the scan merges and tags. Assembly knows each source's schema.
-- Define a type for each record type as the following did with `Formattable`. Maybe it can be called mergeable. Static code generation seems necessary here, what is the java equivalent / workaround to static code generation? Maybe Calcite already defined all records types under one interface, and we can simply use a type like `tuple(SourceTag,RecordInterface)`?
+Chose the **generic tagged `Object[]`** approach with domain tags:
 
-```java
-// Source - https://stackoverflow.com/a/79629091
-// Posted by Mr. Tea
-// Retrieved 2026-03-11, License - CC BY-SA 4.0
-
-public sealed interface Formattable permits StrFormat, IntFormat { 
-
-    String Format();
-
-}
-
-
-public record StrFormat implements Formattable(String val) {
-
-    public String Format() {
-        return String.format("String %s", val);
-    }
-
-}
-
-public record IntFormat implements Formattable(Integer val) {
-    
-    public String Format() {
-        return String.format("Integer %d", val);
-    }
-
-}
+```text
+[ domainTag0, keyVal0, domainTag1, keyVal1, ..., 'I', sourceId, p0, p1, ..., pN ]
+  ╰──────────── key fields with tags ──────╯  ╰─ index ID ─╯  ╰── payload ──╯
 ```
 
-No conclusion yet — explore during implementation.
+- Domain tags (1 byte each): domain 0 = index identifier, domains 1..K = key fields.
+- Index identifier: domain tag 0 + 1-byte source ID (0..sourceCount-1).
+- Payload: non-key columns in original order, variable length per source.
+
+`TaggedRowSchema` tracks both **slot-based positions** (for `Object[]` runtime access)
+and **byte widths** (for cost estimation via `RelMdSize.averageTypeValueSize`).
+
+Key APIs: `toTaggedRow(sourceTag, sourceRow)`, `getKeyValue(taggedRow, keyIndex)`,
+`getSourceId(taggedRow)`, `taggedRowSlotCount(sourceTag)`.
+
+Scoped to **identical keys** (all sources share the same key columns). Hierarchical
+keys are future work.
+
+Open question from user: the physical MI implementation should already store records
+in a similar tagged format (byte strings). Explore whether Calcite needs to handle
+type conversion between physical bytes and TaggedRow, or can assume TaggedRow directly.
 
 ### Subtask 2: `EnumerableMergedIndexScan.implement()` — Interleaved Stream
 
@@ -296,13 +280,21 @@ relevant subtree and store on the Pipeline.
 
 ### Suggested Implementation Order
 
-1. Subtask 0 — Assembly subtree identification + test validation
-2. Subtask 1 — Tagged row type (foundation for scan and assembly)
+1. ~~Subtask 0 — Assembly subtree identification + test validation~~ **DONE**
+2. ~~Subtask 1 — Tagged row type (foundation for scan and assembly)~~ **DONE**
 3. Subtask 3 — Assembly operator (Algorithm 1 implementation)
 4. Subtask 2 — Scan.implement with interleaved output
 5. Subtask 4 — Rule update (wires Assemble(Scan) into the plan)
 6. Subtask 5 — Index creation (physicalPlan field, end-to-end pipeline execution)
 7. Test with Q12, Q3-OL, Q9 — verify actual row production
+
+### Test infrastructure: `MergedIndexTestUtil` (commit `cbd4908bb`)
+
+Shared test helpers extracted from `MergedIndexTpchPlanTest` to
+`testkit/src/main/java/org/apache/calcite/test/MergedIndexTestUtil.java`
+so both `core` and `plus` test suites can reuse them. Includes:
+`injectSortsBeforeSortBasedOps`, `inputAlreadySorted`, `buildPipelineTree`,
+`flattenPipelines`, `findAllJoins`, `countOccurrences`, `safeGetCollation`.
 
 ### Future Work: Maintenance Mode
 
