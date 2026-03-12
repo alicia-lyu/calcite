@@ -246,9 +246,8 @@ No conclusion yet — explore during implementation.
 
 ### Subtask 2: `EnumerableMergedIndexScan.implement()` — Interleaved Stream
 
-The scan obtains source enumerables (via table scans or inner MI scans),
-merge-interleaves them by sort key, and tags each record with source index. PoC can
-use a runtime helper method rather than full Janino codegen.
+The scan obtains source enumerables (via MI scans).
+The physical implementation of merged index should already use a record structure similar to the tagged interleaved row---basically byte strings which lay out the object array contiguously. Explore whether we need to handle the type conversion between the physical bytes and TaggedRow in Calcite, or we could simply assume that we can get TaggedRow from a merged index.
 
 ### Subtask 3: `EnumerableMergedIndexAssemble` Operator
 
@@ -273,6 +272,7 @@ emit cartesianProduct(buffers)
 ```
 
 The assembly strategy is parameterized by the absorbed operator types (from Subtask 0):
+
 - Join-only → Algorithm 1 (Cartesian product per key group)
 - Join + aggregate → Algorithm 2 (aggregate during assembly)
 - Multi-level join → extended Algorithm 1 (3+ source buffers)
