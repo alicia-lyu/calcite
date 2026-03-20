@@ -32,35 +32,38 @@ tables?
 
 ---
 
-### 2. Filter Pushdown into Merged Indexes
+### 2. Filter Handling When Creating Merged Indexes
 
-**Question**: Should predicates (e.g., Q9's `p_name LIKE '%green%'`) be
-incorporated into MI creation/maintenance, or kept in the query plan?
+**Question**: When an order-based pipeline contains filters (e.g., Q9's
+`p_name LIKE '%green%'`), should the filter be included or deleted when
+creating the merged index?
 
-Note: Index creation plans and materialized view plans typically delete filters
-by default. A useful heuristic may be to omit predicates whose parameters can
-change across queries (e.g., `p_name LIKE '%green%'` vs. `'%blue%'`), preserving
-MI reusability. Predicates on stable attributes (e.g., status flags, type codes)
-may be safe to push down. Existing research on partial indexes and parameterized
-views is likely relevant here — further investigation needed.
+Note: `EnumerableMergedIndexScan` is just a special `TableScan` — nothing is
+"pushed down" into it. The question is whether the MI creation plan (which
+replaces the pipeline) retains or drops the filter. Index creation plans and
+materialized view plans typically delete filters by default, producing an
+unfiltered index. The filter then stays in the query plan above the scan.
+
+A useful heuristic may be to omit predicates whose parameters can change across
+queries (e.g., `p_name LIKE '%green%'` vs. `'%blue%'`), preserving MI
+reusability. Predicates on stable attributes (e.g., status flags, type codes)
+may be safe to bake into the MI. Existing research on partial indexes and
+parameterized views is likely relevant — further investigation needed.
 
 **Alternatives**:
 
-- **Query-tier only** — filters remain as `EnumerableFilter` above the MI scan.
-  Simple, correct, MI is maximally reusable, but scans unneeded records.
-- **Scan-internal filtering** — the MI scan evaluates predicates per-record,
-  skipping non-matching entries. Requires the scan to know the predicate and
-  the source table it applies to. MI remains reusable (filter is query-time).
-- **Maintenance-time filtering** — predicates applied when building the MI,
-  excluding non-matching records entirely. Fastest queries but limits MI reuse
-  (the MI becomes query-specific). Only appropriate for stable predicates.
+- **Delete filter (unfiltered MI)** — the MI stores all records; the filter
+  remains in the query plan above the scan. MI is maximally reusable across
+  queries with different predicates.
+- **Retain filter (filtered MI)** — the MI only stores records matching the
+  predicate. Smaller MI, but limits reuse (query-specific). Only appropriate
+  for stable predicates unlikely to change.
 
-**Current default**: Query-tier only (filter stays above scan).
+**Current default**: Delete filter (unfiltered MI); filter stays in query plan.
 
-**Prior paper reference** (`main.md`): §4.1 (scan algorithm), §4.3 (complex queries).
+**Prior paper reference** (`main.md`): §4.3 (complex queries).
 
-**Code reference**: `CLAUDE.md:166-169` (Q9 two-tier plan),
-`EnumerableMergedIndexScan.java`.
+**Code reference**: `CLAUDE.md:166-169` (Q9 two-tier plan).
 
 ---
 
