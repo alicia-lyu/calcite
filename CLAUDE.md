@@ -375,6 +375,20 @@ build a complete optimal plan from a single transformation rule.
 - Prepend `[MergedIndex]` to all commit messages.
 - If staged changes are large and consist different objectives, break them into multiple commits with clear messages. Even consider breaking changes in a single file into multiple commits if they are logically distinct.
 
+## Design Considerations
+
+This project serves a research paper; the implementation demonstrates feasibility while
+design policy questions (materialization decisions, cost trade-offs, coverage scope) are
+the primary research contribution.
+
+- When encountering a design choice with multiple valid approaches, document it in
+  `DESIGN_OPTIONS.md` with: the question, alternatives, trade-offs, current default, and
+  references to relevant code/paper sections.
+- Distinguish **engineering decisions** (how to implement) from **design policy** (what to
+  implement / when to apply). Policy decisions belong in `DESIGN_OPTIONS.md`.
+- When a default is chosen for engineering progress, note it as "current default" so it can
+  be revisited in research discussions.
+
 ## Session Discipline
 
 User instructions across the files. Some are explicitly marked by `lwh` (my initials), some are not so just use your best judgment. They should be deleted once the instruction is executed. If a problem is encountered, follow up with your comment while keeping mine.
