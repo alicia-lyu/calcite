@@ -82,19 +82,54 @@ Also note that the code I provided you with above didn't explicit use join for p
 
 ## Pipeline Conversion
 
-### Architecture Decision: Option B — Separate Scan + Assembly Operators
+### Architecture Decision: Transparent Per-Source MI Scans
 
-For each pipeline, the AFTER query plan should look like:
+Each boundary Sort in a pipeline is replaced by an `EnumerableMergedIndexScan(MI, sourceIndex)`.
+Original operators (MergeJoin, SortedAggregate, etc.) remain in the plan **unchanged**.
 
+**Key principles:**
+1. **Sort defines the substitution**, not MergeJoin. Each boundary `Sort + input chain` → `MIScan(MI, sourceIndex)`.
+2. **Shared meta object**: Multiple MI scan leaves in one assembly subtree reference a shared `MergedIndexScanGroup` representing the single physical linear scan. Plan stays a tree; shared reference makes one-scan reality explicit.
+3. **Assembly subtree stays conceptually** — identifies which leaf scans coordinate. No operator collapse. Code moves to test utils.
+4. **Nested MIs are opaque**: The outer pipeline sees the inner view as an opaque source in MI_outer. Inner operators are visible only in the index creation plan.
+5. **Buffer management**: Co-locality from the shared meta object is a storage-level concern discussed in the paper, not implemented in Calcite.
+
+**Pipeline categories:**
+
+|              | Root pipeline | Other pipelines      |
+|--------------|---------------|----------------------|
+| Data flow    | Query plan    | Index creation plan  |
+| Delta flow   | N/A           | Maintenance plan     |
+
+**Example AFTER plans:**
+
+Q12 (2-table, single root pipeline):
 ```text
-remaining operators (Aggregate, Filter, Project, ...)
-  EnumerableMergedIndexAssemble(sources=N, keyIndices=[...])
-    EnumerableMergedIndexScan(raw interleaved stream)
+EnumerableSort(l_shipmode)
+  EnumerableSortedAggregate(...)
+    EnumerableMergeJoin(orderkey)           ← STAYS
+      MIScan(MI, src=ORDERS, group=G1)     ← replaces Sort→Scan(ORDERS)
+      MIScan(MI, src=LINEITEM, group=G1)   ← replaces Sort→Scan(LINEITEM)
+                                             G1 = shared physical scan
 ```
 
-The scan outputs **tagged interleaved records** (one row per source record, with a
-source-tag column). The assembly operator above it buffers per source and emits
-Cartesian products on key change (Algorithm 1 from `main.tex`).
+Q3-OL root query plan (outer pipeline only):
+```text
+EnumerableLimitSort
+  EnumerableProject
+    EnumerableMergeJoin(custkey)                  ← STAYS
+      MIScan(MI_outer, src=inner_view, group=G2)  ← replaces Sort→(inner pipeline result)
+      MIScan(MI_outer, src=CUSTOMER, group=G2)    ← replaces Sort→Scan(CUSTOMER)
+```
+
+Q3-OL inner pipeline (index creation plan, populates MI_inner):
+```text
+EnumerableMergeJoin(orderkey)
+  EnumerableSortedAggregate → TableScan(lineitem)
+  TableScan(Orders)
+```
+
+Note: the leaf pipeline's mergedIndex is null — its sources are actually read.
 
 ### Subtask 0: Identify the Assembly Subtree
 
@@ -228,65 +263,48 @@ Open question from user: the physical MI implementation should already store rec
 in a similar tagged format (byte strings). Explore whether Calcite needs to handle
 type conversion between physical bytes and TaggedRow, or can assume TaggedRow directly.
 
-### Subtask 2: `EnumerableMergedIndexScan.implement()` — Interleaved Stream
+### Subtask 0 (revised): Per-Source MI Scan Operator
 
-The scan obtains source enumerables (via MI scans).
-The physical implementation of merged index should already use a record structure similar to the interleaved tagged rows---basically byte strings which lay out the object array contiguously. One row of a type is emitted at a time. Explore whether we need to handle the type conversion between the physical bytes and TaggedRow in Calcite, or we could simply assume that we can get TaggedRow from a merged index. Plan for concrete changes to `EnumerableMergedIndexScan.implement()` and relevant methods.
+Rework `EnumerableMergedIndexScan`:
+- Add `sourceIndex` field — designates which source's row type this scan produces (not tagged/joined).
+- Create `MergedIndexScanGroup` class — shared meta object referenced by all leaf scans in one assembly subtree. Represents the single physical linear scan.
+- `implement()`: scan MI, filter by source tag, return **source-native rows** (not tagged rows).
+- Collation: MI's shared collation remapped to source's field indices.
 
-### Subtask 3: `EnumerableMergedIndexAssemble` Operator
+### Subtask 1 (revised): PipelineToMergedIndexScanRule — match Sort boundaries
 
-New physical operator. Algorithm 1 logic (N-way inner join):
-```text
-buffers = new List<List<Object[]>>[sourceCount]
-currentKey = null
+The current implementation should be correct in matching `EnumerableSort` at pipeline boundaries.
+- Check: is the Sort's input table part of a registered MI with this collation?
+- Replace: `Sort(input_chain)` → `MergedIndexScan(MI, sourceIndex, scanGroup)`
+- Parent operators (MergeJoin, SortedAggregate, etc.) remain **untouched**. All operators except the Sorts remain untouched.
 
-for each record in input:
-  key = extractKey(record)
-  tag = record.sourceTag
+### Subtask 2: Index Creation Plan
 
-  if key != currentKey:
-    if currentKey != null: emit cartesianProduct(buffers)
-    clear all buffers
-    currentKey = key
+For non-root pipelines, the BEFORE plan IS the index creation plan.
+- Store as `physicalPlan` field on `Pipeline`.
+- Populates MI from base tables (or inner MI views).
+- Leaf pipelines have `mergedIndex = null` — their sources are actually read.
 
-  buffers[tag].add(extractPayload(record, tag))
+### Subtask 3: Update Tests
 
-// flush last key group
-emit cartesianProduct(buffers)
-```
+- All AFTER plan expectations change: MergeJoin stays, leaf scans replace Sort→TableScan.
+- Assembly subtree validation moves to `MergedIndexTestUtil`.
 
-The assembly strategy is parameterized by the absorbed operator types (from Subtask 0):
+### Subtask 4: Cost Model
 
-- Join-only → Algorithm 1 (Cartesian product per key group)
-- Join + aggregate → Algorithm 2 (aggregate during assembly)
-- Multi-level join → extended Algorithm 1 (3+ source buffers)
-
-### Subtask 4: Update `PipelineToMergedIndexScanRule`
-
-The rule produces `Assemble(Scan)` replacing the Assembly subtree. Both inner and outer
-pipelines use the same pattern. `EnumerableMergedIndexJoin` may become unnecessary
-(Assemble handles both cases uniformly).
-
-Rule's match pattern stays the same (match MergeJoin), but replacement now considers
-the Assembly subtree: replace LCA with `Assemble(Scan)`, leave operators above LCA.
-
-### Subtask 5: Index Creation Mode
-
-For non-final pipelines, the physicalPlan's output feeds into the parent merged index:
-`while (hasNext) { parentMI.add(physicalPlan.next()) }`.
-
-Needs `physicalPlan` field on `Pipeline.java`. After HEP substitution, extract the
-relevant subtree and store on the Pipeline.
+- N leaf scans sharing one physical scan: combined IO = one sequential scan, not N.
+- `MergedIndexScanGroup` enables cost sharing across sibling scans.
 
 ### Suggested Implementation Order
 
-1. ~~Subtask 0 — Assembly subtree identification + test validation~~ **DONE**
-2. ~~Subtask 1 — Tagged row type (foundation for scan and assembly)~~ **DONE**
-3. Subtask 3 — Assembly operator (Algorithm 1 implementation)
-4. Subtask 2 — Scan.implement with interleaved output
-5. Subtask 4 — Rule update (wires Assemble(Scan) into the plan)
-6. Subtask 5 — Index creation (physicalPlan field, end-to-end pipeline execution)
-7. Test with Q12, Q3-OL, Q9 — verify actual row production
+1. ~~Subtask 0 — Assembly subtree identification~~ **DONE** (moved to test utils)
+2. ~~Subtask 1 — Tagged row type~~ **DONE** (TaggedRowSchema)
+3. Subtask 0 (revised) — Per-source MI scan operator + MergedIndexScanGroup
+4. Subtask 1 (revised) — Rule update: Sort→MIScan substitution
+5. Subtask 3 — Update test expectations
+6. Subtask 2 — Index creation plan (physicalPlan field)
+7. Subtask 4 — Cost model with scan group sharing
+8. End-to-end test with actual row production — Q12, Q3-OL, Q9
 
 ### Test infrastructure: `MergedIndexTestUtil` (commit `cbd4908bb`)
 

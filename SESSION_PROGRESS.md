@@ -8,11 +8,11 @@
 | `core/.../materialize/MergedIndex.java` (+ `sources` field, `of()` factory) | Done |
 | `core/.../materialize/MergedIndexRegistry.java` (`findFor(List<Object>, ...)`) | Done |
 | `core/.../adapter/enumerable/EnumerableMergedIndexScan.java`            | Done    |
-| `core/.../adapter/enumerable/EnumerableMergedIndexJoin.java` (NEW)      | Done    |
+| `core/.../adapter/enumerable/EnumerableMergedIndexJoin.java` (NEW)      | Obsolete (Option B) |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java` (generalized) | Done |
 | `core/.../adapter/enumerable/EnumerableRules.java` (constant)           | Done    |
-| `core/.../adapter/enumerable/EnumerableMergedIndexDeltaScan.java` (NEW) | Done    |
-| `core/.../adapter/enumerable/DeltaToMergedIndexDeltaScanRule.java` (NEW)| Done    |
+| `core/.../adapter/enumerable/EnumerableMergedIndexDeltaScan.java` (NEW) | Obsolete (Option B) |
+| `core/.../adapter/enumerable/DeltaToMergedIndexDeltaScanRule.java` (NEW)| Obsolete (Option B) |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
 | TPC-H Q3 (deleted — incorrect CUSTOMER+ORDERS example)                  | Removed |
 | TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓  |
@@ -44,37 +44,38 @@
 
 Search for `=== Q12 BEFORE`, `=== Q12 AFTER`, `=== Q3 OL AFTER`, `=== Q9 AFTER` in output.
 
-### Sample AFTER output
+### Sample AFTER output (Transparent Per-Source MI Scans)
 
-**Q12** (full 2-table substitution):
+**Q12** (2-table, single root pipeline — MergeJoin stays):
 
-```
-EnumerableSort(...)
-  EnumerableAggregate(...)
-    EnumerableMergedIndexScan(
-      tables=[[[TPCH, ORDERS]:O_ORDERKEY, [TPCH, LINEITEM]:L_ORDERKEY]],
-      collation=[[0]])
-```
-
-**Q3-OL** (full 3-table substitution — both inner and outer replaced):
-
-```
-EnumerableLimitSort(...)
-  EnumerableProject(...)
-    EnumerableMergedIndexJoin(sources=[[view([0]), [TPCH, CUSTOMER]:C_CUSTKEY]], joinType=[INNER], collation=[[3]])
-      EnumerableMergedIndexScan(tables=[[view([0]), [TPCH, CUSTOMER]:C_CUSTKEY]], collation=[[3]])
+```text
+EnumerableSort(l_shipmode)
+  EnumerableSortedAggregate(...)
+    EnumerableMergeJoin(orderkey)           ← STAYS
+      MIScan(MI, src=ORDERS, group=G1)     ← replaces Sort→Scan(ORDERS)
+      MIScan(MI, src=LINEITEM, group=G1)   ← replaces Sort→Scan(LINEITEM)
 ```
 
-**Q9** (full 6-table substitution):
+**Q3-OL** root query plan (outer pipeline only — inner is index creation plan):
 
+```text
+EnumerableLimitSort
+  EnumerableProject
+    EnumerableMergeJoin(custkey)                  ← STAYS
+      MIScan(MI_outer, src=inner_view, group=G2)  ← replaces Sort→(inner result)
+      MIScan(MI_outer, src=CUSTOMER, group=G2)    ← replaces Sort→Scan(CUSTOMER)
 ```
-EnumerableSort(sort0=[$0], sort1=[$1], dir0=[ASC], dir1=[DESC])
-  EnumerableAggregate(group=[{0, 1}], SUM_PROFIT=[SUM($2)])
-    EnumerableSort(sort0=[$0], sort1=[$1], dir0=[ASC], dir1=[ASC])
-      EnumerableProject(...)
-        EnumerableFilter(condition=[LIKE($26, '%green%')])
-          EnumerableMergedIndexJoin(...)
-            EnumerableMergedIndexScan(...)
+
+**Q9** root query plan (outer pipeline only):
+
+```text
+EnumerableSort(n_name, o_year DESC)
+  EnumerableAggregate(n_name, o_year)
+    EnumerableProject
+      EnumerableFilter(p_name LIKE ...)
+        EnumerableMergeJoin(nationkey)                    ← STAYS
+          MIScan(MI_outer, src=inner_view, group=G5)
+          MIScan(MI_outer, src=NATION, group=G5)
 ```
 
 ---
@@ -112,7 +113,7 @@ SQL String
 
 ---
 
-## Flow Chart B — Merged Index Substitution on Top of Normal Planning
+## Flow Chart B — Merged Index Substitution (Transparent Per-Source MI Scans)
 
 ```text
           ┌─────────────────────────────────────────────┐
@@ -124,27 +125,32 @@ SQL String
                           │
     ┌─────────────────────┼──────────────────────────┐
     │  Between phases:    │                           │
-    │  walk plan tree     │                           │
-    │  extract RelOptTable refs + collation           │
-    │  MergedIndexRegistry.register(                  │
-    │    new MergedIndex(tables, collation, rc))      │
+    │  walk plan tree, discover pipelines             │
+    │  register MergedIndex per pipeline              │
+    │  create MergedIndexScanGroup per pipeline       │
     └─────────────────────┼──────────────────────────┘
                           │
                           ▼  HEP planner
           [PipelineToMergedIndexScanRule]
-          Matches: EnumerableMergeJoin
-                     ├─ EnumerableSort → EnumerableTableScan(A)
-                     └─ EnumerableSort → EnumerableTableScan(B)
-          Checks:  MergedIndexRegistry.findFor(tables, collation) != empty
-          Fires:   call.transformTo(EnumerableMergedIndexScan)
+          Matches: EnumerableSort at pipeline boundary
+          Checks:  Sort's input is part of a registered MI
+          Fires:   Sort(input_chain) → MIScan(MI, srcIdx, group)
                           │
                           ▼
-          [Merged Index Plan]
-          EnumerableProject
-            └─ EnumerableMergedIndexScan
-               tables=[A, B], collation=[k ASC]
-               (one sequential pass; join assembled on-the-fly)
+          [Merged Index Plan — operators stay, Sorts replaced]
+          EnumerableMergeJoin                    ← STAYS
+            ├─ MIScan(MI, src=A, group=G1)      ← replaces Sort→Scan(A)
+            └─ MIScan(MI, src=B, group=G1)      ← replaces Sort→Scan(B)
+               G1 = shared physical scan object
+               (one sequential scan; MergeJoin assembles on-the-fly)
 ```
+
+**Pipeline categories:**
+
+|              | Root pipeline | Other pipelines      |
+|--------------|---------------|----------------------|
+| Data flow    | Query plan    | Index creation plan  |
+| Delta flow   | N/A           | Maintenance plan     |
 
 ---
 
@@ -190,109 +196,73 @@ are depth-many cascading steps total.
 
 ---
 
-### Q12 — 2-table full substitution (`tpchQ12`)
+### Q12 — 2-table (`tpchQ12`)
 
-Key: `o_orderkey = l_orderkey`. One HEP pass. One level, no cascade.
-
-```text
-BEFORE                                     AFTER (Query plan only)
-EnumerableSort                             EnumerableSort
-  EnumerableAggregate                        EnumerableAggregate
-    EnumerableMergeJoin(orderkey)              EnumerableMergedIndexScan
-      EnumerableSort → Scan(ORDERS)              [ORDERS]:O_ORDERKEY
-      EnumerableSort → Scan(LINEITEM)            [LINEITEM]:L_ORDERKEY
-```
-
-After: query plan + maintenance plan
+Key: `o_orderkey = l_orderkey`. Single root pipeline. One HEP pass.
 
 ```text
-QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLAN (from BEFORE)
-EnumerableSort                             On ORDERS insert(o_orderkey=k):
-  EnumerableAggregate                        insert ORDERS record at key k
-    EnumerableMergedIndexScan                  into MI(ORDERS+LINEITEM)
-      [ORDERS]:O_ORDERKEY                On LINEITEM insert(l_orderkey=k):
-      [LINEITEM]:L_ORDERKEY               insert LINEITEM record at key k
-                                            into MI(ORDERS+LINEITEM)
+BEFORE                                     AFTER (Query plan — MergeJoin stays)
+EnumerableSort(l_shipmode)                 EnumerableSort(l_shipmode)
+  EnumerableSortedAggregate                  EnumerableSortedAggregate
+    EnumerableMergeJoin(orderkey)              EnumerableMergeJoin(orderkey)  ← STAYS
+      EnumerableSort → Scan(ORDERS)              MIScan(MI, src=ORDERS, G1)
+      EnumerableSort → Scan(LINEITEM)            MIScan(MI, src=LINEITEM, G1)
 ```
 
-Maintenance plan structure (the replaced pipeline from BEFORE):
-```text
-  MergeJoin(orderkey)   ← re-run for delta key k to produce merged index entry
-    Sort → Scan(ORDERS)
-    Sort → Scan(LINEITEM)
-```
+Index creation: N/A (root pipeline — no MI to populate, sources read directly).
 
 ---
 
-### Q3-OL — 3-table full substitution (`tpchQ3OrdersLineitem`)
+### Q3-OL — 3-table (`tpchQ3OrdersLineitem`)
 
-Keys: `l_orderkey = o_orderkey` (inner), `o_custkey = c_custkey` (outer). Two HEP passes. Two-level cascade.
+Keys: `l_orderkey = o_orderkey` (inner), `o_custkey = c_custkey` (outer). Two pipelines.
 
 ```text
-BEFORE                                     AFTER (Query plan only)
-EnumerableLimitSort                        EnumerableLimitSort
-  EnumerableProject                          EnumerableProject
-    EnumerableMergeJoin(custkey) ←outer        EnumerableMergedIndexJoin(custkey, INNER)
-      EnumerableSort(custkey)                    EnumerableMergedIndexScan
-        EnumerableMergeJoin(orderkey) ←inner       [view(OL)]:O_CUSTKEY
-          EnumerableSort                            [CUSTOMER]:C_CUSTKEY
+BEFORE (full plan)
+EnumerableLimitSort
+  EnumerableProject
+    EnumerableMergeJoin(custkey)          ← outer pipeline
+      EnumerableSort(custkey)
+        EnumerableMergeJoin(orderkey)     ← inner pipeline
+          EnumerableSort
             EnumerableAggregate → Scan(LINEITEM)
           EnumerableSort → Scan(ORDERS)
       EnumerableSort → Scan(CUSTOMER)
 ```
 
-After: query plan + maintenance plan
-
 ```text
-QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLANS (from BEFORE)
-EnumerableLimitSort                        Level 1 — MI(OL) by orderkey:
-  EnumerableProject                          On LINEITEM insert(l_orderkey=k):
-    EnumerableMergedIndexJoin(custkey)         re-aggregate LINEITEM for key k,
-      EnumerableMergedIndexScan                update MI(OL) at k
-        [view(OL)]:O_CUSTKEY               On ORDERS insert(o_orderkey=k):
-        [CUSTOMER]:C_CUSTKEY                 insert ORDERS record at k in MI(OL)
-
-                                           Level 2 — MI(OL+CUSTOMER) by custkey:
-                                             On MI(OL) delta at (orderkey, custkey=c):
-                                               update MI(OL+CUSTOMER) at custkey c
-                                             On CUSTOMER insert(c_custkey=c):
-                                               insert CUSTOMER record at c
+AFTER — Root query plan (outer pipeline only)
+EnumerableLimitSort
+  EnumerableProject
+    EnumerableMergeJoin(custkey)                     ← STAYS
+      MIScan(MI_outer, src=inner_view, group=G2)    ← replaces Sort→(inner result)
+      MIScan(MI_outer, src=CUSTOMER, group=G2)      ← replaces Sort→Scan(CUSTOMER)
 ```
 
-Maintenance plan structure (the two replaced pipelines from BEFORE):
 ```text
-  Inner: MergeJoin(orderkey)              Outer: MergeJoin(custkey)
-           Sort(Agg(LINEITEM))                     Sort(MI(OL) view)
-           Sort → Scan(ORDERS)                     Sort → Scan(CUSTOMER)
+AFTER — Index creation plan (inner pipeline, populates MI_inner)
+EnumerableMergeJoin(orderkey)
+  EnumerableSortedAggregate → TableScan(LINEITEM)
+  TableScan(ORDERS)
 ```
 
 ---
 
-### Q3 (deleted)
+### Q9 — 6-table (`tpchQ9`)
 
-The `tpchQ3` test was an incorrect example: it registered a merged index for
-CUSTOMER ⋈ ORDERS by custkey, but the natural inner pipeline for TPC-H Q3 is
-ORDERS ⋈ LINEITEM by orderkey. The correct 3-table test is `tpchQ3OrdersLineitem`
-(Q3-OL), which tests inner (ORDERS+LINEITEM by orderkey) + outer (+CUSTOMER by custkey).
-
----
-
-### Q9 — 6-table full substitution (`tpchQ9`)
-
-Keys: orderkey → partkey → (partkey,suppkey) → suppkey → nationkey. Five HEP passes.
-`findAllPipelines` discovers 5 nested `Pipeline` objects post-order; `MergedIndex.of()`
-builds OL → OLP → OLPS → OLPPS → OLPPSS+NATION bottom-up. Five-level cascade.
+Keys: orderkey → partkey → (partkey,suppkey) → suppkey → nationkey.
+5 pipelines, 4 inner (index creation) + 1 root (query plan).
 
 ```text
-BEFORE                                     AFTER
-EnumerableSort(n_name, o_year DESC)        EnumerableSort(n_name, o_year DESC) ← ORDER BY only
-  EnumerableAggregate(n_name, o_year)        EnumerableAggregate(n_name, o_year)
-    EnumerableFilter(p_name LIKE ...)          EnumerableProject
-      EnumerableMergeJoin(nationkey)             EnumerableFilter(p_name LIKE ...)
-        EnumerableSort                             EnumerableMergedIndexJoin(nationkey, INNER)
-          EnumerableMergeJoin(suppkey)               EnumerableMergedIndexScan
-            EnumerableSort                             [view(OLPPS)]:N_NATIONKEY
-              EnumerableMergeJoin(partkey,suppkey)     [NATION]:N_NATIONKEY
+BEFORE (full plan)
+EnumerableSort(n_name, o_year DESC)
+  EnumerableAggregate(n_name, o_year)
+    EnumerableFilter(p_name LIKE ...)
+      EnumerableMergeJoin(nationkey)         ← root pipeline
+        EnumerableSort
+          EnumerableMergeJoin(suppkey)
+            EnumerableSort
+              EnumerableMergeJoin(partkey,suppkey)
                 EnumerableSort → Scan(PARTSUPP)
                 EnumerableSort
                   EnumerableMergeJoin(partkey)
@@ -306,109 +276,39 @@ EnumerableSort(n_name, o_year DESC)        EnumerableSort(n_name, o_year DESC) �
 ```
 
 ```text
-QUERY-TIME PLAN (AFTER)                    MAINTENANCE PLANS (5 levels from BEFORE)
-EnumerableSort(n_name, o_year DESC)        L1 OL(orderkey):   ORDERS/LINEITEM delta
-  EnumerableAggregate(n_name, o_year)      L2 OLP(partkey):   OL/PART delta
-    EnumerableProject                      L3 OLPS(pk,sk):    OLP/PARTSUPP delta
-      EnumerableFilter(p_name LIKE ...)    L4 OLPPS(suppkey): OLPS/SUPPLIER delta
-        EnumerableMergedIndexJoin          L5 final(natkey):  OLPPS/NATION delta
-          EnumerableMergedIndexScan
-            [view(OLPPS)]:S_NATIONKEY      Each level: 1 delta in → 1 MI entry updated
-            [NATION]:N_NATIONKEY           Cascade depth = 5 for a LINEITEM base change
+AFTER — Root query plan (outermost pipeline only)
+EnumerableSort(n_name, o_year DESC)
+  EnumerableAggregate(n_name, o_year)
+    EnumerableProject
+      EnumerableFilter(p_name LIKE ...)
+        EnumerableMergeJoin(nationkey)                   ← STAYS
+          MIScan(MI_outer, src=inner_view, group=G5)
+          MIScan(MI_outer, src=NATION, group=G5)
 ```
 
-Note: `EnumerableFilter(p_name LIKE '%green%')` remains because PART is absorbed into
-the merged index but the filter cannot be pushed below the assembled join result.
+Inner pipelines (index creation plans, 4 levels):
+- L1: MI(OL) by orderkey — MergeJoin(ORDERS, LINEITEM)
+- L2: MI(OLP) by partkey — MergeJoin(OL_view, PART)
+- L3: MI(OLPS) by (partkey,suppkey) — MergeJoin(OLP_view, PARTSUPP)
+- L4: MI(OLPPS) by suppkey — MergeJoin(OLPS_view, SUPPLIER)
+
+Note: `EnumerableFilter(p_name LIKE '%green%')` stays in root query plan.
 
 ---
 
-## Maintenance Plan Generation (implemented 2026-03-10)
+## Maintenance & Index Creation (design notes)
 
-Obsolete.
+Archived Option B maintenance plan content → `TRASH-option-b.md`.
 
-`MergedIndex.maintenancePlan` stores the incremental IVM plan derived by
-`deriveIncrementalPlan(Join)` in `MergedIndexTpchPlanTest`.
+### Index creation plan
 
-### Two-phase maintenance model
+For non-root pipelines, the BEFORE plan IS the index creation plan. It populates the
+MI from base tables (or inner MI views). Store as `physicalPlan` field on `Pipeline`.
 
-A merged index does **not** store a pre-computed join — it stores records from each
-source table independently, interleaved by sort key. This distinction drives two
-fundamentally different maintenance phases:
+### Maintenance plan
 
-#### Phase 1 — base table Δ → inner MI (no join needed)
-
-Each source contributes independently. One base-table insert/delete triggers exactly
-one MI record update, with no join against any other source. For example, in Q3-OL:
-
-- `ORDERS` insert at orderkey=k → insert ORDERS record into MI(OL)\[k\]
-- `LINEITEM` insert at orderkey=k → re-aggregate LINEITEM for key k → update Agg
-  record in MI(OL)\[k\]
-
-The semi-naive formula `Δ(A ⋈ B) = (Δ(A) ⋈ B) ∪ (A ⋈ Δ(B))` does **not** apply
-here. Branch 2 (ORDERS delta) needs no join with Agg(LINEITEM); ORDERS records are
-simply inserted into the MI slot for key k. The formula overcounts by joining even
-for direct-insertion paths.
-
-#### Phase 2 — inner MI Δ → outer MI (join/propagation required)
-
-When a change in the inner MI must propagate to the outer MI, the key level changes
-(e.g., orderkey → custkey). Before this step, the inner MI just stores multiple types of records, now we need to assemble them together. It usually involves a join but may also involve additional operators, as defined by the pipeline for the current merged index.
-For example, in Q3-OL,
-when a lineitem insertion triggers an additional joined record, we need to produce it and insert it directly into the outer MI.
-Note that a join-like lookup in the outer merged index is still NOT required.
-
-**The BEFORE plan defines both phases:**
-
-- Phase 1 updates leaf merged indexes that correspond to leaf pipelines.
-- Phase 2 updates non-leaf merged indexes that correspond to inner pipelines.
-
-### Current `deriveIncrementalPlan` — union of independent deltas (2026-03-10)
-
-A merged index stores records from each source **independently**, interleaved by
-sort key. No join between sources is needed at maintenance time — each source inserts
-its records directly at the appropriate sort key. The maintenance plan is therefore:
-
-```text
-LogicalUnion(all=true)
-  LogicalDelta(sortedInputs[0])    ← new records from source 0
-  LogicalDelta(sortedInputs[1])    ← new records from source 1
-  ...
-```
-
-For nested pipelines (Q3-OL outer, Q9 levels 1–4), the left sorted input wraps
-the entire inner pipeline (e.g., `Sort(inner_join_result)`). `LogicalDelta` over
-this node means "run the inner pipeline for changed keys and emit the assembled
-delta" — the Phase 2 propagation is defined by the inner pipeline's own operators.
-No additional join node is added at the outer MI level.
-
-The implementation bypasses `HepPlanner + StreamRules` because
-`DeltaJoinTransposeRule.onMatch()` calls `HepRuleCall.transformTo()` which runs
-`verifyTypeEquivalence` — this fails because TPC-H schema uses `JavaType(String)` while
-the newly created `LogicalJoin`s re-derive their row types as `VARCHAR` (SQL type system).
-By constructing the plan directly, we avoid the type mismatch entirely.
-
-### `EnumerableMergedIndexDeltaScan` and `DeltaToMergedIndexDeltaScanRule` (2026-03-10)
-
-`EnumerableMergedIndexDeltaScan` — physical delta-scan operator analogous to
-`EnumerableMergedIndexScan`, slightly higher cost. Registered as
-`ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE` in `EnumerableRules` (opt-in).
-
-`DeltaToMergedIndexDeltaScanRule` matches `LogicalDelta(EnumerableMergedIndexScan)`
-and replaces it with `EnumerableMergedIndexDeltaScan`. Tested in `tpchQ3OrdersLineitem`
-by constructing a synthetic `LogicalDelta(innerScan)` and verifying the rule fires.
-
-### Tag-based lazy propagation (future design)
-
-Each merged-index record carries a 1-byte `propagated` flag. On base-table insert:
-
-1. Insert into MI with `propagated=false`.
-2. Background worker finds untagged records, runs the phase-1 source pipeline for
-   that key (re-agg LINEITEM, etc.), propagates delta to next-level MI via phase-2
-   join lookup.
-3. Mark source record as `propagated=true`.
-
-This avoids storing full delta records and keeps update cost O(1) amortized per
-cascade level.
+Same as index creation but processes deltas instead of full data. Future work — reconcile
+with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 
 ---
 
@@ -417,70 +317,62 @@ cascade level.
 ### Completed
 
 1. ~~**MergedIndex ↔ Pipeline deduplication**~~ **DONE** (commit `33779964c`)
-2. ~~**Subtask 0: Assembly subtree identification**~~ **DONE** (commit `f8c8981f8`)
+2. ~~**Subtask 0: Assembly subtree identification**~~ **DONE** (commit `f8c8981f8`) — moved to test utils
 3. ~~**Subtask 1: Tagged interleaved row type**~~ **DONE** (commit `c3a048e11`)
-   - `TaggedRowSchema` in `materialize/TaggedRowSchema.java`. Tracks per-source key/payload
-     structure, byte widths, slot-based accessors, `toTaggedRow()` conversion.
+   - `TaggedRowSchema` in `materialize/TaggedRowSchema.java`.
    - Wired into `MergedIndex.getTaggedRowSchema()`.
-   - Tests: 2-table A⋈B round-trip + TPC-H Q12 ORDERS⋈LINEITEM byte-width validation.
 4. ~~**Test helpers extraction**~~ **DONE** (commit `cbd4908bb`)
-   - `MergedIndexTestUtil` in `testkit/` — `injectSortsBeforeSortBasedOps`, `inputAlreadySorted`,
-     `buildPipelineTree`, `flattenPipelines`, `findAllJoins`, `countOccurrences`.
+   - `MergedIndexTestUtil` in `testkit/`.
 
-### Short Term (next session)
+### Short Term (next session) — Transparent Per-Source MI Scans
 
-1. **Subtask 3: `EnumerableMergedIndexAssemble` operator** (new file: `EnumerableMergedIndexAssemble.java`)
-   - Implement Algorithm 1 (N-way inner join: buffer per source, Cartesian product on key change).
-   - Assembly strategy parameterized by absorbed operator types from Subtask 0.
+1. **Subtask 0 (revised): Per-source MI scan operator** (files: `EnumerableMergedIndexScan.java`, new `MergedIndexScanGroup.java`)
+   - Add `sourceIndex` field to `EnumerableMergedIndexScan` — designates which source's row type this scan produces.
+   - Create `MergedIndexScanGroup` class — shared meta object referenced by all leaf scans in one assembly subtree.
+   - `implement()`: scan MI, filter by source tag, return source-native rows.
+   - Collation: MI's shared collation remapped to source's field indices.
 
-2. **Subtask 2: `EnumerableMergedIndexScan.implement()`** (file: `EnumerableMergedIndexScan.java`)
-   - The physical MI should already store records in tagged interleaved format (byte strings
-     laying out the Object[] contiguously). Explore whether type conversion between physical
-     bytes and TaggedRow is needed in Calcite, or we can assume TaggedRow directly from MI.
+2. **Subtask 1 (revised): PipelineToMergedIndexScanRule — Sort boundary matching** (file: `PipelineToMergedIndexScanRule.java`)
+   - Rule matches `EnumerableSort` at pipeline boundaries (current implementation should be close).
+   - Replace: `Sort(input_chain)` → `MIScan(MI, sourceIndex, scanGroup)`.
+   - Parent operators (MergeJoin, SortedAggregate, etc.) remain untouched.
+
+3. **Subtask 3: Update test expectations** (files: `PipelineToMergedIndexScanRuleTest.java`, `MergedIndexTpchPlanTest.java`)
+   - AFTER plans: MergeJoin stays, leaf scans replace Sort→TableScan.
+   - Assembly subtree validation in `MergedIndexTestUtil`.
 
 ### Following Sessions
 
-3. **Subtask 4: Update `PipelineToMergedIndexScanRule`** (file: `PipelineToMergedIndexScanRule.java`)
-   - Rule produces `Assemble(Scan)` replacing the Assembly subtree.
-   - `EnumerableMergedIndexJoin` may become unnecessary.
+1. **Subtask 2: Index creation plan** (file: `Pipeline.java`)
+   - For non-root pipelines, BEFORE plan = index creation plan.
+   - Store as `physicalPlan` field on Pipeline.
 
-4. **Subtask 5: Index creation mode** (file: `Pipeline.java`)
-   - `physicalPlan` field on Pipeline; after HEP substitution, extract and store subtree.
-   - End-to-end: `while (hasNext) { parentMI.add(physicalPlan.next()) }`.
+2. **Subtask 4: Cost model with scan group sharing** (file: `EnumerableMergedIndexScan.java`)
+   - N leaf scans sharing one physical scan: combined IO = one sequential scan, not N.
+   - `MergedIndexScanGroup` enables cost sharing.
 
-5. **End-to-end test with actual row production** — Q12, Q3-OL, Q9.
+3. **End-to-end test with actual row production** — Q12, Q3-OL, Q9.
 
 ### Medium Term
 
-1. **Direction-agnostic sort injection** (file: `MergedIndexTpchPlanTest.java`,
-   method `injectSortsBeforeSortBasedOps`)
-   - Sort-based operators (Aggregate GROUP BY, Join) don't inherently require ASC or DESC.
-     Currently `injectSortsBeforeSortBasedOps` always creates ASC sorts
-     (`new RelFieldCollation(idx)` defaults to ASC).
-   - Future: look downstream at parent operator's required direction and proactively match.
-   - Concrete example: Q9's GROUP BY creates `Sort(n_name ASC, o_year ASC)` but ORDER BY
-     needs `(n_name ASC, o_year DESC)`. With direction propagation, the injected sort would
-     use DESC for o_year, eliminating the redundant post-aggregate sort.
+1. **Direction-agnostic sort injection** — propagate downstream direction requirements
+   to eliminate redundant sorts (e.g., Q9 GROUP BY ASC vs ORDER BY DESC).
 
-2. **`extractCollation` specificity** (file: `PipelineToMergedIndexScanRule.java`)
-   - When both MergeJoin inputs have collations, choose the most specific one. Both sides
-     are compatible but not necessarily identical.
+2. **`extractCollation` specificity** — choose most specific collation when both MergeJoin
+   inputs have collations.
 
-3. **Additional TPC-H queries** — show all order-based query plans can use merged indexes.
-   - Q5: CUSTOMER ⋈ ORDERS ⋈ LINEITEM ⋈ SUPPLIER ⋈ NATION ⋈ REGION — hierarchical keys.
-   - Q6: single-table aggregate, no join — baseline showing no MI applies.
+3. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI).
 
-4. **Realistic cost model** — explore Calcite's cost model for index/MV access, adapt
-   for merged index access and full query+maintenance plan costs.
+4. **Realistic cost model** — adapt Calcite's cost model for merged index access.
 
 ### Long Term
 
-1. **PATH B: Native merged index support** — `PipelineToMergedIndexScanRule` matching
-   bare `EnumerableTableScan` with collation traits (no explicit `EnumerableSort`).
+1. **PATH B: Native merged index support** — tables report collation via `getStatistic()`,
+   rule matches bare `EnumerableTableScan` with collation traits.
 
 2. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
    ORDERKEY→CUSTKEY recognition.
 
 3. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
 
-4. **`implement()` stub** — real sequential B-tree scan implementation; LeanStore integration.
+4. **`implement()` stub** — real sequential B-tree scan; LeanStore integration.
