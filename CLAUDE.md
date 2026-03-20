@@ -11,11 +11,14 @@ demonstrate this substitution via the planner rule infrastructure.
 
 ## Background
 
-This project accompanies the VLDB 2026 paper:
+This project extends the prior work documented in `main.md` (a summary of `main.tex`):
   "Storing and Indexing Multiple Tables by Interesting Orderings"
-  Wenhui Lyu, Goetz Graefe — University of Wisconsin–Madison / Google
+  Wenhui Lyu, Goetz Graefe — University of Wisconsin–Madison / Google (VLDB 2026)
 
-The full paper is @main.md and is very important context for this project.
+The prior paper covers single-pipeline merged indexes. This Calcite implementation
+is a new study extending to multi-pipeline queries. `main.md` provides essential
+background on merged index concepts, but the current project's contributions go
+beyond what that paper describes.
 
 ### Merged Indexes (the key concept)
 
@@ -377,9 +380,9 @@ build a complete optimal plan from a single transformation rule.
 
 ## Design Considerations
 
-This project serves a research paper; the implementation demonstrates feasibility while
-design policy questions (materialization decisions, cost trade-offs, coverage scope) are
-the primary research contribution.
+This project is a new research study extending the prior paper (`main.md`). The
+implementation demonstrates feasibility while design policy questions (materialization
+decisions, cost trade-offs, coverage scope) are the primary research contribution.
 
 - When encountering a design choice with multiple valid approaches, document it in
   `DESIGN_OPTIONS.md` with: the question, alternatives, trade-offs, current default, and

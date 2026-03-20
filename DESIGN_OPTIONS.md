@@ -25,7 +25,7 @@ tables?
 
 **Current default**: All materialized.
 
-**Paper reference**: §6 (Spectrum of Pre-computation, Table 4).
+**Prior paper reference** (`main.md`): §6 (Spectrum of Pre-computation, Table 4).
 
 **Code reference**: `Pipeline.java:78` (`mergedIndex` field),
 `overhaul-03-10.md` pipeline categories table.
@@ -49,7 +49,7 @@ during MI scan or must they stay in the query plan above the scan?
 
 **Current default**: Query-tier only (filter stays above scan).
 
-**Paper reference**: §4.1 (scan algorithm), §4.3 (complex queries).
+**Prior paper reference** (`main.md`): §4.1 (scan algorithm), §4.3 (complex queries).
 
 **Code reference**: `CLAUDE.md:166-169` (Q9 two-tier plan),
 `EnumerableMergedIndexScan.java`.
@@ -74,7 +74,7 @@ requiring separate MIs per key?
 **Current default**: Independent keys only; `MergedIndex.satisfies()` uses exact
 prefix matching.
 
-**Paper reference**: §3.2 (Hierarchical Join Keys).
+**Prior paper reference** (`main.md`): §3.2 (Hierarchical Join Keys).
 
 **Code reference**: `MergedIndex.java:174` (`satisfies()`),
 `CLAUDE.md:158-164`.
@@ -98,7 +98,7 @@ instead of two nested MIs?
 
 **Current default**: Not exploited (two nested MIs).
 
-**Paper reference**: §3.4 (Multi-Table Aggregations, FD example).
+**Prior paper reference** (`main.md`): §3.4 (Multi-Table Aggregations, FD example).
 
 **Code reference**: `CLAUDE.md:105-117` (Functional Dependencies and 3-Table Q3),
 `MergedIndex.java` TODO at `satisfies()`.
@@ -122,7 +122,7 @@ physical sequential scan of the same merged index?
 
 **Current default**: Independent costing.
 
-**Paper reference**: §6 (pre-computation spectrum implies shared maintenance).
+**Prior paper reference** (`main.md`): §6 (pre-computation spectrum implies shared maintenance).
 
 **Code reference**: `overhaul-03-10.md` Subtask 4,
 `EnumerableMergedIndexScan.java` (`computeSelfCost`).
@@ -146,7 +146,7 @@ propagation model?
 
 **Current default**: Conceptual only (no maintenance implementation).
 
-**Paper reference**: §5 (Index Maintenance).
+**Prior paper reference** (`main.md`): §5 (Index Maintenance).
 
 **Code reference**: `TRASH-option-b.md` (two-phase model, lazy propagation
 design).
@@ -169,7 +169,7 @@ avoid redundant re-sorts?
 
 **Current default**: Always ASC (`new RelFieldCollation(idx)` defaults to ASC).
 
-**Paper reference**: §3.1 (sort order in merged indexes).
+**Prior paper reference** (`main.md`): §3.1 (sort order in merged indexes).
 
 **Code reference**: `overhaul-03-10.md:17-19`,
 `MergedIndexTestUtil.java` (`injectSortsBeforeSortBasedOps`).
@@ -192,7 +192,7 @@ avoid redundant re-sorts?
 
 **Current default**: Object[] with domain tags.
 
-**Paper reference**: §3.3 (Record Structure).
+**Prior paper reference** (`main.md`): §3.3 (Record Structure).
 
 **Code reference**: `TaggedRowSchema.java`.
 
@@ -214,7 +214,7 @@ of (or alongside) base-table records?
 
 **Current default**: Base records only.
 
-**Paper reference**: §8 (Trade-offs and Limitations, last bullet).
+**Prior paper reference** (`main.md`): §8 (Trade-offs and Limitations, last bullet).
 
 **Code reference**: `EnumerableMergedIndexScan.java` (scan assembly logic).
 
