@@ -42,7 +42,10 @@ Note: `EnumerableMergedIndexScan` is just a special `TableScan` — nothing is
 "pushed down" into it. The question is whether the MI creation plan (which
 replaces the pipeline) retains or drops the filter. Index creation plans and
 materialized view plans typically delete filters by default, producing an
-unfiltered index. The filter then stays in the query plan above the scan.
+unfiltered index. Filters in the root pipeline then stay in the query plan above the scan.
+If inner pipelines drop their filters, those filters need to be moved to the
+final pipeline, provided that the filtered column is still included at that
+point.
 
 A useful heuristic may be to omit predicates whose parameters can change across
 queries (e.g., `p_name LIKE '%green%'` vs. `'%blue%'`), preserving MI
@@ -209,28 +212,6 @@ avoid redundant re-sorts?
 
 ---
 
-### 9. Storing Aggregate Views in MI
-
-**Question**: Should a merged index store pre-computed aggregate results instead
-of (or alongside) base-table records?
-
-**Alternatives**:
-- **Base records only** — the MI stores interleaved base-table records;
-  aggregation happens at query time via scan assembly. Maximum reuse across
-  queries with different aggregation functions.
-- **Aggregate views** — the MI stores materialized aggregate results. Fastest
-  query-time retrieval but narrowest reuse (one aggregate function per MI).
-- **Mixed** — base records plus cached aggregate summaries. Broadest coverage but
-  most complex maintenance.
-
-**Current default**: Base records only.
-
-**Prior paper reference** (`main.md`): §8 (Trade-offs and Limitations, last bullet).
-
-**Code reference**: `EnumerableMergedIndexScan.java` (scan assembly logic).
-
----
-
 ## Settled Decisions
 
 These are engineering choices already committed to. Included for completeness.
@@ -242,3 +223,4 @@ These are engineering choices already committed to. Included for completeness.
 | PoC path | PATH A (substitution) | PATH B (native collation reporting) deferred; substitution sufficient for paper |
 | Rule registration | Opt-in explicit (not in `ENUMERABLE_RULES`) | Avoids interfering with unrelated Calcite tests |
 | Multi-pass HEP | Separate `HepPlanner` per nesting level | Single-pass unreliable for dependent pipeline replacements |
+| Aggregate views in MI | MI stores whatever `p.sources` produces | Obsolete from prior paper (`main.md`); aggregates are just part of the pipeline, not a separate MI design choice |
