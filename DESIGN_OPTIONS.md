@@ -34,18 +34,26 @@ tables?
 
 ### 2. Filter Pushdown into Merged Indexes
 
-**Question**: Can predicates (e.g., Q9's `p_name LIKE '%green%'`) be evaluated
-during MI scan or must they stay in the query plan above the scan?
+**Question**: Should predicates (e.g., Q9's `p_name LIKE '%green%'`) be
+incorporated into MI creation/maintenance, or kept in the query plan?
+
+Note: Index creation plans and materialized view plans typically delete filters
+by default. A useful heuristic may be to omit predicates whose parameters can
+change across queries (e.g., `p_name LIKE '%green%'` vs. `'%blue%'`), preserving
+MI reusability. Predicates on stable attributes (e.g., status flags, type codes)
+may be safe to push down. Existing research on partial indexes and parameterized
+views is likely relevant here — further investigation needed.
 
 **Alternatives**:
+
 - **Query-tier only** — filters remain as `EnumerableFilter` above the MI scan.
-  Simple, correct, but scans unneeded records.
+  Simple, correct, MI is maximally reusable, but scans unneeded records.
 - **Scan-internal filtering** — the MI scan evaluates predicates per-record,
   skipping non-matching entries. Requires the scan to know the predicate and
-  the source table it applies to.
+  the source table it applies to. MI remains reusable (filter is query-time).
 - **Maintenance-time filtering** — predicates applied when building the MI,
   excluding non-matching records entirely. Fastest queries but limits MI reuse
-  (the MI becomes query-specific).
+  (the MI becomes query-specific). Only appropriate for stable predicates.
 
 **Current default**: Query-tier only (filter stays above scan).
 
