@@ -8,13 +8,13 @@ settled decisions are engineering choices already committed to.
 
 ## Open Decisions
 
-### 1. Materialization Policy for Inner Pipelines
+### 1. Materialization Policy for Pipelines
 
-**Question**: Should every inner pipeline's merged index be materialized
-(persisted), or should some be recomputed at query time from their constituent
-tables?
+**Question**: Should every pipeline's merged index be materialized
+(persisted), or should some be recomputed at query time from their preceding pipeline
 
 **Alternatives**:
+
 - **All materialized** — every MI is a physical B-tree. Fastest queries, highest
   space usage, most update overhead for deeply nested pipelines.
 - **Selective materialization** — only leaf MIs are materialized; intermediate
@@ -57,7 +57,8 @@ parameterized views is likely relevant — further investigation needed.
 
 - **Delete filter (unfiltered MI)** — the MI stores all records; the filter
   remains in the query plan above the scan. MI is maximally reusable across
-  queries with different predicates.
+  queries with different predicates. This filter needs to be moved to the final pipeline.
+  We also need to ensure that the selected column stay in that final pipeline.
 - **Retain filter (filtered MI)** — the MI only stores records matching the
   predicate. Smaller MI, but limits reuse (query-specific). Only appropriate
   for stable predicates unlikely to change.
@@ -76,6 +77,7 @@ parameterized views is likely relevant — further investigation needed.
 requiring separate MIs per key?
 
 **Alternatives**:
+
 - **Independent keys only** — each MI serves exactly one shared key. Separate MIs
   needed for `orderkey` and `custkey` even if one is functionally dependent on
   the other. Simple matching logic.
@@ -100,15 +102,7 @@ prefix matching.
 **Question**: Can FDs (e.g., `o_orderkey -> o_custkey`) allow a single 3-table MI
 instead of two nested MIs?
 
-**Alternatives**:
-- **No FD exploitation** — treat all keys as independent. Q3 with
-  CUSTOMER+ORDERS+LINEITEM requires two nested MIs (inner by `orderkey`, outer
-  by `custkey`).
-- **Manual FD assertion** — test code registers a 3-table MI and asserts the FD.
-  Demonstrates feasibility without planner integration.
-- **Planner-integrated FDs** — use Calcite's `RelMdFunctionalDependencies` /
-  `UniqueKeys` to detect FDs and automatically determine when a single MI
-  suffices.
+This is equivalent to minimizing pipeline count. For Q3, the sort on custkey can be pushed down to the sorts on orderkey, and this will require extending the lineitem rows with custkey.
 
 **Current default**: Not exploited (two nested MIs).
 
@@ -125,6 +119,7 @@ instead of two nested MIs?
 physical sequential scan of the same merged index?
 
 **Alternatives**:
+
 - **Independent costing** — each `EnumerableMergedIndexScan` is costed as a
   separate sequential scan. Overstates I/O when multiple scans share the same
   physical pass.
@@ -149,6 +144,7 @@ physical sequential scan of the same merged index?
 propagation model?
 
 **Alternatives**:
+
 - **Eager cascade** — a base-table update immediately propagates through all
   dependent MIs. Simple semantics, potentially high write amplification for
   deep nesting.
@@ -158,7 +154,7 @@ propagation model?
 - **Hybrid** — leaf MIs updated eagerly (1-to-1 cost); outer MIs updated lazily
   or on demand.
 
-**Current default**: Conceptual only (no maintenance implementation).
+**Current default**: eager all the way.
 
 **Prior paper reference** (`main.md`): §5 (Index Maintenance).
 
@@ -173,6 +169,7 @@ design).
 avoid redundant re-sorts?
 
 **Alternatives**:
+
 - **Always ASC** — simplest. Downstream operators that need DESC (e.g., Q9
   `ORDER BY o_year DESC`) require an additional sort.
 - **Direction-aware injection** — `injectSortsBeforeSortBasedOps` inspects
@@ -195,6 +192,7 @@ avoid redundant re-sorts?
 **Question**: How should interleaved records be represented in the scan operator?
 
 **Alternatives**:
+
 - **Object[] with domain tags** — Java-native, easy to debug, works with
   Calcite's `Enumerable<Object[]>` interface. Not representative of real B-tree
   storage.
