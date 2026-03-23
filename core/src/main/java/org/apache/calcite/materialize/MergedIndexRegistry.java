@@ -17,7 +17,10 @@
 package org.apache.calcite.materialize;
 
 import org.apache.calcite.plan.RelOptTable;
+import org.apache.calcite.plan.hep.HepRelVertex;
 import org.apache.calcite.rel.RelCollation;
+import org.apache.calcite.rel.RelFieldCollation;
+import org.apache.calcite.rel.RelNode;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -67,9 +70,166 @@ public final class MergedIndexRegistry {
     return Optional.empty();
   }
 
+  /**
+   * Finds a registered {@link MergedIndex} containing {@code sortInput} as one
+   * of its pipeline sources, with a boundary collation matching {@code required}.
+   *
+   * <p>Matching strategy (robust against HEP node copying):
+   * <ol>
+   *   <li><b>Identity</b> (fast path): {@code source.root == sortInput}.
+   *       Works for leaf {@code TableScan} nodes which HEP does not copy.
+   *   <li><b>Base table</b>: both the source root and sortInput are drilled
+   *       to their leaf {@code TableScan} and compared by qualified name.
+   *   <li><b>View source</b> (source has a {@code mergedIndex}): searches
+   *       the sortInput subtree for an {@code EnumerableMergedIndexScan}
+   *       referencing the same {@code MergedIndex} instance.
+   * </ol>
+   *
+   * <p>Collation is checked per-source: the source's {@code boundaryCollation}
+   * must match the Sort's collation, because field indices are relative to
+   * each source's own row type (not the MI's shared collation).
+   *
+   * @param sortInput the node directly below the Sort boundary
+   * @param required  the collation of the Sort being matched
+   * @return a match describing the merged index and source position, or empty
+   */
+  public static synchronized Optional<SourceMatch> findForSource(
+      RelNode sortInput, RelCollation required) {
+    for (MergedIndex index : INDEXES) {
+      List<Pipeline> sources = index.pipeline.sources;
+      for (int i = 0; i < sources.size(); i++) {
+        Pipeline source = sources.get(i);
+        if (!collationMatches(source.boundaryCollation, required)) {
+          continue;
+        }
+        if (sourceMatchesSortInput(source, sortInput)) {
+          return Optional.of(new SourceMatch(index, i));
+        }
+      }
+    }
+    return Optional.empty();
+  }
+
+  /**
+   * Checks whether a pipeline source structurally matches a Sort's input.
+   *
+   * <ol>
+   *   <li>Identity match (leaf TableScans survive HEP unchanged).
+   *   <li>Leaf TableScan qualified-name match (for base-table sources whose
+   *       root is a non-leaf operator like Project or Aggregate).
+   *   <li>MergedIndex identity match (for view sources after inner pipeline
+   *       Sorts have been replaced by MIScans in a prior HEP pass).
+   * </ol>
+   */
+  private static boolean sourceMatchesSortInput(Pipeline source,
+      RelNode sortInput) {
+    // Fast path: identity (works for leaf TableScans and same-planner nodes)
+    if (source.root == sortInput) {
+      return true;
+    }
+    // Base table source: compare leaf TableScan qualified names.
+    // source.root is from the original Phase 1 plan (no HepRelVertex).
+    // sortInput is from HEP (may contain HepRelVertex children).
+    if (source.mergedIndex == null) {
+      final RelOptTable sourceLeaf = MergedIndex.findLeafScan(source.root);
+      final RelOptTable inputLeaf = findLeafScanHep(sortInput);
+      if (sourceLeaf != null && inputLeaf != null) {
+        return sourceLeaf.getQualifiedName()
+            .equals(inputLeaf.getQualifiedName());
+      }
+    }
+    // View source: search sortInput subtree for a MIScan with matching MI
+    if (source.mergedIndex != null) {
+      return containsMergedIndex(sortInput, source.mergedIndex);
+    }
+    return false;
+  }
+
+  /** Unwraps a {@link HepRelVertex} to its current rel. */
+  private static RelNode unwrap(RelNode node) {
+    return node instanceof HepRelVertex
+        ? ((HepRelVertex) node).getCurrentRel() : node;
+  }
+
+  /**
+   * Like {@link MergedIndex#findLeafScan} but unwraps {@link HepRelVertex}
+   * at each level, so it works inside a HEP planner graph.
+   */
+  private static @org.checkerframework.checker.nullness.qual.Nullable
+      RelOptTable findLeafScanHep(RelNode node) {
+    final RelNode n = unwrap(node);
+    if (n instanceof
+        org.apache.calcite.adapter.enumerable.EnumerableTableScan) {
+      return ((org.apache.calcite.adapter.enumerable.EnumerableTableScan) n)
+          .getTable();
+    }
+    if (n.getInputs().size() == 1) {
+      return findLeafScanHep(n.getInputs().get(0));
+    }
+    return null;
+  }
+
+  /**
+   * Searches the subtree rooted at {@code node} for an
+   * {@code EnumerableMergedIndexScan} referencing {@code mi}.
+   * Unwraps {@link HepRelVertex} at each level.
+   */
+  private static boolean containsMergedIndex(RelNode node, MergedIndex mi) {
+    final RelNode n = unwrap(node);
+    if (n instanceof
+        org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan) {
+      if (((org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan)
+          n).mergedIndex == mi) {
+        return true;
+      }
+    }
+    for (RelNode input : n.getInputs()) {
+      if (containsMergedIndex(input, mi)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Checks whether a source's boundary collation matches the Sort's collation.
+   * Both must have the same field indices and directions (exact match, not
+   * prefix), because the Sort was derived from this source during discovery.
+   */
+  private static boolean collationMatches(RelCollation boundary,
+      RelCollation required) {
+    List<RelFieldCollation> bFields = boundary.getFieldCollations();
+    List<RelFieldCollation> rFields = required.getFieldCollations();
+    if (bFields.size() != rFields.size()) {
+      return false;
+    }
+    for (int i = 0; i < bFields.size(); i++) {
+      if (bFields.get(i).getFieldIndex() != rFields.get(i).getFieldIndex()) {
+        return false;
+      }
+      if (bFields.get(i).direction != rFields.get(i).direction) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /** Removes all registered indexes. Useful for test isolation. */
   public static synchronized void clear() {
     INDEXES.clear();
+  }
+
+  /** Result of a single-source lookup in the registry. */
+  public static class SourceMatch {
+    /** The merged index containing the source. */
+    public final MergedIndex mergedIndex;
+    /** Position of the source within the merged index's pipeline sources. */
+    public final int sourceIndex;
+
+    SourceMatch(MergedIndex mergedIndex, int sourceIndex) {
+      this.mergedIndex = mergedIndex;
+      this.sourceIndex = sourceIndex;
+    }
   }
 
   /**

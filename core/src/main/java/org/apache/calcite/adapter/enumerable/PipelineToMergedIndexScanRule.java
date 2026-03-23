@@ -18,54 +18,38 @@ package org.apache.calcite.adapter.enumerable;
 
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.MergedIndexRegistry;
+import org.apache.calcite.materialize.MergedIndexScanGroup;
 import org.apache.calcite.plan.RelOptRuleCall;
-import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelRule;
+import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepRelVertex;
 import org.apache.calcite.rel.RelCollation;
-import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelNode;
-import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.rules.TransformationRule;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.immutables.value.Value;
 
-import java.util.List;
 import java.util.Optional;
 
 /**
- * Planner rule that replaces an order-based pipeline of:
+ * Planner rule that replaces an {@link EnumerableSort} boundary node with a
+ * per-source {@link EnumerableMergedIndexScan} when a matching
+ * {@link MergedIndex} is registered in {@link MergedIndexRegistry}.
  *
- * <pre>
- *   EnumerableSort(A) ──→ EnumerableMergeJoin
- *   EnumerableSort(B) ──→/
- * </pre>
+ * <p>Under the "Transparent Per-Source MI Scans" architecture, each boundary
+ * Sort in a pipeline is replaced <b>independently</b> by a per-source MI scan
+ * returning source-native rows. Parent operators (MergeJoin, SortedAggregate)
+ * stay in the plan unchanged.
  *
- * with a single {@link EnumerableMergedIndexScan} (inner pipeline) or
- * {@link EnumerableMergedIndexJoin} wrapping a scan (outer pipeline),
- * when a matching {@link MergedIndex} is registered in
- * {@link MergedIndexRegistry}.
+ * <p>The rule matches by <b>identity</b>: the Sort's input ({@code sortInput})
+ * is literally the same {@code RelNode} object stored in
+ * {@code pipeline.sources[i].root}. This works because HEP updates
+ * {@link HepRelVertex} pointers, not the RelNode objects themselves.
  *
- * <h3>Two cases</h3>
- * <ul>
- *   <li><b>Inner pipeline</b> (both sources are base tables): rule produces a
- *       leaf {@link EnumerableMergedIndexScan}. Join assembly and aggregation
- *       happen at maintenance time (pre-stored in the outer merged index).
- *   <li><b>Outer pipeline</b> (left source is a {@link MergedIndex} view):
- *       rule produces
- *       {@code EnumerableMergedIndexJoin → EnumerableMergedIndexScan(leaf)}.
- *       The outer scan reads co-located (inner-join-result + right-table)
- *       records by the shared key; the join assembles the Cartesian product.
- * </ul>
- *
- * <h3>Accepted patterns for one join side</h3>
- * <ul>
- *   <li>{@code Sort → TableScan} — base table source
- *   <li>{@code Sort → SortedAggregate → Sort → TableScan} — aggregate is
- *       maintenance-time; treated as base table source
- *   <li>{@code Sort → EnumerableMergedIndexScan} — inner pipeline view source
- * </ul>
+ * <p>All per-source scans within the same pipeline share a
+ * {@link MergedIndexScanGroup} instance, discovered by searching the current
+ * plan tree for an existing sibling scan referencing the same MI.
  *
  * <p>Register (but do NOT add to {@code EnumerableRules.ENUMERABLE_RULES}):
  * <pre>{@code
@@ -92,138 +76,71 @@ public class PipelineToMergedIndexScanRule
         : node;
   }
 
-  @SuppressWarnings("deprecation")
+  /**
+   * Returns {@code true} if the Sort is a pipeline boundary: non-empty
+   * collation and no FETCH/OFFSET (LimitSort is not a boundary).
+   */
+  private static boolean isBoundarySort(EnumerableSort sort) {
+    return sort.fetch == null && sort.offset == null
+        && !sort.getCollation().getFieldCollations().isEmpty();
+  }
+
   @Override public void onMatch(RelOptRuleCall call) {
-    final EnumerableMergeJoin join = call.rel(0);
-    final RelNode leftNode = unwrap(join.getLeft());
-    final RelNode rightNode = unwrap(join.getRight());
-    final Object leftSource = extractSource(leftNode);
-    final Object rightSource = extractSource(rightNode);
-    if (leftSource == null || rightSource == null) {
+    final EnumerableSort sort = call.rel(0);
+    final RelCollation collation = sort.getCollation();
+    final RelNode sortInput = unwrap(sort.getInput());
+
+    // Identity match: sortInput == some pipeline source's root node.
+    final Optional<MergedIndexRegistry.SourceMatch> matchOpt =
+        MergedIndexRegistry.findForSource(sortInput, collation);
+    if (!matchOpt.isPresent()) {
       return;
     }
 
-    // Shared collation: prefer an explicit EnumerableSort; fall back to
-    // the node's trait-set collation (e.g. SortedAggregate output).
-    final RelCollation collation = extractCollation(leftNode, rightNode);
-    if (collation == null || collation.getFieldCollations().isEmpty()) {
-      return;
+    final MergedIndexRegistry.SourceMatch match = matchOpt.get();
+    final MergedIndex mi = match.mergedIndex;
+
+    // Find or create scan group: search the current plan for an existing
+    // MIScan sibling referencing the same MI. If found, reuse its group.
+    // Otherwise create a new one (this is the first Sort for this MI).
+    MergedIndexScanGroup scanGroup = findExistingScanGroup(call, mi);
+    if (scanGroup == null) {
+      scanGroup = new MergedIndexScanGroup(mi);
     }
 
-    final Optional<MergedIndex> idxOpt =
-        MergedIndexRegistry.findFor(List.of(leftSource, rightSource), collation);
-    if (!idxOpt.isPresent()) {
-      return;
-    }
-    final MergedIndex idx = idxOpt.get();
-
-    final EnumerableMergedIndexScan scan =
-        EnumerableMergedIndexScan.create(join.getCluster(), idx, join.getRowType());
-
-    if (leftSource instanceof MergedIndex) {
-      // Outer pipeline: outer scan + join assembly at query time.
-      call.transformTo(EnumerableMergedIndexJoin.create(
-          join.getCluster(), idx, JoinRelType.INNER, scan));
-    } else {
-      // Inner pipeline: leaf scan only; join assembly + agg are maintenance-time.
-      call.transformTo(scan);
-    }
+    call.transformTo(EnumerableMergedIndexScan.create(
+        sort.getCluster(), mi, match.sourceIndex, scanGroup));
   }
 
   /**
-   * Extracts the shared collation from the merge-join inputs.
-   *
-   * <p>Prefers an explicit {@link EnumerableSort}'s collation; falls back to
-   * the trait-set collation of the first input (e.g. when a
-   * {@link EnumerableSortedAggregate} directly feeds the join).
+   * Searches the current plan tree (via the HEP planner's root) for an
+   * existing {@link EnumerableMergedIndexScan} referencing {@code mi}.
+   * Returns its scanGroup if found, null otherwise.
    */
-  private static @Nullable RelCollation extractCollation(RelNode left, RelNode right) { // lwh future work: choose the most specific collation if multiple are present (both sides should be compatible but not necessarily identical)
-    if (left instanceof EnumerableSort) {
-      return ((EnumerableSort) left).getCollation();
-    }
-    if (right instanceof EnumerableSort) {
-      return ((EnumerableSort) right).getCollation();
-    }
-    // Neither input is an explicit Sort — try the trait set.
-    final List<RelCollation> collations =
-        left.getTraitSet().getTraits(RelCollationTraitDef.INSTANCE);
-    if (collations != null && !collations.isEmpty()) {
-      return collations.get(0);
-    }
-    return null;
+  private static @Nullable MergedIndexScanGroup findExistingScanGroup(
+      RelOptRuleCall call, MergedIndex mi) {
+    RelNode root = ((HepPlanner) call.getPlanner()).getRoot();
+    return searchForScanGroup(root, mi);
   }
 
   /**
-   * Extracts the source identity for one side of a {@link EnumerableMergeJoin}.
-   *
-   * <p>Accepted patterns:
-   * <ul>
-   *   <li>{@code Sort → TableScan} → returns {@link org.apache.calcite.plan.RelOptTable}
-   *   <li>{@code Sort → (Aggregate | Project | ...) → ... → TableScan} — drills through
-   *       any chain of single-input operators to the base table (operators such as aggregates
-   *       and projects are maintenance-time and do not affect source identity)
-   *   <li>{@code Sort → EnumerableMergedIndexScan} → returns
-   *       {@link MergedIndex} (inner pipeline view)
-   *   <li>{@code Sort → EnumerableMergedIndexJoin → EnumerableMergedIndexScan} → returns
-   *       {@link MergedIndex} from the underlying scan (outer pipeline view, produced after
-   *       a prior HEP pass replaced an outer pipeline)
-   *   <li>{@code SortedAggregate → ... → TableScan} — a sorted operator that is not
-   *       an explicit Sort; drills through to the base table
-   *   <li>{@code EnumerableMergedIndexScan} — direct scan (no Sort wrapper)
-   * </ul>
-   *
-   * @param node the direct input to the merge join (may be Sort, SortedAggregate, etc.)
-   * @return the source object, or {@code null} if the pattern is unrecognized
+   * Recursively searches the plan tree for an {@link EnumerableMergedIndexScan}
+   * referencing {@code mi} and returns its scan group.
    */
-  private static @Nullable Object extractSource(RelNode node) {
-    if (node instanceof EnumerableSort) {
-      final RelNode below = unwrap(((EnumerableSort) node).getInput());
-      return extractSourceBelow(below);
-    }
-    // Direct MergedIndexScan (no Sort wrapper).
-    if (node instanceof EnumerableMergedIndexScan) {
-      return ((EnumerableMergedIndexScan) node).mergedIndex;
-    }
-    // Single-input sorted operator (e.g. SortedAggregate): drill through.
-    if (node.getInputs().size() == 1) {
-      return extractSourceBelow(node);
-    }
-    return null;
-  }
-
-  /**
-   * Given a node below a Sort (or a single-input sorted operator), identifies
-   * the source as a {@link MergedIndex} or {@link RelOptTable}.
-   */
-  private static @Nullable Object extractSourceBelow(RelNode below) {
-    if (below instanceof EnumerableMergedIndexScan) {
-      return ((EnumerableMergedIndexScan) below).mergedIndex;
-    }
-    // EnumerableMergedIndexJoin → EnumerableMergedIndexScan:
-    // after an outer pipeline is replaced, its result appears as this pattern.
-    if (below instanceof EnumerableMergedIndexJoin) {
-      final RelNode scanNode = unwrap(((EnumerableMergedIndexJoin) below).getInput(0));
-      if (scanNode instanceof EnumerableMergedIndexScan) {
-        return ((EnumerableMergedIndexScan) scanNode).mergedIndex;
+  private static @Nullable MergedIndexScanGroup searchForScanGroup(
+      RelNode node, MergedIndex mi) {
+    final RelNode n = unwrap(node);
+    if (n instanceof EnumerableMergedIndexScan) {
+      EnumerableMergedIndexScan scan = (EnumerableMergedIndexScan) n;
+      if (scan.mergedIndex == mi) {
+        return scan.scanGroup;
       }
     }
-    // Drill through any chain of single-input operators (aggregate, project, filter, etc.)
-    // to reach a base-table scan. These intermediate operators are maintenance-time only.
-    return findLeafTableScan(below);
-  }
-
-  /**
-   * Drills through a chain of single-input operators (unwrapping any
-   * {@link HepRelVertex}) to find the leaf {@link EnumerableTableScan}.
-   * Returns {@code null} if the chain splits (multi-input) or has no scan.
-   */
-  private static @Nullable RelOptTable findLeafTableScan(RelNode node) {
-    final RelNode n = unwrap(node);
-    if (n instanceof EnumerableTableScan) {
-      return ((EnumerableTableScan) n).getTable();
-    }
-    if (n.getInputs().size() == 1) {
-      return findLeafTableScan(n.getInputs().get(0)); // unwrapped at next call's entry
+    for (RelNode input : n.getInputs()) {
+      MergedIndexScanGroup found = searchForScanGroup(input, mi);
+      if (found != null) {
+        return found;
+      }
     }
     return null;
   }
@@ -234,7 +151,9 @@ public class PipelineToMergedIndexScanRule
     Config DEFAULT =
         ImmutablePipelineToMergedIndexScanRule.Config.of()
             .withOperandSupplier(b0 ->
-                b0.operand(EnumerableMergeJoin.class).anyInputs());
+                b0.operand(EnumerableSort.class)
+                    .predicate(PipelineToMergedIndexScanRule::isBoundarySort)
+                    .anyInputs());
 
     @Override default PipelineToMergedIndexScanRule toRule() {
       return new PipelineToMergedIndexScanRule(this);
