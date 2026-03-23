@@ -8,8 +8,8 @@
 | `core/.../materialize/MergedIndex.java` (+ `sources` field, `of()` factory) | Done |
 | `core/.../materialize/MergedIndexRegistry.java` (`findFor(List<Object>, ...)`) | Done |
 | `core/.../adapter/enumerable/EnumerableMergedIndexScan.java`            | Done    |
-| `core/.../adapter/enumerable/EnumerableMergedIndexJoin.java` (NEW)      | Obsolete (Option B) |
-| `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java` (generalized) | Done |
+| `core/.../adapter/enumerable/EnumerableMergedIndexJoin.java`            | Deleted (per-source arch) |
+| `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java` (Sort-boundary) | Done |
 | `core/.../adapter/enumerable/EnumerableRules.java` (constant)           | Done    |
 | `core/.../adapter/enumerable/EnumerableMergedIndexDeltaScan.java` (NEW) | Obsolete (Option B) |
 | `core/.../adapter/enumerable/DeltaToMergedIndexDeltaScanRule.java` (NEW)| Obsolete (Option B) |
@@ -77,6 +77,68 @@ EnumerableSort(n_name, o_year DESC)
           MIScan(MI_outer, src=inner_view, group=G5)
           MIScan(MI_outer, src=NATION, group=G5)
 ```
+
+---
+
+## Calcite Planner Architecture: Volcano vs HEP
+
+Calcite has **two independent planner engines**. Understanding both is essential for
+this project because we use them in sequence.
+
+### Volcano (Phase 1) — Cost-Based Optimizer
+
+The classic Cascade/Volcano framework:
+- Explores equivalent plans via **rules** that fire on pattern matches
+- Maintains a **memo** of equivalent expressions grouped by properties (traits like
+  sort order, convention/physical-operator-set)
+- Multiple rules can fire on the same node, producing **alternatives**
+- The planner picks the **cheapest** plan using the cost model
+
+**In our pipeline**: Phase 1 uses Volcano to convert the logical plan (LogicalJoin,
+LogicalTableScan, etc.) to a physical plan (EnumerableMergeJoin, EnumerableSort,
+EnumerableTableScan, etc.). It chooses between hash join vs merge join, hash aggregate
+vs sorted aggregate, etc. — all based on cost.
+
+### HEP (Phase 2) — Heuristic/Deterministic Rewriter
+
+A simpler, **deterministic rewrite engine** (no cost comparison):
+- Applies rules as **unconditional rewrites** — if a rule matches, the replacement happens
+- Processes the plan in a configurable traversal order:
+  - `BOTTOM_UP`: leaves first, then ancestors (what we use — inner Sorts fire before outer)
+  - `TOP_DOWN`: root first, then descendants
+  - `DEPTH_FIRST`: avoids re-processing after each transformation
+  - `ARBITRARY`: default, efficient, order doesn't matter
+- Think of HEP as **"find-and-replace for plan trees"**
+
+**In our pipeline**: Phase 2 uses HEP to apply `PipelineToMergedIndexScanRule`. This is
+a deterministic rewrite — if a Sort's input matches a registered MI, replace it. No cost
+comparison needed (MI scan is always preferred). HEP is ideal because we want unconditional
+substitution and need control over traversal order.
+
+### What Is a "Rule"?
+
+A **rule** is a pattern-match-and-transform unit with two parts:
+1. **Operand pattern**: What plan node to match (e.g., `EnumerableSort` with no FETCH/OFFSET)
+2. **`onMatch(call)`**: Inspect the node, optionally call `call.transformTo(replacement)`
+
+In Volcano, multiple rules can fire on the same node → produces alternatives → cost picks
+winner. In HEP, rules fire and replace unconditionally.
+
+### Why BOTTOM_UP Matters for Nested Pipelines
+
+For nested pipelines (Q3-OL, Q9), inner boundary Sorts must be replaced by MIScans
+**before** outer Sorts fire. Otherwise, the outer Sort can't recognize its inner subtree
+as an MI view. `BOTTOM_UP` guarantees this ordering:
+
+```text
+Step 1: Inner Sort(orderkey) over ORDERS    → MIScan(innerMI, 0)  ← leaf, fires first
+Step 2: Inner Sort(orderkey) over LINEITEM  → MIScan(innerMI, 1)  ← leaf, fires second
+Step 3: Outer Sort(custkey) over inner result → sees MIScans → recognizes innerMI → MIScan(outerMI, 0)
+Step 4: Outer Sort(custkey) over CUSTOMER   → MIScan(outerMI, 1)
+```
+
+Previously we used **N sequential HepPlanner instances** (one per nesting level) to
+achieve this ordering. With `BOTTOM_UP`, a single HEP pass suffices.
 
 ---
 
@@ -324,34 +386,38 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 4. ~~**Test helpers extraction**~~ **DONE** (commit `cbd4908bb`)
    - `MergedIndexTestUtil` in `testkit/`.
 
-### Short Term (next session) — Transparent Per-Source MI Scans
+### Short Term (completed) — Transparent Per-Source MI Scans
 
-1. **Subtask 0 (revised): Per-source MI scan operator** (files: `EnumerableMergedIndexScan.java`, new `MergedIndexScanGroup.java`)
-   - Add `sourceIndex` field to `EnumerableMergedIndexScan` — designates which source's row type this scan produces.
-   - Create `MergedIndexScanGroup` class — shared meta object referenced by all leaf scans in one assembly subtree.
-   - `implement()`: scan MI, filter by source tag, return source-native rows.
-   - Collation: MI's shared collation remapped to source's field indices.
+1. ~~**Subtask 0 (revised): Per-source MI scan operator**~~ **DONE** (commit `84f1589a4`)
+   - `EnumerableMergedIndexScan`: added `sourceIndex`, `scanGroup`, source-native row type.
+   - New `MergedIndexScanGroup` class in `materialize/`.
+   - Old `create(cluster, mi, rowType)` kept as deprecated overload.
+   - `implement()`: stub returning empty enumerable (execution out of scope).
 
-2. **Subtask 1 (revised): PipelineToMergedIndexScanRule — Sort boundary matching** (file: `PipelineToMergedIndexScanRule.java`)
-   - Rule matches `EnumerableSort` at pipeline boundaries (current implementation should be close).
-   - Replace: `Sort(input_chain)` → `MIScan(MI, sourceIndex, scanGroup)`.
-   - Parent operators (MergeJoin, SortedAggregate, etc.) remain untouched.
+2. ~~**Subtask 1 (revised): PipelineToMergedIndexScanRule — Sort boundary matching**~~ **DONE** (commits `69911832f`, `82c5ffbec`)
+   - Rule rewritten to match `EnumerableSort` (not `EnumerableMergeJoin`).
+   - `findForSource()`: structural matching (leaf table name + mergedIndex identity),
+     per-source boundary collation, HepRelVertex-aware traversal.
+   - Incremental MI registration: one level per HEP pass (leaf-to-root).
+   - Scan groups discovered via plan tree search for sibling MIScans.
+   - `EnumerableMergedIndexJoin` deleted (parent MergeJoin stays in plan).
+   - `@Execution(SAME_THREAD)` on core tests (registry race condition fix).
 
-3. **Subtask 3: Update test expectations** (files: `PipelineToMergedIndexScanRuleTest.java`, `MergedIndexTpchPlanTest.java`)
-   - AFTER plans: MergeJoin stays, leaf scans replace Sort→TableScan.
-   - Assembly subtree validation in `MergedIndexTestUtil`.
+### Short Term (next session)
 
-### Following Sessions
-
-1. **Subtask 2: Index creation plan** (file: `Pipeline.java`)
-   - For non-root pipelines, BEFORE plan = index creation plan.
-   - Store as `physicalPlan` field on Pipeline.
+1. **Subtask 2: Index creation plan capture** (file: `Pipeline.java`, `MergedIndex.java`)
+   - After each non-root HEP pass, the subtree rooted at `pipeline.root` has
+     MIScan leaves — this IS the index creation plan.
+   - Store as `indexCreationPlan` field on MergedIndex.
+   - Extract from post-HEP plan in the multi-stage loop.
 
 2. **Subtask 4: Cost model with scan group sharing** (file: `EnumerableMergedIndexScan.java`)
    - N leaf scans sharing one physical scan: combined IO = one sequential scan, not N.
    - `MergedIndexScanGroup` enables cost sharing.
 
-3. **End-to-end test with actual row production** — Q12, Q3-OL, Q9.
+3. **Remove deprecated `create(cluster, mi, rowType)`** if no callers remain outside delta tests.
+
+4. **End-to-end test with actual row production** — Q12, Q3-OL, Q9.
 
 ### Medium Term
 
