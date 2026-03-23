@@ -150,7 +150,7 @@ propagation model?
   deep nesting.
 - **Lazy (tag-based) propagation** — updates are tagged and deferred; dependent
   MIs are refreshed on next read or at batch boundaries. Lower write
-  amplification but stale reads possible.
+  amplification but stale reads possible. Propagate when compacting LSM?
 - **Hybrid** — leaf MIs updated eagerly (1-to-1 cost); outer MIs updated lazily
   or on demand.
 
