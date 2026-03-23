@@ -88,6 +88,7 @@ Each boundary Sort in a pipeline is replaced by an `EnumerableMergedIndexScan(MI
 Original operators (MergeJoin, SortedAggregate, etc.) remain in the plan **unchanged**.
 
 **Key principles:**
+
 1. **Sort defines the substitution**, not MergeJoin. Each boundary `Sort + input chain` → `MIScan(MI, sourceIndex)`.
 2. **Shared meta object**: Multiple MI scan leaves in one assembly subtree reference a shared `MergedIndexScanGroup` representing the single physical linear scan. Plan stays a tree; shared reference makes one-scan reality explicit.
 3. **Assembly subtree stays conceptually** — identifies which leaf scans coordinate. No operator collapse. Code moves to test utils.
@@ -263,20 +264,23 @@ Open question from user: the physical MI implementation should already store rec
 in a similar tagged format (byte strings). Explore whether Calcite needs to handle
 type conversion between physical bytes and TaggedRow, or can assume TaggedRow directly.
 
-### Subtask 0 (revised): Per-Source MI Scan Operator
+### Subtask 0 (revised): Per-Source MI Scan Operator — **DONE**
 
-Rework `EnumerableMergedIndexScan`:
-- Add `sourceIndex` field — designates which source's row type this scan produces (not tagged/joined).
-- Create `MergedIndexScanGroup` class — shared meta object referenced by all leaf scans in one assembly subtree. Represents the single physical linear scan.
-- `implement()`: scan MI, filter by source tag, return **source-native rows** (not tagged rows).
-- Collation: MI's shared collation remapped to source's field indices.
+Reworked `EnumerableMergedIndexScan`:
+- Added `sourceIndex` field — designates which source's row type this scan produces (source-native, not tagged/joined).
+- Created `MergedIndexScanGroup` class — shared meta object referenced by all leaf scans in one assembly subtree. Represents the single physical linear scan.
+- `implement()`: stub returning empty enumerable. Calcite is used purely for plan generation and cost modeling; real execution happens in a separate storage system with actual B-trees/LSM-trees.
+- Collation: source's `boundaryCollation` (already in source's field indices).
+- Old `create(cluster, mi, rowType)` kept as deprecated overload for backward compat.
 
 ### Subtask 1 (revised): PipelineToMergedIndexScanRule — match Sort boundaries
 
-The current implementation should be correct in matching `EnumerableSort` at pipeline boundaries.
-- Check: is the Sort's input table part of a registered MI with this collation?
+Rewrite the rule to match individual `EnumerableSort` nodes (not `EnumerableMergeJoin`).
+- Match pattern: `EnumerableSort` whose input chain resolves to a source in a registered MI.
 - Replace: `Sort(input_chain)` → `MergedIndexScan(MI, sourceIndex, scanGroup)`
-- Parent operators (MergeJoin, SortedAggregate, etc.) remain **untouched**. All operators except the Sorts remain untouched.
+- Parent operators (MergeJoin, SortedAggregate, etc.) remain **untouched**.
+- Need to create one `MergedIndexScanGroup` per pipeline and share it across all Sort replacements in that pipeline. Consider: rule fires per-Sort, so the group must be created on first match and reused. Could attach to the `MergedIndex` or use a rule-level map.
+- The old join-matching logic and `EnumerableMergedIndexJoin` become obsolete.
 
 ### Subtask 2: Index Creation Plan
 
@@ -288,23 +292,35 @@ For non-root pipelines, the BEFORE plan IS the index creation plan.
 ### Subtask 3: Update Tests
 
 - All AFTER plan expectations change: MergeJoin stays, leaf scans replace Sort→TableScan.
-- Assembly subtree validation moves to `MergedIndexTestUtil`.
+- `PipelineToMergedIndexScanRuleTest` needs rewrite for new Sort-matching rule.
+- `MergedIndexTpchPlanTest` plan assertions update to expect MIScan leaves under existing MergeJoin/SortedAgg.
+- Remove or deprecate `EnumerableMergedIndexJoin`-related assertions.
 
 ### Subtask 4: Cost Model
 
 - N leaf scans sharing one physical scan: combined IO = one sequential scan, not N.
 - `MergedIndexScanGroup` enables cost sharing across sibling scans.
 
+### Execution Scope
+
+Calcite is a query optimization framework, not a database system. It has no storage
+engine. All `implement()` methods on MI operators are stubs returning empty enumerables.
+Real execution (B-tree scans, tagged row filtering, record assembly) happens in a
+separate storage system. Calcite's role is purely **plan generation and cost modeling**.
+
+`TaggedRowSchema` and `MergedIndex.scanData()` exist for PoC testing of row-level
+semantics in unit tests, not as production execution paths. The plan tests (Q12, Q3-OL,
+Q9) validate plan structure only.
+
 ### Suggested Implementation Order
 
 1. ~~Subtask 0 — Assembly subtree identification~~ **DONE** (moved to test utils)
 2. ~~Subtask 1 — Tagged row type~~ **DONE** (TaggedRowSchema)
-3. Subtask 0 (revised) — Per-source MI scan operator + MergedIndexScanGroup
+3. ~~Subtask 0 (revised) — Per-source MI scan operator + MergedIndexScanGroup~~ **DONE**
 4. Subtask 1 (revised) — Rule update: Sort→MIScan substitution
 5. Subtask 3 — Update test expectations
 6. Subtask 2 — Index creation plan (physicalPlan field)
 7. Subtask 4 — Cost model with scan group sharing
-8. End-to-end test with actual row production — Q12, Q3-OL, Q9
 
 ### Test infrastructure: `MergedIndexTestUtil` (commit `cbd4908bb`)
 

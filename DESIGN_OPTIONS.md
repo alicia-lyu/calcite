@@ -216,7 +216,8 @@ These are engineering choices already committed to. Included for completeness.
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Architecture | Transparent per-source MI scans (Option B) | Simpler planner integration; each source scanned independently |
+| Architecture | Transparent per-source MI scans | Each boundary Sort replaced by per-source MIScan returning source-native rows; parent operators (MergeJoin, SortedAgg) stay unchanged |
+| Execution scope | Plan generation only; no real execution in Calcite | Calcite has no storage engine; `implement()` stubs return empty enumerables. Real B-tree/LSM execution is a separate system |
 | Pipeline identification | Sort-boundary-based | More robust than join-centered; aligns with interesting ordering theory |
 | PoC path | PATH A (substitution) | PATH B (native collation reporting) deferred; substitution sufficient for paper |
 | Rule registration | Opt-in explicit (not in `ENUMERABLE_RULES`) | Avoids interfering with unrelated Calcite tests |
