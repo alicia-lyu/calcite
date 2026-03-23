@@ -17,12 +17,10 @@
 package org.apache.calcite.adapter.enumerable;
 
 import org.apache.calcite.linq4j.tree.BlockBuilder;
-import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
-import org.apache.calcite.linq4j.tree.Types;
 import org.apache.calcite.materialize.MergedIndex;
+import org.apache.calcite.materialize.MergedIndexScanGroup;
 import org.apache.calcite.materialize.Pipeline;
-import org.apache.calcite.materialize.TaggedRowSchema;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptPlanner;
@@ -33,25 +31,26 @@ import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.util.BuiltInMethod;
 
-import java.util.ArrayList;
-import java.util.List;
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
- * Physical relational operator that reads a {@link MergedIndex} —
- * a multi-table interleaved B-tree — and produces the joined (and optionally
- * aggregated) output of all participating tables in a single sequential pass.
+ * Physical relational operator that reads one source's rows from a
+ * {@link MergedIndex} — a multi-table interleaved B-tree.
  *
- * <p>This operator replaces an entire pipeline of:
- * <pre>
- *   EnumerableSort(A) ──→ EnumerableMergeJoin ──→ (EnumerableSortedAggregate)
- *   EnumerableSort(B) ──→/
- * </pre>
- * The merged index physically pre-sorts records from all tables by the shared
- * key, so no run-time sorting, merging, or aggregation is needed.
+ * <p>Under the "Transparent Per-Source MI Scans" architecture, each boundary
+ * Sort in a pipeline is replaced independently by a per-source MI scan that
+ * returns <b>source-native rows</b> (the row type of just that one source).
+ * Parent operators (MergeJoin, SortedAggregate) remain in the plan unchanged.
  *
- * <p>Cost model: {@code rowCount=ΣTᵢ, cpu=ΣTᵢ*0.1, io=ΣTᵢ} — always cheaper
- * than the sum of sort + merge-join costs for any non-trivial dataset.
+ * <p>All per-source scans within the same pipeline share a
+ * {@link MergedIndexScanGroup} instance, signifying that they share one
+ * physical I/O pass over the merged index. The co-locality benefits are
+ * handled by the buffer manager (not implemented in Calcite).
+ *
+ * <p>Cost model: source's share of total MI rows for cpu/rowCount; full MI
+ * size for I/O (the entire index is scanned, shared across siblings).
  *
  * <p>See: "Storing and Indexing Multiple Tables by Interesting Orderings",
  * Wenhui Lyu &amp; Goetz Graefe, VLDB 2026.
@@ -62,114 +61,131 @@ public class EnumerableMergedIndexScan extends AbstractRelNode
   /** The merged index that backs this scan. */
   public final MergedIndex mergedIndex;
 
-  /**
-   * The joined output row type (all fields from all participating tables
-   * concatenated, matching the row type of the pipeline being replaced).
-   */
-  private final RelDataType rowType;
+  /** Which source (0..N-1) this scan filters for. */
+  public final int sourceIndex;
 
-  /** Creates an EnumerableMergedIndexScan. Use {@link #create} instead. */
+  /** Shared physical scan reference — sibling scans share the same instance. */
+  public final MergedIndexScanGroup scanGroup;
+
+  /**
+   * Optional row type override for backward compatibility with the deprecated
+   * {@link #create(RelOptCluster, MergedIndex, RelDataType)} factory. When
+   * non-null, {@link #deriveRowType()} returns this instead of deriving from
+   * the source pipeline.
+   */
+  private final @Nullable RelDataType rowTypeOverride;
+
+  /** Creates an EnumerableMergedIndexScan. Use a {@code create} factory instead. */
   protected EnumerableMergedIndexScan(
       RelOptCluster cluster,
       RelTraitSet traitSet,
       MergedIndex mergedIndex,
-      RelDataType rowType) {
+      int sourceIndex,
+      MergedIndexScanGroup scanGroup,
+      @Nullable RelDataType rowTypeOverride) {
     super(cluster, traitSet);
     this.mergedIndex = mergedIndex;
-    this.rowType = rowType;
+    this.sourceIndex = sourceIndex;
+    this.scanGroup = scanGroup;
+    this.rowTypeOverride = rowTypeOverride;
     assert getConvention() instanceof EnumerableConvention;
   }
 
   /**
-   * Creates an {@code EnumerableMergedIndexScan}.
+   * Creates a per-source {@code EnumerableMergedIndexScan}.
    *
-   * @param cluster    query planning cluster
+   * <p>The scan returns rows matching the source pipeline's row type at
+   * {@code sourceIndex}, with collation matching the source's boundary
+   * collation.
+   *
+   * @param cluster     query planning cluster
    * @param mergedIndex the merged index to scan
-   * @param rowType    the joined output row type (from the pipeline being replaced)
+   * @param sourceIndex which source (0..N-1) this scan filters for
+   * @param scanGroup   shared physical scan reference
    */
   public static EnumerableMergedIndexScan create(
       RelOptCluster cluster,
       MergedIndex mergedIndex,
-      RelDataType rowType) {
+      int sourceIndex,
+      MergedIndexScanGroup scanGroup) {
+    Pipeline source = mergedIndex.getSources().get(sourceIndex);
+    RelCollation boundaryCollation = source.boundaryCollation;
     final RelTraitSet traitSet =
         cluster.traitSetOf(EnumerableConvention.INSTANCE)
-            .replace(mergedIndex.getCollation());
-    return new EnumerableMergedIndexScan(cluster, traitSet, mergedIndex, rowType);
+            .replace(boundaryCollation);
+    return new EnumerableMergedIndexScan(cluster, traitSet, mergedIndex,
+        sourceIndex, scanGroup, null);
+  }
+
+  /**
+   * Creates an {@code EnumerableMergedIndexScan} with explicit row type.
+   *
+   * @deprecated Use {@link #create(RelOptCluster, MergedIndex, int, MergedIndexScanGroup)}.
+   *     This overload exists for backward compatibility with existing tests and
+   *     rules that expect the old joined-row-type semantics.
+   */
+  @Deprecated
+  public static EnumerableMergedIndexScan create(
+      RelOptCluster cluster,
+      MergedIndex mergedIndex,
+      RelDataType rowType) {
+    return new EnumerableMergedIndexScan(cluster,
+        cluster.traitSetOf(EnumerableConvention.INSTANCE)
+            .replace(mergedIndex.getCollation()),
+        mergedIndex, 0, new MergedIndexScanGroup(mergedIndex), rowType);
   }
 
   @Override protected RelDataType deriveRowType() {
-    return rowType;
+    if (rowTypeOverride != null) {
+      return rowTypeOverride;
+    }
+    return mergedIndex.getSources().get(sourceIndex).root.getRowType();
   }
 
   /**
-   * Cost model: the merged index scan costs only O(ΣTᵢ) I/O and O(ΣTᵢ)
-   * CPU (record assembly), eliminating the O(N log N) sort costs.
+   * Cost model: source's share of total MI rows for cpu/rowCount; full MI
+   * size for I/O (the entire index is scanned, shared across siblings).
+   * Future work in {@link MergedIndexScanGroup} will refine cost sharing.
    */
   @Override public RelOptCost computeSelfCost(RelOptPlanner planner,
       RelMetadataQuery mq) {
-    double rc = mergedIndex.getRowCount();
-    return planner.getCostFactory().makeCost(rc, rc * 0.1, rc);
+    double totalRows = mergedIndex.getRowCount();
+    double sourceRows = totalRows / scanGroup.sourceCount;
+    return planner.getCostFactory().makeCost(sourceRows, sourceRows * 0.1,
+        totalRows);
   }
 
   @Override public double estimateRowCount(RelMetadataQuery mq) {
-    return mergedIndex.getRowCount();
+    return mergedIndex.getRowCount() / scanGroup.sourceCount;
   }
 
   @Override public RelWriter explainTerms(RelWriter pw) {
-    List<String> sourceDescriptions = new ArrayList<>();
-    for (int i = 0; i < mergedIndex.getSources().size(); i++) {
-      Pipeline child = mergedIndex.getSources().get(i);
-      RelCollation tc = child.boundaryCollation;
-      if (child.mergedIndex != null) {
-        sourceDescriptions.add("view(" + child.mergedIndex.getCollation() + ")");
-      } else {
-        RelOptTable t = MergedIndex.findLeafScan(child.root);
-        if (t != null) {
-          int keyIdx = tc.getFieldCollations().get(0).getFieldIndex();
-          String keyName = t.getRowType().getFieldList().get(keyIdx).getName();
-          sourceDescriptions.add(t.getQualifiedName() + ":" + keyName);
-        } else {
-          sourceDescriptions.add("unknown");
-        }
-      }
+    Pipeline source = mergedIndex.getSources().get(sourceIndex);
+    String srcDesc;
+    if (source.mergedIndex != null) {
+      srcDesc = "view(" + source.mergedIndex.getCollation() + ")";
+    } else {
+      RelOptTable t = MergedIndex.findLeafScan(source.root);
+      srcDesc = (t != null) ? t.getQualifiedName().toString() : "unknown";
     }
     return super.explainTerms(pw)
-        .item("tables", sourceDescriptions)
-        .item("collation", mergedIndex.getCollation());
+        .item("mi", mergedIndex.getCollation())
+        .item("source", srcDesc)
+        .item("sourceIndex", sourceIndex);
   }
 
   /**
-   * Code generation: stashes the {@link MergedIndex} instance and generates
-   * a call to {@link MergedIndex#scanData()} which returns the pre-populated
-   * tagged row stream as {@code Enumerable<Object[]>}.
-   *
-   * <p>The PhysType uses the tagged row schema (from {@link TaggedRowSchema
-   * #toRelDataType}) so that downstream operators see the correct field count.
-   * The plan-level {@code deriveRowType()} still returns the join row type for
-   * compatibility with existing plan-only tests; Assembly (Subtask 4) will
-   * reconcile the two.
+   * Stub implementation: returns an empty enumerable. Real execution happens
+   * in a separate storage system with actual B-trees/LSM-trees, not in
+   * Calcite. Calcite is used purely for plan generation and cost modeling.
    */
   @Override public Result implement(EnumerableRelImplementor implementor,
       Prefer pref) {
     final BlockBuilder builder = new BlockBuilder();
-    final TaggedRowSchema schema = mergedIndex.getTaggedRowSchema();
-    final RelDataType taggedType =
-        schema.toRelDataType(implementor.getTypeFactory());
-    final PhysType physType =
-        PhysTypeImpl.of(implementor.getTypeFactory(), taggedType,
-            JavaRowFormat.ARRAY);
-
-    // Stash the MergedIndex for runtime access (same pattern as
-    // EnumerableInterpreter stashing a RelNode).
-    final Expression miExpr =
-        implementor.stash(mergedIndex, MergedIndex.class);
-
-    // Generate: mergedIndex.scanData()
-    builder.add(
-        Expressions.return_(null,
-            Expressions.call(miExpr,
-                Types.lookupMethod(MergedIndex.class, "scanData"))));
-
+    final PhysType physType = PhysTypeImpl.of(
+        implementor.getTypeFactory(), deriveRowType(), JavaRowFormat.ARRAY);
+    builder.add(Expressions.return_(null,
+        Expressions.call(BuiltInMethod.EMPTY_ENUMERABLE.method)));
     return implementor.result(physType, builder.toBlock());
   }
 }

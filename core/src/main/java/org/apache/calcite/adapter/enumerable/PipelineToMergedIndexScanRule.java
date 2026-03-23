@@ -92,6 +92,7 @@ public class PipelineToMergedIndexScanRule
         : node;
   }
 
+  @SuppressWarnings("deprecation")
   @Override public void onMatch(RelOptRuleCall call) {
     final EnumerableMergeJoin join = call.rel(0);
     final RelNode leftNode = unwrap(join.getLeft());

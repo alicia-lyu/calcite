@@ -283,6 +283,7 @@ class MergedIndexTpchPlanTest {
    *
    * <p>Full DOT diagrams for BEFORE/AFTER are in {@code test-dot-output/q3ol_*.dot}.
    */
+  @SuppressWarnings("deprecation")
   @Test void tpchQ3OrdersLineitem() throws Exception {
     // Subquery form: aggregate lineitem by orderkey, then join ORDERS on orderkey,
     // then join CUSTOMER on custkey. The subquery forces the join order so that
