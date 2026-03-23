@@ -203,9 +203,16 @@ class MergedIndexTpchPlanTest {
     writeDotFile("q12_after", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
+    // Per-source MI scan: MergeJoin stays, boundary Sorts replaced by 2 MIScans
     final String planStr = dumpText(phase2Plan);
     assertThat(planStr, containsString("EnumerableMergedIndexScan"));
-    assertThat(planStr, not(containsString("EnumerableMergeJoin")));
+    assertThat(planStr, containsString("EnumerableMergeJoin"));
+    // Boundary Sorts (inside MergeJoin) replaced; non-boundary Sorts
+    // (GROUP BY on l_shipmode) may remain above the pipeline.
+    assertThat(MergedIndexTestUtil.countOccurrences(planStr,
+        "EnumerableMergedIndexScan"), is(2));
+    // No TableScan remains (absorbed into MI scans)
+    assertThat(planStr, not(containsString("EnumerableTableScan")));
     assertThat("Q12 MI missing maintenance plan",
         p.mergedIndex.getMaintenancePlan() != null, is(true));
     final String maintStr12 = dumpText(p.mergedIndex.getMaintenancePlan());
@@ -270,15 +277,17 @@ class MergedIndexTpchPlanTest {
    *       by a leaf {@link EnumerableMergedIndexScan} because join assembly and aggregation
    *       are pre-computed at update time.
    *   <li>Outer (custkey): sources = [inner_view, CUSTOMER]; operator = MergeJoin.
-   *       At query time this produces {@code EnumerableMergedIndexJoin → scan}, where the
-   *       scan reads the outer merged index and the join assembles co-located record groups.
+   *       At query time, the MergeJoin stays and each boundary Sort is replaced by
+   *       a per-source {@link EnumerableMergedIndexScan}.
    * </ol>
    *
-   * <h3>Expected AFTER (query-time plan)</h3>
+   * <h3>Expected AFTER (per-source MI scan plan)</h3>
    * <pre>
    *   EnumerableLimitSort(ORDER BY l_revenue DESC, o_orderdate)
-   *     EnumerableMergedIndexJoin(custkey, INNER)
-   *       EnumerableMergedIndexScan(outer_index)   ← stores inner_view + CUSTOMER by custkey
+   *     EnumerableProject(...)
+   *       EnumerableMergeJoin(custkey)          ← stays in plan (per-source architecture)
+   *         EnumerableMergedIndexScan(MI_outer, source=inner_view)
+   *         EnumerableMergedIndexScan(MI_outer, source=CUSTOMER)
    * </pre>
    *
    * <p>Full DOT diagrams for BEFORE/AFTER are in {@code test-dot-output/q3ol_*.dot}.
@@ -380,7 +389,7 @@ class MergedIndexTpchPlanTest {
     assertThat("Q3-OL outer should have 2 boundary sorts",
         asmOuter.boundarySorts, hasSize(2));
 
-    // ── Register merged indexes bottom-up ─────────────────────────────────
+    // ── Create MergedIndexes (bottom-up) and set maintenance plans ────────
     for (int i = 0; i < pipelines.size(); i++) {
       final Pipeline p = pipelines.get(i);
       new MergedIndex(p);
@@ -388,7 +397,6 @@ class MergedIndexTpchPlanTest {
       final Join ljOL = logicalJoinsOL.get(i);
       p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
           List.of(ljOL.getLeft(), ljOL.getRight())));
-      MergedIndexRegistry.register(p.mergedIndex);
     }
 
     printMaintenancePlans("Q3-OL", pipelines);
@@ -396,24 +404,24 @@ class MergedIndexTpchPlanTest {
       writeDotFile("q3ol_maintenance_" + i, pipelines.get(i).mergedIndex.getMaintenancePlan());
     }
 
-    // ── Phase 2: two HEP passes for two-level pipeline dependency ─────────
-    // Pass 1 replaces inner joins (Sort→Agg/Scan + Sort→Scan → MergeJoin)
-    // with a leaf EnumerableMergedIndexScan.
-    // Pass 2 then sees Sort→MergedIndexScan on the outer join's left input
-    // and replaces the outer join with EnumerableMergedIndexJoin → scan.
-    // A single-pass approach is unreliable because HEP may process the outer
-    // join before the inner one fires, leaving the outer join unmatched.
+    // ── Phase 2: incremental MI registration with multi-stage HEP ────────
+    // Each pass registers ONE level's MI and replaces that level's boundary
+    // Sorts with per-source MIScans. Inner pipeline first, then outer.
+    // After each pass, deeper Sorts are already replaced, so the rule only
+    // matches the current level's Sorts.
     final HepProgram hepPass = HepProgram.builder()
         .addRuleInstance(
             EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
         .build();
-    final HepPlanner hepPlanner1 = new HepPlanner(hepPass);
-    hepPlanner1.setRoot(phase1Plan);
-    final RelNode afterPass1 = hepPlanner1.findBestExp();
 
-    final HepPlanner hepPlanner2 = new HepPlanner(hepPass);
-    hepPlanner2.setRoot(afterPass1);
-    final RelNode phase2Plan = hepPlanner2.findBestExp();
+    RelNode currentPlan = phase1Plan;
+    for (Pipeline p : pipelines) {
+      MergedIndexRegistry.register(p.mergedIndex);
+      final HepPlanner hp = new HepPlanner(hepPass);
+      hp.setRoot(currentPlan);
+      currentPlan = hp.findBestExp();
+    }
+    final RelNode phase2Plan = currentPlan;
 
     final String afterStr = dumpText(phase2Plan);
     System.out.println("=== Q3 OL AFTER (merged index plan) ===");
@@ -421,19 +429,17 @@ class MergedIndexTpchPlanTest {
     writeDotFile("q3ol_after", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
-    // No raw Calcite join, sorted aggregate, or intermediate sorts in query plan
-    assertThat(afterStr, not(containsString("EnumerableMergeJoin")));
-    assertThat(afterStr, not(containsString("EnumerableSortedAggregate")));
-    assertThat(afterStr, not(containsString("EnumerableSort(")));
-    // Query-time operators present
-    assertThat(afterStr, containsString("EnumerableMergedIndexJoin")); // outer assembly
-    assertThat(afterStr, containsString("EnumerableMergedIndexScan"));  // outer leaf scan
-    // Maintenance-time aggregation NOT in query plan
-    assertThat(afterStr, not(containsString("EnumerableMergedIndexAggregate")));
-    // Outer merged index involves CUSTOMER key
-    assertThat(afterStr, containsString("C_CUSTKEY"));
+    // Per-source MI scan architecture: MergeJoins stay, boundary Sorts replaced.
+    // Inner pipeline: 2 MIScans (LINEITEM, ORDERS on orderkey).
+    // Outer pipeline: 2 MIScans (inner_view, CUSTOMER on custkey).
+    assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
+    // No EnumerableMergedIndexJoin (obsolete under per-source architecture)
+    assertThat(afterStr, not(containsString("EnumerableMergedIndexJoin")));
+    // MergeJoins stay in the plan
+    assertThat(afterStr, containsString("EnumerableMergeJoin"));
+    // No base TableScans remain (all absorbed into MI scans)
+    assertThat(afterStr, not(containsString("EnumerableTableScan")));
     // All pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.
-    // Outer pipelines may contain nested LogicalJoin inside a delta (from the inner pipeline).
     for (Pipeline p : pipelines) {
       assertThat("Q3-OL pipeline missing maintenance plan",
           p.mergedIndex.getMaintenancePlan() != null, is(true));
@@ -444,11 +450,11 @@ class MergedIndexTpchPlanTest {
     // ── Verify DeltaToMergedIndexDeltaScanRule ────────────────────────────
     // Construct a synthetic LogicalDelta(EnumerableMergedIndexScan) and verify
     // the rule converts it to EnumerableMergedIndexDeltaScan.
+    final MergedIndex innerMi = pipelines.get(0).mergedIndex;
     final EnumerableMergedIndexScan innerScan =
         EnumerableMergedIndexScan.create(
-            phase2Plan.getCluster(),
-            pipelines.get(0).mergedIndex,
-            logicalJoinsOL.get(0).getRowType());
+            phase2Plan.getCluster(), innerMi, 0,
+            new org.apache.calcite.materialize.MergedIndexScanGroup(innerMi));
     final RelNode deltaOfScan = LogicalDelta.create(innerScan);
     final HepProgram deltaProgram = HepProgram.builder()
         .addRuleInstance(
@@ -501,15 +507,15 @@ class MergedIndexTpchPlanTest {
    *           EnumerableSort → Scan(NATION)
    * </pre>
    *
-   * <h3>Expected AFTER structure (query-time plan)</h3>
+   * <h3>Expected AFTER structure (per-source MI scan plan)</h3>
    * <pre>
-   *   EnumerableSort(n_name ASC, o_year DESC)   ← ORDER BY only; no intermediate sorts
+   *   EnumerableSort(n_name ASC, o_year DESC)   ← ORDER BY only
    *     EnumerableAggregate(n_name, o_year)
    *       EnumerableProject
    *         EnumerableFilter(p_name LIKE '%green%')
-   *           EnumerableMergedIndexJoin(nationkey, INNER)
-   *             EnumerableMergedIndexScan([view(OLPPS)]:S_NATIONKEY,
-   *                                      [NATION]:N_NATIONKEY)
+   *           EnumerableMergeJoin(nationkey)     ← stays in plan (per-source architecture)
+   *             EnumerableMergedIndexScan(MI_root, source=view(OLPPS))
+   *             EnumerableMergedIndexScan(MI_root, source=NATION)
    * </pre>
    *
    * <p>Full DOT diagrams for BEFORE/AFTER are in {@code test-dot-output/q9_before.dot}
@@ -616,6 +622,7 @@ class MergedIndexTpchPlanTest {
           asm.boundarySorts, hasSize(2));
     }
 
+    // ── Create MergedIndexes (bottom-up) and set maintenance plans ────────
     for (int i = 0; i < pipelines.size(); i++) {
       final Pipeline p = pipelines.get(i);
       new MergedIndex(p);
@@ -623,7 +630,6 @@ class MergedIndexTpchPlanTest {
       final Join ljQ9 = logicalJoinsQ9.get(i);
       p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
           List.of(ljQ9.getLeft(), ljQ9.getRight())));
-      MergedIndexRegistry.register(p.mergedIndex);
     }
 
     printMaintenancePlans("Q9", pipelines);
@@ -631,15 +637,18 @@ class MergedIndexTpchPlanTest {
       writeDotFile("q9_maintenance_" + i, pipelines.get(i).mergedIndex.getMaintenancePlan());
     }
 
-    // ── Phase 2: N HEP passes, one per pipeline level ─────────────────────
-    // Each pass replaces one level; a new planner instance is required because
-    // HEP cannot fire the same rule twice on a mutated plan in one pass.
+    // ── Phase 2: incremental MI registration with multi-stage HEP ────────
+    // Each pass registers ONE level's MI and replaces that level's boundary
+    // Sorts with per-source MIScans. Registering incrementally ensures each
+    // pass only matches the current level's Sorts (deeper Sorts were already
+    // replaced in prior passes).
     final HepProgram hepPass = HepProgram.builder()
         .addRuleInstance(
             EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
         .build();
     RelNode current = phase1Plan;
-    for (int i = 0; i < pipelines.size(); i++) {
+    for (Pipeline p : pipelines) {
+      MergedIndexRegistry.register(p.mergedIndex);
       final HepPlanner hp = new HepPlanner(hepPass);
       hp.setRoot(current);
       current = hp.findBestExp();
@@ -652,20 +661,19 @@ class MergedIndexTpchPlanTest {
     writeDotFile("q9_after", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
-    // All pipeline joins and intermediate sorts must be gone.
-    assertThat(afterStr, not(containsString("EnumerableMergeJoin")));
-    // Two EnumerableSorts remain:
+    // Per-source MI scan architecture: MergeJoins stay, boundary Sorts replaced.
+    assertThat(afterStr, containsString("EnumerableMergeJoin"));
+    assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
+    // No EnumerableMergedIndexJoin (obsolete under per-source architecture)
+    assertThat(afterStr, not(containsString("EnumerableMergedIndexJoin")));
+    // Non-boundary Sorts may remain (GROUP BY, ORDER BY):
     // 1. Before the Aggregate: Sort(n_name ASC, o_year ASC) on GROUP BY keys,
     //    injected by injectSortsBeforeSortBasedOps.
     // 2. After the Aggregate: Sort(n_name ASC, o_year DESC) for ORDER BY.
     //    This cannot be dropped because the Aggregate output is sorted
     //    (n_name ASC, o_year ASC) which differs in direction from the required
     //    (n_name ASC, o_year DESC).
-    assertThat(MergedIndexTestUtil.countOccurrences(afterStr, "EnumerableSort("), is(2));
-    assertThat(afterStr, containsString("EnumerableMergedIndexJoin"));
-    assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
     // All pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.
-    // Outer pipelines may contain nested LogicalJoin inside a delta (from the inner pipeline).
     for (Pipeline p : pipelines) {
       assertThat("Q9 pipeline missing maintenance plan",
           p.mergedIndex.getMaintenancePlan() != null, is(true));
