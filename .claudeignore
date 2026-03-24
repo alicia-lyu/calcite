@@ -1,0 +1,57 @@
+# Gradle build outputs
+.gradle/
+build/
+*/build/
+
+# Test output artifacts
+*/test-dot-output/
+*/surefire-reports/
+*/test-output/
+
+# IDE files
+.idea/
+*.iml
+
+# Generated sources
+*/generated-sources/
+*/generated-test-sources/
+
+# Dependency caches and lock files
+.gradle/
+gradle/wrapper/gradle-wrapper.jar
+.m2/
+
+# Large adapter modules NOT relevant to the merged-index research
+cassandra/
+druid/
+elasticsearch/
+mongodb/
+pig/
+spark/
+geode/
+splunk/
+redis/
+kafka/
+server/
+babel/
+ubenchmark/
+
+# Archived/trash files
+TRASH/
+TRASH-option-b.md
+
+# Binary and media files
+*.class
+*.jar
+img/
+
+# Version control and OS
+.git/
+.gitignore
+.DS_Store
+
+# Temporary files
+*.swp
+*.swo
+*~
+.*.swp
