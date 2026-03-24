@@ -66,10 +66,26 @@ public class MergedIndex {
   private @Nullable List<Object[]> data;
 
   /**
-   * Incremental maintenance plan derived by applying {@code DeltaJoinTransposeRule}
-   * to this pipeline's join node. Null until set by the test/caller.
+   * Incremental maintenance plan: describes the DELTA of this pipeline's output
+   * when the underlying MI data changes.
    *
-   * <p>Future work: move to {@code Pipeline.physicalPlan}.
+   * <p>A consumer (parent MI, query) uses this plan to compute the delta of the
+   * pipeline's output. Derived by applying the standard IVM formula
+   * ({@code DeltaJoinTransposeRule}) to the pipeline's logical join:
+   *
+   * <pre>
+   *   Delta(A join B) = (DeltaA join B) UNION ALL (A join DeltaB)
+   * </pre>
+   *
+   * <p>At the leaves, {@code LogicalDelta(LogicalTableScan(T))} represents the
+   * stream of changes to base table T. For nested pipelines, this recursively
+   * expands through inner joins to all base table leaves.
+   *
+   * <p>The MI B-tree is updated trivially (insert/delete by sort key). This plan
+   * describes what happens AFTER the MI update: how the pipeline's assembled
+   * output (join, aggregate, etc.) changes for a consumer.
+   *
+   * <p>Null until set by the test/caller.
    */
   private @Nullable RelNode maintenancePlan;
 

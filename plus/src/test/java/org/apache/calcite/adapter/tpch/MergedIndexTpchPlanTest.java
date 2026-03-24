@@ -39,7 +39,10 @@ import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalUnion;
+import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.stream.LogicalDelta;
+
+import com.google.common.collect.ImmutableList;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.sql.SqlExplainFormat;
 import org.apache.calcite.sql.SqlExplainLevel;
@@ -191,8 +194,7 @@ class MergedIndexTpchPlanTest {
     // Pipeline 0: join pipeline (ORDERS ⋈ LINEITEM on orderkey)
     final Pipeline joinPipeline = pipelines.get(0);
     new MergedIndex(joinPipeline);
-    joinPipeline.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
-        List.of(logicalJoinQ12.getLeft(), logicalJoinQ12.getRight())));
+    joinPipeline.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(logicalJoinQ12));
 
     // Pipeline 1: indexed view (single-source, sorted by l_shipmode)
     final Pipeline ivPipeline = pipelines.get(1);
@@ -266,7 +268,7 @@ class MergedIndexTpchPlanTest {
         joinPipeline.mergedIndex.getMaintenancePlan() != null, is(true));
     final String maintStr12 = dumpText(joinPipeline.mergedIndex.getMaintenancePlan());
     assertThat(maintStr12, containsString("LogicalUnion"));
-    assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalJoin"), is(0));
+    assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalJoin"), is(2));
     assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalDelta"), is(2));
     // Non-root pipelines have index creation plans with MIScans, no boundary Sorts
     for (int i = 0; i < pipelines.size() - 1; i++) {
@@ -449,8 +451,7 @@ class MergedIndexTpchPlanTest {
       new MergedIndex(p);
       // Use logical join (SQL types) for IVM derivation — matches StreamRules expectations
       final Join ljOL = logicalJoinsOL.get(i);
-      p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
-          List.of(ljOL.getLeft(), ljOL.getRight())));
+      p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(ljOL));
     }
 
     printMaintenancePlans("Q3-OL", pipelines);
@@ -740,8 +741,7 @@ class MergedIndexTpchPlanTest {
       final Pipeline p = joinPipelinesQ9.get(i);
       new MergedIndex(p);
       final Join ljQ9 = logicalJoinsQ9.get(i);
-      p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
-          List.of(ljQ9.getLeft(), ljQ9.getRight())));
+      p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(ljQ9));
     }
     // Indexed views: single-source, no IVM derivation for now
     for (Pipeline iv : indexedViewsQ9) {
@@ -941,33 +941,52 @@ class MergedIndexTpchPlanTest {
   /**
    * Derives the incremental maintenance plan for a merged-index pipeline.
    *
-   * <p>A merged index stores records from each source independently, interleaved by
-   * sort key. Each source independently inserts its records at update time — no join
-   * against any other source is needed at the MI level. The maintenance plan is
-   * therefore a union of independent delta streams, one per sorted input:
+   * <p>The maintenance plan answers: "when this MI's data changes, what is the
+   * delta of this pipeline's OUTPUT?" A consumer (parent MI, query) uses this
+   * plan to incrementally update its own state.
    *
+   * <p>Applies the standard IVM join formula (equivalent to
+   * {@link StreamRules.DeltaJoinTransposeRule}) directly without going through
+   * HEP, to avoid Calcite's type-equivalence check which rejects the
+   * TPCH adapter's mix of {@code JavaType(String)} and {@code VARCHAR}:
    * <pre>
-   *   LogicalUnion(all=true)
-   *     LogicalDelta(sortedInputs.get(0))
-   *     LogicalDelta(sortedInputs.get(1))
-   *     ...
+   *   Delta(A join B) = (A join DeltaB) UNION ALL (DeltaA join B)
    * </pre>
    *
-   * <p>For nested pipelines (outer MI), the left sorted input wraps the entire inner
-   * pipeline (e.g., {@code Sort(inner_join_result)}). {@code LogicalDelta} over this
-   * node means "run the inner pipeline for changed keys and emit the assembled delta,"
-   * which is the Phase 2 propagation defined by the inner pipeline's own operators.
-   * No additional join against the right source is added here.
+   * <p>{@code LogicalDelta(input)} at the leaves represents the stream of
+   * changes to that input (base table scan or inner pipeline). For nested
+   * pipelines, the delta of an inner pipeline is the delta of the inner join's
+   * assembled output — i.e., how the assembled records change when a base table
+   * row is inserted or deleted.
    *
-   * <p>{@code sortedInputs} are the sort nodes immediately feeding the pipeline
-   * operator (join, aggregate, etc.) — the boundaries of the interesting-ordering
-   * pipeline that defines this MI.
+   * @param logicalJoin the logical join node for this pipeline (pre-Phase-1)
    */
-  private static RelNode deriveIncrementalPlan(List<RelNode> sortedInputs) {
-    final List<RelNode> branches = sortedInputs.stream()
-        .map(LogicalDelta::create)
-        .collect(Collectors.toList());
-    return LogicalUnion.create(branches, true);
+  private static RelNode deriveMaintenancePlan(RelNode logicalJoin) {
+    if (!(logicalJoin instanceof Join)) {
+      // Non-join pipeline (e.g. indexed view): delta is just the input delta
+      return LogicalDelta.create(logicalJoin);
+    }
+    final Join join = (Join) logicalJoin;
+    final RelNode left = join.getLeft();
+    final RelNode right = join.getRight();
+
+    // Branch 1: A join Delta(B)
+    final LogicalDelta rightWithDelta = LogicalDelta.create(right);
+    final LogicalJoin joinL =
+        LogicalJoin.create(left, rightWithDelta, join.getHints(),
+            join.getCondition(), join.getVariablesSet(), join.getJoinType(),
+            join.isSemiJoinDone(),
+            ImmutableList.copyOf(join.getSystemFieldList()));
+
+    // Branch 2: Delta(A) join B
+    final LogicalDelta leftWithDelta = LogicalDelta.create(left);
+    final LogicalJoin joinR =
+        LogicalJoin.create(leftWithDelta, right, join.getHints(),
+            join.getCondition(), join.getVariablesSet(), join.getJoinType(),
+            join.isSemiJoinDone(),
+            ImmutableList.copyOf(join.getSystemFieldList()));
+
+    return LogicalUnion.create(List.of(joinL, joinR), true);
   }
 
   /** Prints maintenance plans for all pipelines to stdout. */
