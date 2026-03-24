@@ -273,14 +273,37 @@ Reworked `EnumerableMergedIndexScan`:
 - Collation: source's `boundaryCollation` (already in source's field indices).
 - Old `create(cluster, mi, rowType)` kept as deprecated overload for backward compat.
 
-### Subtask 1 (revised): PipelineToMergedIndexScanRule — match Sort boundaries
+### Subtask 1 (revised): PipelineToMergedIndexScanRule — match Sort boundaries — **DONE**
 
-Rewrite the rule to match individual `EnumerableSort` nodes (not `EnumerableMergeJoin`).
-- Match pattern: `EnumerableSort` whose input chain resolves to a source in a registered MI.
+Rule rewritten to match individual `EnumerableSort` nodes (not `EnumerableMergeJoin`).
+- Operand: `EnumerableSort` with `isBoundarySort` predicate (non-empty collation, no FETCH/OFFSET).
 - Replace: `Sort(input_chain)` → `MergedIndexScan(MI, sourceIndex, scanGroup)`
 - Parent operators (MergeJoin, SortedAggregate, etc.) remain **untouched**.
-- Need to create one `MergedIndexScanGroup` per pipeline and share it across all Sort replacements in that pipeline. Consider: rule fires per-Sort, so the group must be created on first match and reused. Could attach to the `MergedIndex` or use a rule-level map.
-- The old join-matching logic and `EnumerableMergedIndexJoin` become obsolete.
+- `EnumerableMergedIndexJoin` deleted (moved to TRASH/).
+
+**Matching** (`MergedIndexRegistry.findForSource`):
+- Per-source **boundary collation** comparison (not MI-level `satisfies`), because field indices
+  are relative to each source's own row type.
+- **Structural matching** (not identity), because HEP's `addRelToGraph()` copies all non-leaf
+  nodes via `rel.copy(traitSet, newInputs)` when wrapping children in `HepRelVertex`:
+  1. Identity fast path (works for leaf `TableScan` — HEP does not copy leaves).
+  2. Leaf `TableScan` qualified-name match (for base-table sources with non-leaf roots like
+     `Project → TableScan`). Uses `findLeafScanHep` with HepRelVertex unwrapping.
+  3. `MergedIndex` identity match (for view sources after inner pipeline Sorts have been
+     replaced by MIScans in a prior HEP pass). Uses `containsMergedIndex` tree search.
+
+**Scan group sharing**: first Sort for an MI creates a new `MergedIndexScanGroup`; subsequent
+Sorts find the existing group via `searchForScanGroup` tree search on the HEP planner's root.
+
+**Multi-stage HEP** (incremental MI registration):
+- Each pass registers ONE level's MI and replaces that level's boundary Sorts.
+- Inner pipeline first, then outer. Deeper Sorts are already replaced in prior passes,
+  so each pass only matches the current level.
+- Number of passes = pipeline nesting depth (Q12: 1, Q3-OL: 2, Q9: 5).
+
+**Test parallelism fix**: `@Execution(ExecutionMode.SAME_THREAD)` on test classes using the
+static `MergedIndexRegistry` singleton. JUnit5 ForkJoinPool runs methods in parallel by default,
+causing `@AfterEach clear()` on one thread to race with `register()` + HEP on another.
 
 ### Subtask 2: Index Creation Plan
 
@@ -289,12 +312,15 @@ For non-root pipelines, the BEFORE plan IS the index creation plan.
 - Populates MI from base tables (or inner MI views).
 - Leaf pipelines have `mergedIndex = null` — their sources are actually read.
 
-### Subtask 3: Update Tests
+### Subtask 3: Update Tests — **DONE** (merged with Subtask 1)
 
-- All AFTER plan expectations change: MergeJoin stays, leaf scans replace Sort→TableScan.
-- `PipelineToMergedIndexScanRuleTest` needs rewrite for new Sort-matching rule.
-- `MergedIndexTpchPlanTest` plan assertions update to expect MIScan leaves under existing MergeJoin/SortedAgg.
-- Remove or deprecate `EnumerableMergedIndexJoin`-related assertions.
+- `pipelineReplacedByMergedIndexScan`: MergeJoin stays, 2 MIScans, no EnumerableSort.
+- `scanProducesTaggedRows` → `perSourceScanPlanStructure`: plan-structure test (execution out of scope).
+- Q12: boundary Sorts replaced, non-boundary GROUP BY Sort remains (expected).
+- Q3-OL: incremental MI registration (2 passes), all 4 boundary Sorts replaced.
+- Q9: 5 passes, all boundary Sorts replaced (unchanged — already passed).
+- DeltaScan test updated to per-source `create()` factory.
+- All `EnumerableMergedIndexJoin` assertions removed or negated.
 
 ### Subtask 4: Cost Model
 
@@ -317,8 +343,8 @@ Q9) validate plan structure only.
 1. ~~Subtask 0 — Assembly subtree identification~~ **DONE** (moved to test utils)
 2. ~~Subtask 1 — Tagged row type~~ **DONE** (TaggedRowSchema)
 3. ~~Subtask 0 (revised) — Per-source MI scan operator + MergedIndexScanGroup~~ **DONE**
-4. Subtask 1 (revised) — Rule update: Sort→MIScan substitution
-5. Subtask 3 — Update test expectations
+4. ~~Subtask 1 (revised) — Rule update: Sort→MIScan substitution~~ **DONE**
+5. ~~Subtask 3 — Update test expectations~~ **DONE** (merged with Subtask 1)
 6. Subtask 2 — Index creation plan (physicalPlan field)
 7. Subtask 4 — Cost model with scan group sharing
 
