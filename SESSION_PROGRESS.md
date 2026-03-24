@@ -225,43 +225,42 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 - "Top side" = output side (root pipeline, final result).
 - Two-pipeline test output structure added to SESSION_PROGRESS.md for Q12, Q3-OL, Q9.
 
-### Documentation Migration (2026-03-24)
+### Documentation Migration & Cost Model Refinement (2026-03-24)
 - Migrated stable reference content from SESSION_PROGRESS.md to CLAUDE.md:
   - "Calcite Planner Architecture: Volcano vs HEP" (revised with current single-pass BOTTOM_UP approach)
   - "Architecture: Sort-Boundary-Based Pipeline Replacement" (documents current operand pattern)
-  - "Flow Chart A/B/C" (planning workflow and merged index concept)
   - "Multi-stage HEP for nested pipelines" (replaced outdated two-pass section)
 - Updated Q9 plan documentation: removed redundant ORDER BY sort note; clarified indexed view scan as final step.
 - Cleaned up SESSION_PROGRESS.md to keep only ephemeral session content (status table, commands, test summaries).
-- Added detailed cost model Javadoc to `EnumerableMergedIndexScan.computeSelfCost()` and expanded
-  `MergedIndexScanGroup` class-level Javadoc explaining why the class exists and the IO sharing design decision.
-  Fixed pre-existing checkstyle violations in `MergedIndexRegistry.java` (`instanceof` line-wrap).
+- **Cost model documentation** (commit `32c4c6d03`):
+  - Expanded `EnumerableMergedIndexScan.computeSelfCost()` Javadoc explaining per-source row/cpu cost split and shared I/O cost.
+  - Expanded `MergedIndexScanGroup` class-level Javadoc explaining why the class exists and the I/O sharing design decision for future cost refinements.
+- Fixed checkstyle violations in `MergedIndexRegistry.java` (instanceof line-wrap).
 
 ## Next Steps
 
 ### [Short-term] (Next Session)
 
-1. ~~**EnumerableMergedIndexScan.java — Document cost model with scan group sharing**~~ Done.
+1. **Pipeline.java — Add `getIndexCreationPlan()` getter for explicit access**
+   Currently `mergedIndex.indexCreationPlan` must be accessed via MergedIndex reference.
+   Add convenience getter to Pipeline for direct query-time access by PipelineToMergedIndexScanRule.
 
-2. ~~**isBoundarySort() Javadoc — Add future-work note on LimitSort**~~ Done:
-   `Pipeline.java` lines 100–106 already document `EnumerableLimitSort` exclusion
-   and the future-work note for top-K indexed views.
-
-3. ~~**Cleanup: Remove stale DOT artifacts**~~ Done:
-   No `leaf-4` or `branch-1` files exist in `plus/test-dot-output/`; no stale
-   references in `MergedIndexTpchPlanTest.java`.
-
-4. **Maintenance plans for indexed views** — single-source pipelines currently skip `setMaintenancePlan`.
-   Design: single delta branch (not union of two). Reconcile with existing delta infrastructure.
+2. **MergedIndex.java — Document indexCreationPlan lifecycle across nested levels**
+   Clarify: non-root pipelines capture `root` as indexCreationPlan after HEP pass.
+   Root pipeline (query-time) does NOT capture; indexCreationPlan remains null.
+   Document exception handling for future incremental maintenance delta logic.
 
 ### [Medium-term] (Future Sessions)
 
-1. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI), Q14 (complex filters).
+1. **Maintenance plans for indexed views** — single-source pipelines currently skip `setMaintenancePlan`.
+   Design: single delta branch (not union of two). Reconcile with existing delta infrastructure.
 
-2. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
+2. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI), Q14 (complex filters).
+
+3. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
    ORDERKEY→CUSTKEY recognition; enable 3-table merged indexes without manual registration.
 
-3. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
+4. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
 
 ### [Long-term]
 
