@@ -589,28 +589,31 @@ class MergedIndexTpchPlanTest {
    *
    * <h3>Expected BEFORE structure (after sort-direction fix)</h3>
    * <pre>
-   *   EnumerableSort(n_name ASC, o_year DESC)       ← ORDER BY (boundary)
-   *     EnumerableAggregate(n_name, o_year)
-   *       EnumerableSort(n_name ASC, o_year DESC)   ← GROUP BY (boundary, direction fixed)
-   *         EnumerableProject
-   *           EnumerableFilter(p_name LIKE '%green%')
-   *             EnumerableMergeJoin(s_nationkey = n_nationkey)
-   *               EnumerableSort(s_nationkey) → ... 4 nested MergeJoins ...
-   *               EnumerableSort(s_nationkey) → Scan(NATION)
+   *   EnumerableAggregate(n_name, o_year)
+   *     EnumerableSort(n_name ASC, o_year DESC)   ← GROUP BY (boundary, direction fixed)
+   *       EnumerableProject
+   *         EnumerableFilter(p_name LIKE '%green%')
+   *           EnumerableMergeJoin(s_nationkey = n_nationkey)
+   *             EnumerableSort(s_nationkey) → ... 4 nested MergeJoins ...
+   *             EnumerableSort(s_nationkey) → Scan(NATION)
    * </pre>
+   *
+   * <p>The ORDER BY Sort is dropped by {@code propagateOrderByDirection} because
+   * after propagating {@code o_year DESC} to the GROUP BY sort, the ORDER BY
+   * becomes redundant — the Aggregate output is already in (n_name ASC, o_year DESC)
+   * order. Removing it reduces pipeline count by one.
    *
    * <h3>Expected AFTER structure (indexed view)</h3>
    * <pre>
-   *   EnumerableMergedIndexScan(ivMI)   ← single scan, entire plan collapsed
+   *   EnumerableAggregate(n_name, o_year)          ← stays in query plan
+   *     EnumerableMergedIndexScan(ivMI)             ← single scan, joins collapsed
    * </pre>
    *
    * <p>Six pipelines are discovered: 5 join pipelines (nested bottom-up) plus
-   * 1 indexed view on (n_name ASC, o_year DESC). The ORDER BY Sort is also a
-   * boundary sort that becomes a second indexed view, ultimately collapsing
-   * the entire plan to a single MIScan.
+   * 1 indexed view on (n_name ASC, o_year DESC) from the GROUP BY Sort boundary.
+   * The Aggregate remains in the query-time plan above the MIScan.
    *
-   * <p>Full DOT diagrams for BEFORE/AFTER are in {@code test-dot-output/q9_before.dot}
-   * and {@code test-dot-output/q9_after.dot}.
+   * <p>Full DOT diagrams for BEFORE/AFTER are in {@code test-dot-output/q9/}.
    */
   @Test void tpchQ9() throws Exception {
     // Use explicit JOIN ... ON ... syntax so all join conditions are equi-joins
@@ -685,8 +688,13 @@ class MergedIndexTpchPlanTest {
     final List<Join> logicalJoinsQ9 =
         MergedIndexTestUtil.findAllJoins(logicalWithSorts);
 
+    // Strip the ORDER BY collation from desired traits: propagateOrderByDirection
+    // already removed the ORDER BY Sort node, so Volcano should not require that
+    // collation on the root output. Only EnumerableConvention is needed.
     final RelTraitSet desiredTraits =
-        root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
+        root.rel.getTraitSet()
+            .replace(EnumerableConvention.INSTANCE)
+            .replace(RelCollations.EMPTY);
 
     // ── Phase 1: logical → physical pipeline ──────────────────────────────
     final RelNode phase1Plan =
@@ -799,17 +807,19 @@ class MergedIndexTpchPlanTest {
     }
 
     // ── Assert ────────────────────────────────────────────────────────────
-    // With the sort-direction fix and two indexed view pipelines:
-    // 1. The GROUP BY Sort(n_name ASC, o_year DESC) is a boundary for the
-    //    inner indexed view → replaced by MIScan (absorbs join+filter subtree).
-    // 2. The ORDER BY Sort(n_name ASC, o_year DESC) is a boundary for the
-    //    outer indexed view → replaced by MIScan (absorbs Aggregate + inner scan).
-    // The entire plan collapses to a single MIScan.
+    // With the ORDER BY sort removed (redundant after direction propagation),
+    // there is exactly 1 indexed view pipeline: the GROUP BY Sort(n_name ASC,
+    // o_year DESC) boundary is replaced by a MIScan absorbing the join+filter
+    // subtree. The Aggregate sits above the MIScan in the query-time plan.
+    // AFTER structure:
+    //   EnumerableAggregate(n_name, o_year)
+    //     EnumerableMergedIndexScan(ivMI)   ← single scan, joins collapsed
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
     assertThat(afterStr, not(containsString("EnumerableMergeJoin")));
     assertThat(afterStr, not(containsString("EnumerableMergedIndexJoin")));
     assertThat(afterStr, not(containsString("EnumerableSort")));
-    assertThat(afterStr, not(containsString("EnumerableAggregate")));
+    // Aggregate remains in the query-time plan (above the MIScan boundary)
+    assertThat(afterStr, containsString("EnumerableAggregate"));
     assertThat(MergedIndexTestUtil.countOccurrences(afterStr,
         "EnumerableMergedIndexScan"), is(1));
     // Join pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.
@@ -839,13 +849,16 @@ class MergedIndexTpchPlanTest {
    * with a Sort (GROUP BY) on the same key fields but different directions,
    * propagates the ORDER BY directions to the GROUP BY sort.
    *
-   * <p>The ORDER BY Sort is kept in the plan (Volcano needs it to satisfy the
-   * desired collation trait) but becomes a no-op at runtime since the
-   * SortedAggregate output is already sorted with the correct direction.
-   * During pipeline discovery it acts as the indexed view boundary sort.
+   * <p>The ORDER BY Sort is <em>removed</em> from the plan after direction
+   * propagation — the GROUP BY sort already produces output in the correct
+   * order, so the ORDER BY is redundant. Removing it reduces the pipeline
+   * count by one (one fewer boundary sort → one fewer indexed view pipeline).
+   * The caller must strip the collation from {@code desiredTraits} before
+   * passing to Volcano, since the root output no longer has a Sort node.
    *
    * <p>This fixes Q9: the GROUP BY sort {@code (n_name ASC, o_year ASC)}
-   * becomes {@code (n_name ASC, o_year DESC)} matching the ORDER BY.
+   * becomes {@code (n_name ASC, o_year DESC)} matching the ORDER BY, and
+   * the redundant ORDER BY sort is eliminated.
    *
    * @param node the plan root (potentially a Sort)
    * @return the plan with propagated directions, or unchanged if no match
@@ -918,8 +931,11 @@ class MergedIndexTpchPlanTest {
       final RelNode n = chain.get(i);
       result = n.copy(n.getTraitSet(), List.of(result));
     }
-    // Keep the ORDER BY Sort (Volcano needs it) but now it's a no-op
-    return orderBy.copy(orderBy.getTraitSet(), List.of(result));
+    // Drop the ORDER BY Sort: after direction propagation the GROUP BY sort
+    // already produces output in (n_name ASC, o_year DESC) order, making the
+    // ORDER BY redundant. Removing it reduces the pipeline count by one
+    // (one fewer boundary sort → one fewer indexed view pipeline).
+    return result;
   }
 
   /**
