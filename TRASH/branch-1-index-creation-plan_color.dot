@@ -1,0 +1,11 @@
+digraph {
+  rankdir=BT;
+  node [fontname="Helvetica"];
+  n0 [label="MergeJoin\nL_ORDERKEY = O_ORDERKEY", style=filled, fillcolor="#FFD700"];
+  n1 [label="SortedAggregate\ngroup: L_ORDERKEY", style=filled, fillcolor="#FFA07A"];
+  n2 [label="MergedIndexScan\nmi=[[0]]\nsource=[[TPCH, LINEITEM]]\nsourceIndex=[0]", style=filled, fillcolor="#90EE90"];
+  n2 -> n1;
+  n1 -> n0 [label="left"];
+  n3 [label="MergedIndexScan\nmi=[[0]]\nsource=[[TPCH, ORDERS]]\nsourceIndex=[1]", style=filled, fillcolor="#90EE90"];
+  n3 -> n0 [label="right"];
+}

@@ -94,11 +94,16 @@ public class Pipeline {
   }
 
   /**
-   * Returns {@code true} if {@code node} is a pipeline-separating Sort.
+   * Returns {@code true} if {@code node} is a pipeline-separating Sort boundary.
    *
-   * <p>A boundary Sort is an {@link EnumerableSort} with a non-empty
-   * collation and no FETCH/OFFSET (LimitSort carries row-count semantics
-   * and is not a pipeline boundary).
+   * <p>A boundary Sort must have a non-empty collation and no FETCH/OFFSET.
+   * {@code EnumerableLimitSort} (Sort with FETCH or OFFSET) is explicitly
+   * excluded because it carries row-count semantics, not just ordering.
+   *
+   * <p><b>Future work:</b> {@code EnumerableLimitSort} could be treated as a
+   * pipeline boundary when its sort key matches the pipeline's shared collation.
+   * This would allow ORDER BY … LIMIT queries to fully collapse into a single
+   * indexed-view scan. Excluded for now to keep pipeline semantics clean.
    */
   public static boolean isBoundarySort(RelNode node) {
     if (!(node instanceof EnumerableSort)) {

@@ -497,6 +497,9 @@ class MergedIndexTpchPlanTest {
 
     // ── Index creation plans ─────────────────────────────────────────────
     System.out.println("=== Q3-OL INDEX CREATION PLANS ===");
+    // Write index creation plans for non-root pipelines only.
+    // pipelines.get(pipelines.size()-1) is the root query pipeline — its output
+    // IS the query result, not an intermediate MI entry. No parent MI to populate.
     for (int i = 0; i < pipelines.size() - 1; i++) {
       String level = (i == 0) ? "leaf" : "branch";
       Pipeline p = pipelines.get(i);
@@ -518,8 +521,13 @@ class MergedIndexTpchPlanTest {
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
     // No EnumerableMergedIndexJoin (obsolete under per-source architecture)
     assertThat(afterStr, not(containsString("EnumerableMergedIndexJoin")));
-    // MergeJoins stay in the plan
+    // MergeJoins stay in the plan (outer custkey join + inner orderkey join)
     assertThat(afterStr, containsString("EnumerableMergeJoin"));
+    // Exactly 2 MIScans in the final plan: one per source in the outer pipeline
+    // (inner_view + CUSTOMER). The inner pipeline's MIScans are absorbed into the
+    // outer MIScan's view([0]) reference — not visible as separate nodes in the root plan.
+    assertThat("Q3-OL should have exactly 2 MIScans in the final plan",
+        MergedIndexTestUtil.countOccurrences(afterStr, "EnumerableMergedIndexScan"), is(2));
     // No base TableScans remain (all absorbed into MI scans)
     assertThat(afterStr, not(containsString("EnumerableTableScan")));
     // All pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.

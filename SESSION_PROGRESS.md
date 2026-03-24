@@ -368,7 +368,12 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 - Added `indexCreationPlan` field to `MergedIndex` with getter/setter.
 - Javadoc added: "Physical execution plan for this pipeline. Reads from this MI (via MIScans), executes pipeline operators (join, aggregate, etc.), and produces output rows that become a source in the parent pipeline."
 - Wired into Q12 multi-stage HEP loop (commit `128b1fb53`): after each HEP pass except root, `pipeline.root` captured as index creation plan.
+- Wired into Q3-OL and Q9 HEP loops (same pattern as Q12) — both already present in the code.
 - Test verification: all intermediate pipelines have non-null `indexCreationPlan` fields (except root).
+- Q3-OL root pipeline assertion added: exactly 2 `EnumerableMergedIndexScan` nodes in final plan
+  (inner pipeline MIScans absorbed into outer `view([0])` reference; not separate nodes in root plan).
+- `MergedIndexTestUtil`: no deprecated `buildPipelineTree`/`flattenPipelines` methods found; all tests
+  already use `Pipeline.buildTree()` and `pipelineTree.flatten()` directly.
 
 ### Q12, Q3-OL, Q9 Javadoc & Plan Updates
 - `tpchQ12()`: restructured to show 2-pipeline discovery (join + indexed view); affirms indexed view absorption.
@@ -385,20 +390,7 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 
 ### [Short-term] (Next Session)
 
-1. **MergedIndex.java — Implement getter for indexCreationPlan**
-   - Verify getter/setter wired and tested in Q12, Q3-OL, Q9.
-   - Extend to Q3-OL and Q9 multi-stage HEP loops (currently only Q12 captures plans).
-
-2. **MergedIndexTpchPlanTest.java — Add root pipeline execution assertions**
-   - Assert that root pipeline remains in final plan (not replaced by MIScan).
-   - Q12: verify ORDER BY Sort (l_shipmode) stays after MIScan absorbs join.
-   - Q3-OL: verify outer MergeJoin assembly operator stays (not replaced).
-
-3. **Test utilities cleanup — Verify and remove deprecated methods**
-   - Check that no production or test code calls `MergedIndexTestUtil.buildPipelineTree()`, `flattenPipelines()`.
-   - Migrate callers to `Pipeline.buildTree()` (production) and `pipelineTree.flatten()`.
-
-4. **EnumerableMergedIndexScan.java — Document cost model with scan group sharing**
+1. **EnumerableMergedIndexScan.java — Document cost model with scan group sharing**
    - Different sources in same MI are separate MIScans but share one physical scan.
    - Realistic cost model delegates to `scanGroup` instead of per-scan overhead.
    - For research purposes, add Javadoc explaining the design decision.

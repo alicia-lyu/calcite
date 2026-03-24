@@ -1,0 +1,10 @@
+digraph {
+  rankdir=BT;
+  n0 [label="EnumerableMergeJoin(condition=[=($0, $2)], joinType=[inner])"];
+  n1 [label="EnumerableSortedAggregate(group=[{0}], L_REVENUE=[SUM($1)])"];
+  n2 [label="EnumerableMergedIndexScan(mi=[[0]], source=[[TPCH, LINEITEM]], sourceIndex=[0])"];
+  n2 -> n1 [label="0"];
+  n1 -> n0 [label="0"];
+  n3 [label="EnumerableMergedIndexScan(mi=[[0]], source=[[TPCH, ORDERS]], sourceIndex=[1])"];
+  n3 -> n0 [label="1"];
+}
