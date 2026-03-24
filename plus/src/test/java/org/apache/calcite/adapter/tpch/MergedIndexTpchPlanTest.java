@@ -30,10 +30,14 @@ import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgram;
 import org.apache.calcite.rel.RelCollationTraitDef;
+import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
+import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Join;
+import org.apache.calcite.rel.core.Sort;
+import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalUnion;
 import org.apache.calcite.rel.stream.LogicalDelta;
 import org.apache.calcite.schema.SchemaPlus;
@@ -595,8 +599,12 @@ class MergedIndexTpchPlanTest {
     final SqlNode validated = planner.validate(parsed);
     final RelRoot root = planner.rel(validated);
 
-    final RelNode logicalWithSorts =
+    final RelNode injected =
         MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
+    // Propagate ORDER BY (n_name ASC, o_year DESC) direction to the
+    // pre-aggregate GROUP BY sort (n_name ASC, o_year ASC → DESC),
+    // then drop the now-redundant ORDER BY sort.
+    final RelNode logicalWithSorts = propagateOrderByDirection(injected);
 
     // Capture logical joins (post-order) for IVM — same order as findAllPipelines.
     final List<Join> logicalJoinsQ9 =
@@ -687,14 +695,17 @@ class MergedIndexTpchPlanTest {
     writeDotFile("q9_after", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
-    // With the indexed view, the pre-aggregate Sort(n_name, o_year) is replaced
-    // by a single MIScan that absorbs the entire join+filter+project subtree.
-    // The ORDER BY Sort(n_name ASC, o_year DESC) remains above the Aggregate.
+    // With the sort-direction fix and two indexed view pipelines:
+    // 1. The GROUP BY Sort(n_name ASC, o_year DESC) is a boundary for the
+    //    inner indexed view → replaced by MIScan (absorbs join+filter subtree).
+    // 2. The ORDER BY Sort(n_name ASC, o_year DESC) is a boundary for the
+    //    outer indexed view → replaced by MIScan (absorbs Aggregate + inner scan).
+    // The entire plan collapses to a single MIScan.
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
-    // MergeJoins absorbed into indexed view scan
     assertThat(afterStr, not(containsString("EnumerableMergeJoin")));
     assertThat(afterStr, not(containsString("EnumerableMergedIndexJoin")));
-    // Single indexed view MIScan
+    assertThat(afterStr, not(containsString("EnumerableSort")));
+    assertThat(afterStr, not(containsString("EnumerableAggregate")));
     assertThat(MergedIndexTestUtil.countOccurrences(afterStr,
         "EnumerableMergedIndexScan"), is(1));
     // Join pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.
@@ -707,6 +718,94 @@ class MergedIndexTpchPlanTest {
   }
 
   // ── IVM helpers ──────────────────────────────────────────────────────────
+
+  /**
+   * If the root is a Sort (ORDER BY) whose input chain contains an Aggregate
+   * with a Sort (GROUP BY) on the same key fields but different directions,
+   * propagates the ORDER BY directions to the GROUP BY sort.
+   *
+   * <p>The ORDER BY Sort is kept in the plan (Volcano needs it to satisfy the
+   * desired collation trait) but becomes a no-op at runtime since the
+   * SortedAggregate output is already sorted with the correct direction.
+   * During pipeline discovery it acts as the indexed view boundary sort.
+   *
+   * <p>This fixes Q9: the GROUP BY sort {@code (n_name ASC, o_year ASC)}
+   * becomes {@code (n_name ASC, o_year DESC)} matching the ORDER BY.
+   *
+   * @param node the plan root (potentially a Sort)
+   * @return the plan with propagated directions, or unchanged if no match
+   */
+  private static RelNode propagateOrderByDirection(RelNode node) {
+    if (!(node instanceof Sort)) {
+      return node;
+    }
+    final Sort orderBy = (Sort) node;
+    if (orderBy.fetch != null || orderBy.offset != null) {
+      return node;
+    }
+
+    // Drill through single-input operators to find the Aggregate
+    RelNode cur = orderBy.getInput();
+    final List<RelNode> chain = new ArrayList<>();
+    while (cur != null && !(cur instanceof Aggregate)
+        && cur.getInputs().size() == 1) {
+      chain.add(cur);
+      cur = cur.getInputs().get(0);
+    }
+    if (!(cur instanceof Aggregate)) {
+      return node;
+    }
+
+    final Aggregate agg = (Aggregate) cur;
+    final RelNode aggInput = agg.getInput();
+    if (!(aggInput instanceof Sort)) {
+      return node;
+    }
+
+    final Sort groupBy = (Sort) aggInput;
+    final List<RelFieldCollation> obFields =
+        orderBy.getCollation().getFieldCollations();
+    final List<RelFieldCollation> gbFields =
+        groupBy.getCollation().getFieldCollations();
+    if (obFields.size() != gbFields.size()) {
+      return node;
+    }
+
+    // Check same key fields and whether directions differ
+    boolean sameKeys = true;
+    boolean sameDirections = true;
+    for (int i = 0; i < obFields.size(); i++) {
+      if (obFields.get(i).getFieldIndex() != gbFields.get(i).getFieldIndex()) {
+        sameKeys = false;
+        break;
+      }
+      if (obFields.get(i).getDirection() != gbFields.get(i).getDirection()) {
+        sameDirections = false;
+      }
+    }
+    if (!sameKeys || sameDirections) {
+      return node; // fields don't match, or directions already match
+    }
+
+    // Build new GROUP BY collation with ORDER BY directions
+    final List<RelFieldCollation> newGbFields = new ArrayList<>();
+    for (int i = 0; i < gbFields.size(); i++) {
+      newGbFields.add(new RelFieldCollation(
+          gbFields.get(i).getFieldIndex(),
+          obFields.get(i).getDirection()));
+    }
+    final RelNode newGroupBy = LogicalSort.create(
+        groupBy.getInput(), RelCollations.of(newGbFields), null, null);
+    RelNode result = agg.copy(agg.getTraitSet(), List.of(newGroupBy));
+
+    // Rebuild intermediate nodes (between ORDER BY and Aggregate)
+    for (int i = chain.size() - 1; i >= 0; i--) {
+      final RelNode n = chain.get(i);
+      result = n.copy(n.getTraitSet(), List.of(result));
+    }
+    // Keep the ORDER BY Sort (Volcano needs it) but now it's a no-op
+    return orderBy.copy(orderBy.getTraitSet(), List.of(result));
+  }
 
   /**
    * Derives the incremental maintenance plan for a merged-index pipeline.
