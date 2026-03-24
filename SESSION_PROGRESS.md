@@ -384,37 +384,41 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 
 ### [Short-term] (Next Session)
 
-1. **MergedIndex.java — Wire indexCreationPlan into multi-stage loop**
-   - In `MergedIndexTpchPlanTest`, after each HEP pass, capture the post-transformation plan as the index creation plan.
-   - For non-root pipeline `p`: `p.mergedIndex.setIndexCreationPlan(rootSubtreeAfterPass)`.
+1. **MergedIndex.java — Capture indexCreationPlan in multi-stage HEP loop**
+   - Wire `indexCreationPlan` field into `MergedIndexTpchPlanTest` multi-stage loop.
+   - After each HEP pass (except root), capture `pipeline.root` as the index creation plan via setter.
 
 2. **EnumerableMergedIndexScan.java — Implement cost model with scan group sharing**
-   - N leaf scans sharing one `MergedIndexScanGroup`: combined IO cost = one sequential scan, not N.
-   - Cost formula: `rowCount=ΣTᵢ, cpu=ΣTᵢ*0.1, io=ΣTᵢ` (same as current stub).
+   - Update `computeSelfCost()` to account for shared `MergedIndexScanGroup`: N scans → O(1) IO cost.
+   - Cost formula remains `rowCount=ΣTᵢ, cpu=ΣTᵢ*0.1, io=ΣTᵢ`; ensure group sharing prevents N×IO.
 
-3. **Q12, Q3-OL, Q9 tests — Verify root query plan execution path**
+3. **MergedIndexTpchPlanTest.java — Add root pipeline execution assertions**
    - Assert that root pipeline remains in final plan (not replaced by MIScan).
-   - Verify outer MergeJoin stays for Q3-OL root query plan.
+   - Q12: verify ORDER BY Sort (l_shipmode) stays after MIScan absorbs join.
+   - Q3-OL: verify outer MergeJoin assembly operator stays (not replaced).
 
-4. **Clean up test utilities**
-   - Verify no test code calls deprecated `MergedIndexTestUtil.buildPipelineTree()`, `flattenPipelines()`.
-   - Remove if unused.
-
-5. **Add `.claudignore` file** to reduce Gradle build cache scanning.
+4. **Test utilities cleanup — Verify and remove deprecated methods**
+   - Check that no production or test code calls `MergedIndexTestUtil.buildPipelineTree()`, `flattenPipelines()`.
+   - Migrate callers to `Pipeline.buildTree()` (production) and `pipelineTree.flatten()`.
 
 ### [Medium-term] (Future Sessions)
 
-1. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI).
+1. **Sort direction alignment** — `injectSortsBeforeSortBasedOps` should honor downstream direction
+   requirements (e.g., `ORDER BY o_year DESC`); avoid redundant re-sorts.
 
-2. **Maintenance plans for indexed views** — single-source pipelines currently skip `setMaintenancePlan`.
+2. **Window functions and DISTINCT** — extend sort injection to handle `OVER`, `INTERSECT`, `EXCEPT`.
+
+3. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI), Q14 (complex filters).
+
+4. **Maintenance plans for indexed views** — single-source pipelines currently skip `setMaintenancePlan`.
    Design: single delta branch (not union of two). Reconcile with existing delta infrastructure.
 
-3. **PATH B: Native merged index support** — tables report collation via `getStatistic()`;
+5. **PATH B: Native merged index support** — tables report collation via `getStatistic()`;
    rule matches bare `EnumerableTableScan` with collation traits (no explicit Sorts).
 
-4. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
-   ORDERKEY→CUSTKEY recognition; enable 3-table merged indexes without manual index registration.
+6. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
+   ORDERKEY→CUSTKEY recognition; enable 3-table merged indexes without manual registration.
 
-5. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
+7. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
 
-6. **End-to-end execution** — real sequential B-tree scan; LeanStore or in-memory storage integration.
+8. **End-to-end execution** — real sequential B-tree scan; LeanStore or in-memory storage integration.

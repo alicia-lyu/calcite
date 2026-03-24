@@ -373,6 +373,23 @@ WHERE) so that `splitJoinCondition` can extract equi-join keys from each join no
 applying `PipelineToMergedIndexScanRule` to an already-physical plan. Volcano cannot
 build a complete optimal plan from a single transformation rule.
 
+### Future work: Sort-based operator enhancements
+
+Current `injectSortsBeforeSortBasedOps` always creates ASC sorts. Future improvements:
+
+- **Sort direction alignment**: Sort-based operators (merge join, sorted aggregation,
+  DISTINCT) don't inherently require a direction. When a later operator specifies
+  direction requirements (e.g., `ORDER BY o_year DESC`), proactively use that
+  direction in the injected sort to avoid redundant re-sorts.
+- **Window functions** (`OVER`): require sorting on PARTITION BY + ORDER BY keys.
+  Need to generalize `injectSortsBeforeSortBasedOps` to recognize window operators
+  and inject multi-key sorts on partition + order columns.
+- **DISTINCT / set operators** (INTERSECT, EXCEPT): sort-based implementations need
+  a sort on all output columns. Current helper only handles equi-join keys.
+- **Merge-sort joins with non-equi conditions**: currently skipped due to cross-join
+  guard. Some could benefit from partial key injection if the non-equi condition is
+  independent of the equi key.
+
 ## Style of coding and documentation
 
 - Prepend `[MergedIndex]` to all commit messages.
