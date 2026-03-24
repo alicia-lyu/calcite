@@ -30,10 +30,14 @@ import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgram;
 import org.apache.calcite.rel.RelCollationTraitDef;
+import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
+import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Join;
+import org.apache.calcite.rel.core.Sort;
+import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalUnion;
 import org.apache.calcite.rel.stream.LogicalDelta;
 import org.apache.calcite.schema.SchemaPlus;
@@ -97,14 +101,19 @@ class MergedIndexTpchPlanTest {
   /**
    * TPC-H Q12 (no date filter): ORDERS ⋈ LINEITEM on orderkey.
    *
-   * <p>Demonstrates <em>full</em> 2-table pipeline substitution: the entire
-   * Sort(ORDERS) ⋈ Sort(LINEITEM) pipeline collapses into one scan.
+   * <p>Two pipelines are discovered:
+   * <ol>
+   *   <li>Join pipeline (orderkey): ORDERS ⋈ LINEITEM — merged index
+   *   <li>Indexed view (l_shipmode): single-source pipeline above the join,
+   *       sorted by the GROUP BY key. The boundary Sort(l_shipmode) is replaced
+   *       by a MIScan that absorbs the MergeJoin.
+   * </ol>
    *
    * <p>Expected AFTER structure:
    * <pre>
-   *   (Sort / Aggregate ...)
-   *     EnumerableMergedIndexScan([TPCH, ORDERS]:O_ORDERKEY,
-   *                               [TPCH, LINEITEM]:L_ORDERKEY)
+   *   EnumerableSort(l_shipmode)                  — ORDER BY (no-op)
+   *     EnumerableSortedAggregate(l_shipmode)
+   *       EnumerableMergedIndexScan(ivMI)          — indexed view scan
    * </pre>
    */
   @Test void tpchQ12() throws Exception {
@@ -163,11 +172,10 @@ class MergedIndexTpchPlanTest {
     writeDotFile("q12/before-pipeline", phase1Plan);
 
     // ── Discover pipelines and register merged index ──────────────────────
-    final Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
-    final List<Pipeline> pipelines = MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
-        .filter(p -> p.sources.size() >= 2)
-        .collect(Collectors.toList());
-    assertThat("Expected 1 join pipeline for Q12", pipelines.size(), is(1));
+    final Pipeline pipelineTree = Pipeline.buildTree(phase1Plan);
+    final List<Pipeline> pipelines = pipelineTree.flatten();
+    assertThat("Expected 2 pipelines for Q12 (1 join + 1 indexed view)",
+        pipelines.size(), is(2));
 
     // ── Verify assembly subtree ───────────────────────────────────────────
     final Pipeline.AssemblySubtree asmQ12 = pipelines.get(0).findAssemblySubtree();
@@ -179,51 +187,66 @@ class MergedIndexTpchPlanTest {
     assertThat("Q12 should have 2 boundary sorts",
         asmQ12.boundarySorts, hasSize(2));
 
-    final Pipeline p = pipelines.get(0);
-    new MergedIndex(p);
-    p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
+    // ── Create MergedIndexes (bottom-up) and set maintenance plans ────────
+    // Pipeline 0: join pipeline (ORDERS ⋈ LINEITEM on orderkey)
+    final Pipeline joinPipeline = pipelines.get(0);
+    new MergedIndex(joinPipeline);
+    joinPipeline.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
         List.of(logicalJoinQ12.getLeft(), logicalJoinQ12.getRight())));
-    MergedIndexRegistry.register(p.mergedIndex);
+
+    // Pipeline 1: indexed view (single-source, sorted by l_shipmode)
+    final Pipeline ivPipeline = pipelines.get(1);
+    new MergedIndex(ivPipeline);
 
     System.out.println("=== Q12 MAINTENANCE PLAN (incremental) ===");
-    System.out.println(dumpText(p.mergedIndex.getMaintenancePlan()));
-    writeDotFile("q12/maintenance", p.mergedIndex.getMaintenancePlan());
+    System.out.println(dumpText(joinPipeline.mergedIndex.getMaintenancePlan()));
+    writeDotFile("q12/maintenance", joinPipeline.mergedIndex.getMaintenancePlan());
 
-    // ── Phase 2: HEP planner fires PipelineToMergedIndexScanRule ──────────
+    // ── Phase 2: incremental MI registration with multi-stage HEP ────────
+    // Pass 1: replace join pipeline boundary Sorts (orderkey) with MIScans.
+    // Pass 2: replace indexed view boundary Sort (l_shipmode) with MIScan,
+    //         absorbing the MergeJoin and join MIScans into a single scan.
     final HepProgram hepProgram = HepProgram.builder()
         .addRuleInstance(
             EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
         .build();
-    final HepPlanner hepPlanner = new HepPlanner(hepProgram);
-    hepPlanner.setRoot(phase1Plan);
-    final RelNode phase2Plan = hepPlanner.findBestExp();
+    RelNode currentPlan = phase1Plan;
+    for (Pipeline p : pipelines) {
+      MergedIndexRegistry.register(p.mergedIndex);
+      final HepPlanner hp = new HepPlanner(hepProgram);
+      hp.setRoot(currentPlan);
+      currentPlan = hp.findBestExp();
+    }
+    final RelNode phase2Plan = currentPlan;
 
     System.out.println("=== Q12 AFTER (merged index plan) ===");
     System.out.println(dumpText(phase2Plan));
     writeDotFile("q12/root-pipeline-query-plan", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
-    // Per-source MI scan: MergeJoin stays, boundary Sorts replaced by 2 MIScans
+    // After indexed view replacement: the Sort(l_shipmode) above MergeJoin
+    // is replaced by a single MIScan. The MergeJoin and its join MIScans
+    // are absorbed — only the indexed view MIScan remains.
     final String planStr = dumpText(phase2Plan);
     assertThat(planStr, containsString("EnumerableMergedIndexScan"));
-    assertThat(planStr, containsString("EnumerableMergeJoin"));
-    // Boundary Sorts (inside MergeJoin) replaced; non-boundary Sorts
-    // (GROUP BY on l_shipmode) may remain above the pipeline.
+    // MergeJoin absorbed into indexed view scan
+    assertThat(planStr, not(containsString("EnumerableMergeJoin")));
+    // Single indexed view MIScan replaces the entire join + sort pipeline
     assertThat(MergedIndexTestUtil.countOccurrences(planStr,
-        "EnumerableMergedIndexScan"), is(2));
+        "EnumerableMergedIndexScan"), is(1));
     // No TableScan remains (absorbed into MI scans)
     assertThat(planStr, not(containsString("EnumerableTableScan")));
-    assertThat("Q12 MI missing maintenance plan",
-        p.mergedIndex.getMaintenancePlan() != null, is(true));
-    final String maintStr12 = dumpText(p.mergedIndex.getMaintenancePlan());
+    // Join pipeline has maintenance plan with 2 delta branches
+    assertThat("Q12 join MI missing maintenance plan",
+        joinPipeline.mergedIndex.getMaintenancePlan() != null, is(true));
+    final String maintStr12 = dumpText(joinPipeline.mergedIndex.getMaintenancePlan());
     assertThat(maintStr12, containsString("LogicalUnion"));
-    // Each source inserts independently — no join needed in the maintenance plan.
     assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalJoin"), is(0));
     assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalDelta"), is(2));
 
     // ── TaggedRowSchema for Q12 (ORDERS ⋈ LINEITEM on orderkey) ──────────
     // Verify byte-width metadata for cost estimation and slot counts.
-    final TaggedRowSchema schema = p.mergedIndex.getTaggedRowSchema();
+    final TaggedRowSchema schema = joinPipeline.mergedIndex.getTaggedRowSchema();
     assertThat("Q12 keyFieldCount", schema.keyFieldCount, is(1));
     assertThat("Q12 sourceCount", schema.sourceCount, is(2));
     assertThat("Q12 domainCount", schema.domainCount, is(2));
@@ -354,11 +377,9 @@ class MergedIndexTpchPlanTest {
     // buildPipelineTree walks top-down, cutting at Sort boundaries.
     // flattenPipelines returns non-trivial pipelines in post-order
     // (inner first) so inner pipeline is registered before outer.
-    final Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
-    final List<Pipeline> pipelines = MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
-        .filter(p -> p.sources.size() >= 2)
-        .collect(Collectors.toList());
-    assertThat("Expected 2 join pipelines (inner orderkey + outer custkey)",
+    final Pipeline pipelineTree = Pipeline.buildTree(phase1Plan);
+    final List<Pipeline> pipelines = pipelineTree.flatten();
+    assertThat("Expected 2 pipelines (inner orderkey + outer custkey)",
         pipelines.size(), is(2));
 
     // ── Verify assembly subtrees ──────────────────────────────────────────
@@ -525,38 +546,27 @@ class MergedIndexTpchPlanTest {
    * {@code EnumerableFilter(p_name LIKE '%green%')} remains in the query-time plan
    * because the PART filter cannot be pushed below the assembled join result.
    *
-   * <h3>Expected BEFORE structure (order-based pipeline)</h3>
+   * <h3>Expected BEFORE structure (after sort-direction fix)</h3>
    * <pre>
-   *   EnumerableSort(n_name ASC, o_year DESC)
+   *   EnumerableSort(n_name ASC, o_year DESC)       ← ORDER BY (boundary)
    *     EnumerableAggregate(n_name, o_year)
-   *       EnumerableFilter(p_name LIKE '%green%')
-   *         EnumerableMergeJoin(s_nationkey = n_nationkey)
-   *           EnumerableSort(s_nationkey)
-   *             EnumerableMergeJoin(l_suppkey = s_suppkey)
-   *               EnumerableSort(l_suppkey)
-   *                 EnumerableMergeJoin(l_partkey, l_suppkey = ps_partkey, ps_suppkey)
-   *                   EnumerableSort(l_partkey, l_suppkey)
-   *                     EnumerableMergeJoin(l_partkey = p_partkey)
-   *                       EnumerableSort(l_partkey)
-   *                         EnumerableMergeJoin(o_orderkey = l_orderkey)
-   *                           EnumerableSort → Scan(ORDERS)
-   *                           EnumerableSort → Scan(LINEITEM)
-   *                       EnumerableSort → Scan(PART)
-   *                   EnumerableSort → Scan(PARTSUPP)
-   *               EnumerableSort → Scan(SUPPLIER)
-   *           EnumerableSort → Scan(NATION)
+   *       EnumerableSort(n_name ASC, o_year DESC)   ← GROUP BY (boundary, direction fixed)
+   *         EnumerableProject
+   *           EnumerableFilter(p_name LIKE '%green%')
+   *             EnumerableMergeJoin(s_nationkey = n_nationkey)
+   *               EnumerableSort(s_nationkey) → ... 4 nested MergeJoins ...
+   *               EnumerableSort(s_nationkey) → Scan(NATION)
    * </pre>
    *
-   * <h3>Expected AFTER structure (per-source MI scan plan)</h3>
+   * <h3>Expected AFTER structure (indexed view)</h3>
    * <pre>
-   *   EnumerableSort(n_name ASC, o_year DESC)   ← ORDER BY only
-   *     EnumerableAggregate(n_name, o_year)
-   *       EnumerableProject
-   *         EnumerableFilter(p_name LIKE '%green%')
-   *           EnumerableMergeJoin(nationkey)     ← stays in plan (per-source architecture)
-   *             EnumerableMergedIndexScan(MI_root, source=view(OLPPS))
-   *             EnumerableMergedIndexScan(MI_root, source=NATION)
+   *   EnumerableMergedIndexScan(ivMI)   ← single scan, entire plan collapsed
    * </pre>
+   *
+   * <p>Six pipelines are discovered: 5 join pipelines (nested bottom-up) plus
+   * 1 indexed view on (n_name ASC, o_year DESC). The ORDER BY Sort is also a
+   * boundary sort that becomes a second indexed view, ultimately collapsing
+   * the entire plan to a single MIScan.
    *
    * <p>Full DOT diagrams for BEFORE/AFTER are in {@code test-dot-output/q9_before.dot}
    * and {@code test-dot-output/q9_after.dot}.
@@ -623,8 +633,12 @@ class MergedIndexTpchPlanTest {
     final SqlNode validated = planner.validate(parsed);
     final RelRoot root = planner.rel(validated);
 
-    final RelNode logicalWithSorts =
+    final RelNode injected =
         MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
+    // Propagate ORDER BY (n_name ASC, o_year DESC) direction to the
+    // pre-aggregate GROUP BY sort (n_name ASC, o_year ASC → DESC),
+    // then drop the now-redundant ORDER BY sort.
+    final RelNode logicalWithSorts = propagateOrderByDirection(injected);
 
     // Capture logical joins (post-order) for IVM — same order as findAllPipelines.
     final List<Join> logicalJoinsQ9 =
@@ -643,15 +657,24 @@ class MergedIndexTpchPlanTest {
     writeDotFile("q9/before-pipeline", phase1Plan);
 
     // Discover all 5 join pipelines bottom-up (inner first) and register nested MergedIndexes.
-    final Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
-    final List<Pipeline> pipelines = MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
+    final Pipeline pipelineTree = Pipeline.buildTree(phase1Plan);
+    final List<Pipeline> pipelines = pipelineTree.flatten();
+    assertThat("Expected 6 pipelines for Q9 (5 join + 1 indexed view)",
+        pipelines.size(), is(6));
+
+    // Separate join pipelines (>= 2 sources) from indexed views (1 source)
+    final List<Pipeline> joinPipelinesQ9 = pipelines.stream()
         .filter(p -> p.sources.size() >= 2)
         .collect(Collectors.toList());
-    assertThat("Expected 5 join pipelines for Q9", pipelines.size(), is(5));
+    final List<Pipeline> indexedViewsQ9 = pipelines.stream()
+        .filter(p -> p.sources.size() == 1)
+        .collect(Collectors.toList());
+    assertThat("Expected 5 join pipelines", joinPipelinesQ9.size(), is(5));
+    assertThat("Expected 1 indexed view", indexedViewsQ9.size(), is(1));
 
-    // ── Verify assembly subtrees ──────────────────────────────────────────
-    for (int i = 0; i < pipelines.size(); i++) {
-      final Pipeline.AssemblySubtree asm = pipelines.get(i).findAssemblySubtree();
+    // ── Verify assembly subtrees (join pipelines only) ────────────────────
+    for (int i = 0; i < joinPipelinesQ9.size(); i++) {
+      final Pipeline.AssemblySubtree asm = joinPipelinesQ9.get(i).findAssemblySubtree();
       assertThat("Q9 pipeline " + i + " assembly subtree should exist",
           asm != null, is(true));
       assertThat("Q9 pipeline " + i + " LCA should be MergeJoin",
@@ -663,18 +686,23 @@ class MergedIndexTpchPlanTest {
     }
 
     // ── Create MergedIndexes (bottom-up) and set maintenance plans ────────
-    for (int i = 0; i < pipelines.size(); i++) {
-      final Pipeline p = pipelines.get(i);
+    // Join pipelines: 2 delta branches each (one per source)
+    for (int i = 0; i < joinPipelinesQ9.size(); i++) {
+      final Pipeline p = joinPipelinesQ9.get(i);
       new MergedIndex(p);
-      // Use logical join (SQL types) for IVM derivation — matches StreamRules expectations
       final Join ljQ9 = logicalJoinsQ9.get(i);
       p.mergedIndex.setMaintenancePlan(deriveIncrementalPlan(
           List.of(ljQ9.getLeft(), ljQ9.getRight())));
     }
+    // Indexed views: single-source, no IVM derivation for now
+    for (Pipeline iv : indexedViewsQ9) {
+      new MergedIndex(iv);
+    }
 
-    printMaintenancePlans("Q9", pipelines);
-    for (int i = 0; i < pipelines.size(); i++) {
-      writeDotFile("q9/maintenance-" + i, pipelines.get(i).mergedIndex.getMaintenancePlan());
+    printMaintenancePlans("Q9", joinPipelinesQ9);
+    for (int i = 0; i < joinPipelinesQ9.size(); i++) {
+      writeDotFile("q9/maintenance-" + i,
+          joinPipelinesQ9.get(i).mergedIndex.getMaintenancePlan());
     }
 
     // ── Phase 2: incremental MI registration with multi-stage HEP ────────
@@ -730,22 +758,29 @@ class MergedIndexTpchPlanTest {
     }
 
     // ── Assert ────────────────────────────────────────────────────────────
-    // Per-source MI scan architecture: MergeJoins stay, boundary Sorts replaced.
-    assertThat(afterStr, containsString("EnumerableMergeJoin"));
+    // With the sort-direction fix and two indexed view pipelines:
+    // 1. The GROUP BY Sort(n_name ASC, o_year DESC) is a boundary for the
+    //    inner indexed view → replaced by MIScan (absorbs join+filter subtree).
+    // 2. The ORDER BY Sort(n_name ASC, o_year DESC) is a boundary for the
+    //    outer indexed view → replaced by MIScan (absorbs Aggregate + inner scan).
+    // The entire plan collapses to a single MIScan.
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
-    // No EnumerableMergedIndexJoin (obsolete under per-source architecture)
+    assertThat(afterStr, not(containsString("EnumerableMergeJoin")));
     assertThat(afterStr, not(containsString("EnumerableMergedIndexJoin")));
-    // Non-boundary Sorts may remain (GROUP BY, ORDER BY).
-    // All pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.
-    for (Pipeline p : pipelines) {
+    assertThat(afterStr, not(containsString("EnumerableSort")));
+    assertThat(afterStr, not(containsString("EnumerableAggregate")));
+    assertThat(MergedIndexTestUtil.countOccurrences(afterStr,
+        "EnumerableMergedIndexScan"), is(1));
+    // Join pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.
+    for (Pipeline p : joinPipelinesQ9) {
       assertThat("Q9 pipeline missing maintenance plan",
           p.mergedIndex.getMaintenancePlan() != null, is(true));
       final String m = dumpText(p.mergedIndex.getMaintenancePlan());
       assertThat(MergedIndexTestUtil.countOccurrences(m, "LogicalDelta"), is(2));
     }
-    // Non-root pipelines have index creation plans
-    for (int i = 0; i < pipelines.size() - 1; i++) {
-      RelNode cp = pipelines.get(i).mergedIndex.getIndexCreationPlan();
+    // Non-root join pipelines have index creation plans
+    for (int i = 0; i < joinPipelinesQ9.size() - 1; i++) {
+      RelNode cp = joinPipelinesQ9.get(i).mergedIndex.getIndexCreationPlan();
       assertThat("Q9 creation plan should exist for level " + i,
           cp != null, is(true));
       String cpStr = dumpText(cp);
@@ -757,6 +792,94 @@ class MergedIndexTpchPlanTest {
   }
 
   // ── IVM helpers ──────────────────────────────────────────────────────────
+
+  /**
+   * If the root is a Sort (ORDER BY) whose input chain contains an Aggregate
+   * with a Sort (GROUP BY) on the same key fields but different directions,
+   * propagates the ORDER BY directions to the GROUP BY sort.
+   *
+   * <p>The ORDER BY Sort is kept in the plan (Volcano needs it to satisfy the
+   * desired collation trait) but becomes a no-op at runtime since the
+   * SortedAggregate output is already sorted with the correct direction.
+   * During pipeline discovery it acts as the indexed view boundary sort.
+   *
+   * <p>This fixes Q9: the GROUP BY sort {@code (n_name ASC, o_year ASC)}
+   * becomes {@code (n_name ASC, o_year DESC)} matching the ORDER BY.
+   *
+   * @param node the plan root (potentially a Sort)
+   * @return the plan with propagated directions, or unchanged if no match
+   */
+  private static RelNode propagateOrderByDirection(RelNode node) {
+    if (!(node instanceof Sort)) {
+      return node;
+    }
+    final Sort orderBy = (Sort) node;
+    if (orderBy.fetch != null || orderBy.offset != null) {
+      return node;
+    }
+
+    // Drill through single-input operators to find the Aggregate
+    RelNode cur = orderBy.getInput();
+    final List<RelNode> chain = new ArrayList<>();
+    while (cur != null && !(cur instanceof Aggregate)
+        && cur.getInputs().size() == 1) {
+      chain.add(cur);
+      cur = cur.getInputs().get(0);
+    }
+    if (!(cur instanceof Aggregate)) {
+      return node;
+    }
+
+    final Aggregate agg = (Aggregate) cur;
+    final RelNode aggInput = agg.getInput();
+    if (!(aggInput instanceof Sort)) {
+      return node;
+    }
+
+    final Sort groupBy = (Sort) aggInput;
+    final List<RelFieldCollation> obFields =
+        orderBy.getCollation().getFieldCollations();
+    final List<RelFieldCollation> gbFields =
+        groupBy.getCollation().getFieldCollations();
+    if (obFields.size() != gbFields.size()) {
+      return node;
+    }
+
+    // Check same key fields and whether directions differ
+    boolean sameKeys = true;
+    boolean sameDirections = true;
+    for (int i = 0; i < obFields.size(); i++) {
+      if (obFields.get(i).getFieldIndex() != gbFields.get(i).getFieldIndex()) {
+        sameKeys = false;
+        break;
+      }
+      if (obFields.get(i).getDirection() != gbFields.get(i).getDirection()) {
+        sameDirections = false;
+      }
+    }
+    if (!sameKeys || sameDirections) {
+      return node; // fields don't match, or directions already match
+    }
+
+    // Build new GROUP BY collation with ORDER BY directions
+    final List<RelFieldCollation> newGbFields = new ArrayList<>();
+    for (int i = 0; i < gbFields.size(); i++) {
+      newGbFields.add(new RelFieldCollation(
+          gbFields.get(i).getFieldIndex(),
+          obFields.get(i).getDirection()));
+    }
+    final RelNode newGroupBy = LogicalSort.create(
+        groupBy.getInput(), RelCollations.of(newGbFields), null, null);
+    RelNode result = agg.copy(agg.getTraitSet(), List.of(newGroupBy));
+
+    // Rebuild intermediate nodes (between ORDER BY and Aggregate)
+    for (int i = chain.size() - 1; i >= 0; i--) {
+      final RelNode n = chain.get(i);
+      result = n.copy(n.getTraitSet(), List.of(result));
+    }
+    // Keep the ORDER BY Sort (Volcano needs it) but now it's a no-op
+    return orderBy.copy(orderBy.getTraitSet(), List.of(result));
+  }
 
   /**
    * Derives the incremental maintenance plan for a merged-index pipeline.

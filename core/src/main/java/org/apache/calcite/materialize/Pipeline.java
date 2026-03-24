@@ -18,13 +18,17 @@ package org.apache.calcite.materialize;
 
 import org.apache.calcite.adapter.enumerable.EnumerableSort;
 import org.apache.calcite.rel.RelCollation;
+import org.apache.calcite.rel.RelCollationTraitDef;
+import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.Sort;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 
+import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -239,6 +243,116 @@ public class Pipeline {
       this.lca = lca;
       this.nodes = nodes;
       this.boundarySorts = boundarySorts;
+    }
+  }
+
+  // ── Pipeline discovery (moved from MergedIndexTestUtil) ─────────────────
+
+  /**
+   * Builds a pipeline tree from the Phase 1 physical plan by identifying
+   * {@link EnumerableSort} operators as boundaries between pipelines.
+   *
+   * @param planRoot the Phase 1 physical plan root
+   * @return the root pipeline of the pipeline tree
+   */
+  public static Pipeline buildTree(RelNode planRoot) {
+    return buildPipeline(planRoot);
+  }
+
+  /**
+   * Post-order flattening of this pipeline tree: leaves first, root last.
+   * Returns all pipelines with at least one source (both multi-source
+   * merged indexes and single-source indexed views).
+   */
+  public List<Pipeline> flatten() {
+    final List<Pipeline> result = new ArrayList<>();
+    flattenPostOrder(this, result);
+    return result;
+  }
+
+  /**
+   * Safely extracts the first {@link RelCollation} from a node's trait set.
+   * Uses {@code getTraits()} to avoid the {@code RelCompositeTrait} cast bug.
+   */
+  public static @Nullable RelCollation safeGetCollation(RelNode node) {
+    final List<RelCollation> collations =
+        node.getTraitSet().getTraits(RelCollationTraitDef.INSTANCE);
+    if (collations == null || collations.isEmpty()) {
+      return null;
+    }
+    return collations.get(0);
+  }
+
+  /**
+   * Recursively builds a single pipeline rooted at {@code node}.
+   * Collects child pipelines by finding Sort boundaries among descendants.
+   */
+  private static Pipeline buildPipeline(RelNode node) {
+    final List<Pipeline> childPipelines = new ArrayList<>();
+    collectChildPipelines(node, childPipelines);
+    final RelCollation collation;
+    if (!childPipelines.isEmpty()
+        && !childPipelines.get(0).boundaryCollation.getFieldCollations()
+            .isEmpty()) {
+      collation = childPipelines.get(0).boundaryCollation;
+    } else {
+      collation = inferCollation(node);
+    }
+    final double rowCount =
+        node.estimateRowCount(node.getCluster().getMetadataQuery());
+    return new Pipeline(node, childPipelines, collation, collation, rowCount);
+  }
+
+  /**
+   * Recurses into {@code node}'s inputs looking for Sort boundaries.
+   * When hitting an {@link EnumerableSort} boundary, creates a child Pipeline
+   * rooted at the Sort's input. Otherwise continues recursing.
+   */
+  private static void collectChildPipelines(RelNode node,
+      List<Pipeline> result) {
+    for (RelNode input : node.getInputs()) {
+      if (isBoundarySort(input)) {
+        final EnumerableSort sort = (EnumerableSort) input;
+        final RelNode below = sort.getInput();
+        final Pipeline child = buildPipeline(below);
+        result.add(new Pipeline(below, child.sources,
+            child.sharedCollation, sort.getCollation(), child.rowCount));
+      } else {
+        collectChildPipelines(input, result);
+      }
+    }
+  }
+
+  /**
+   * Infers the shared collation for a pipeline rooted at {@code node}.
+   * First checks the node's own trait set, then drills through single-input
+   * operators to find an authoritative Sort.
+   */
+  private static RelCollation inferCollation(RelNode node) {
+    final RelCollation c = safeGetCollation(node);
+    if (c != null && !c.getFieldCollations().isEmpty()) {
+      return c;
+    }
+    RelNode cur = node;
+    while (cur.getInputs().size() == 1 && !(cur instanceof Sort)) {
+      cur = cur.getInputs().get(0);
+    }
+    if (cur instanceof Sort) {
+      return ((Sort) cur).getCollation();
+    }
+    final RelCollation deep = safeGetCollation(cur);
+    if (deep != null && !deep.getFieldCollations().isEmpty()) {
+      return deep;
+    }
+    return RelCollations.EMPTY;
+  }
+
+  private static void flattenPostOrder(Pipeline p, List<Pipeline> result) {
+    for (Pipeline child : p.sources) {
+      flattenPostOrder(child, result);
+    }
+    if (p.sources.size() >= 1) {
+      result.add(p);
     }
   }
 }

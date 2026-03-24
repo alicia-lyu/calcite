@@ -140,9 +140,9 @@ public class PipelineToMergedIndexScanRuleTest {
     RelNode phase1Plan = planner.transform(0, desiredTraits, logicalWithSorts);
 
     // ── Discover pipeline and register merged index ────────────────────────
-    Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    Pipeline pipelineTree = Pipeline.buildTree(phase1Plan);
     List<Pipeline> pipelines =
-        MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
+        pipelineTree.flatten().stream()
             .filter(p -> p.sources.size() >= 2)
             .collect(Collectors.toList());
     assertThat("Expected 1 join pipeline", pipelines.size(), is(1));
@@ -244,9 +244,9 @@ public class PipelineToMergedIndexScanRuleTest {
 
     // ── Case 1: Aggregate above join (standard planner output) ────────────
     // Use pipeline discovery to find the join pipeline.
-    Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    Pipeline pipelineTree = Pipeline.buildTree(phase1Plan);
     List<Pipeline> pipelines =
-        MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
+        pipelineTree.flatten().stream()
             .filter(p -> p.sources.size() >= 2)
             .collect(Collectors.toList());
     assertThat("Expected 1 join pipeline", pipelines.size(), is(1));
@@ -322,9 +322,9 @@ public class PipelineToMergedIndexScanRuleTest {
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
     RelNode phase1Plan = planner.transform(0, desiredTraits, logicalWithSorts);
 
-    Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    Pipeline pipelineTree = Pipeline.buildTree(phase1Plan);
     List<Pipeline> pipelines =
-        MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
+        pipelineTree.flatten().stream()
             .filter(p -> p.sources.size() >= 2)
             .collect(Collectors.toList());
     assertThat(pipelines.size(), is(1));
@@ -432,9 +432,9 @@ public class PipelineToMergedIndexScanRuleTest {
     RelNode phase1Plan = planner.transform(0, desiredTraits, logicalWithSorts);
 
     // Discover pipeline and register merged index
-    Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
+    Pipeline pipelineTree = Pipeline.buildTree(phase1Plan);
     List<Pipeline> pipelines =
-        MergedIndexTestUtil.flattenPipelines(pipelineTree).stream()
+        pipelineTree.flatten().stream()
             .filter(p -> p.sources.size() >= 2)
             .collect(Collectors.toList());
     assertThat(pipelines.size(), is(1));
