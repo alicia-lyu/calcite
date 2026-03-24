@@ -24,6 +24,9 @@
 | `flattenPipelines`: `p.mergedIndex != null` (not source count)           | Done ✓  |
 | `MergedIndexTestUtil` — shared test helpers extracted to `testkit`        | Done ✓  |
 | `TaggedRowSchema` — tagged interleaved row metadata (Subtask 1)          | Done ✓  |
+| Pipeline discovery moved to `Pipeline.java` (production code)            | Done ✓  |
+| Single-source indexed views (Q12, Q9)                                    | Done ✓  |
+| Q9 sort direction fix (`propagateOrderByDirection`)                      | Done ✓  |
 
 ## Terminology
 
@@ -44,19 +47,17 @@
 
 Search for `=== Q12 BEFORE`, `=== Q12 AFTER`, `=== Q3 OL AFTER`, `=== Q9 AFTER` in output.
 
-### Sample AFTER output (Transparent Per-Source MI Scans)
+### Sample AFTER output (with indexed views)
 
-**Q12** (2-table, single root pipeline — MergeJoin stays):
+**Q12** (2-table + indexed view — MergeJoin absorbed):
 
 ```text
-EnumerableSort(l_shipmode)
-  EnumerableSortedAggregate(...)
-    EnumerableMergeJoin(orderkey)           ← STAYS
-      MIScan(MI, src=ORDERS, group=G1)     ← replaces Sort→Scan(ORDERS)
-      MIScan(MI, src=LINEITEM, group=G1)   ← replaces Sort→Scan(LINEITEM)
+EnumerableSort(l_shipmode)                ← ORDER BY (no-op)
+  EnumerableSortedAggregate(l_shipmode)
+    MIScan(ivMI)                           ← indexed view on l_shipmode
 ```
 
-**Q3-OL** root query plan (outer pipeline only — inner is index creation plan):
+**Q3-OL** root query plan (outer pipeline — no indexed view, LimitSort not a boundary):
 
 ```text
 EnumerableLimitSort
@@ -66,17 +67,15 @@ EnumerableLimitSort
       MIScan(MI_outer, src=CUSTOMER, group=G2)    ← replaces Sort→Scan(CUSTOMER)
 ```
 
-**Q9** root query plan (outer pipeline only):
+**Q9** (6-table + indexed view — entire plan collapses):
 
 ```text
-EnumerableSort(n_name, o_year DESC)
-  EnumerableAggregate(n_name, o_year)
-    EnumerableProject
-      EnumerableFilter(p_name LIKE ...)
-        EnumerableMergeJoin(nationkey)                    ← STAYS
-          MIScan(MI_outer, src=inner_view, group=G5)
-          MIScan(MI_outer, src=NATION, group=G5)
+MIScan(ivMI)                               ← single scan, entire plan collapsed
 ```
+
+After `propagateOrderByDirection`, both ORDER BY and GROUP BY sorts have
+(n_name ASC, o_year DESC). Both are boundary sorts → two indexed view
+levels. The final MIScan absorbs all 5 joins + filter + aggregate.
 
 ---
 
@@ -258,20 +257,19 @@ are depth-many cascading steps total.
 
 ---
 
-### Q12 — 2-table (`tpchQ12`)
+### Q12 — 2-table + indexed view (`tpchQ12`)
 
-Key: `o_orderkey = l_orderkey`. Single root pipeline. One HEP pass.
+Key: `o_orderkey = l_orderkey`. 2 pipelines: join + indexed view on l_shipmode.
 
 ```text
-BEFORE                                     AFTER (Query plan — MergeJoin stays)
-EnumerableSort(l_shipmode)                 EnumerableSort(l_shipmode)
+BEFORE                                     AFTER (indexed view absorbs MergeJoin)
+EnumerableSort(l_shipmode)                 EnumerableSort(l_shipmode)   ← ORDER BY
   EnumerableSortedAggregate                  EnumerableSortedAggregate
-    EnumerableMergeJoin(orderkey)              EnumerableMergeJoin(orderkey)  ← STAYS
-      EnumerableSort → Scan(ORDERS)              MIScan(MI, src=ORDERS, G1)
-      EnumerableSort → Scan(LINEITEM)            MIScan(MI, src=LINEITEM, G1)
+    EnumerableSort(l_shipmode)                 MIScan(ivMI)             ← indexed view
+      EnumerableMergeJoin(orderkey)
+        EnumerableSort → Scan(ORDERS)
+        EnumerableSort → Scan(LINEITEM)
 ```
-
-Index creation: N/A (root pipeline — no MI to populate, sources read directly).
 
 ---
 
@@ -310,51 +308,34 @@ EnumerableMergeJoin(orderkey)
 
 ---
 
-### Q9 — 6-table (`tpchQ9`)
+### Q9 — 6-table + indexed view (`tpchQ9`)
 
 Keys: orderkey → partkey → (partkey,suppkey) → suppkey → nationkey.
-5 pipelines, 4 inner (index creation) + 1 root (query plan).
+6 pipelines: 5 join + 1 indexed view on (n_name ASC, o_year DESC).
+
+After `propagateOrderByDirection`, the GROUP BY sort direction changes from
+`(n_name ASC, o_year ASC)` to `(n_name ASC, o_year DESC)` matching the ORDER BY.
+Both ORDER BY and GROUP BY sorts are boundary sorts → two indexed view levels.
 
 ```text
-BEFORE (full plan)
-EnumerableSort(n_name, o_year DESC)
+BEFORE (after sort-direction fix)
+EnumerableSort(n_name ASC, o_year DESC)        ← ORDER BY (boundary)
   EnumerableAggregate(n_name, o_year)
-    EnumerableFilter(p_name LIKE ...)
-      EnumerableMergeJoin(nationkey)         ← root pipeline
-        EnumerableSort
-          EnumerableMergeJoin(suppkey)
-            EnumerableSort
-              EnumerableMergeJoin(partkey,suppkey)
-                EnumerableSort → Scan(PARTSUPP)
-                EnumerableSort
-                  EnumerableMergeJoin(partkey)
-                    EnumerableSort → Scan(PART)
-                    EnumerableSort
-                      EnumerableMergeJoin(orderkey)
-                        EnumerableSort → Scan(ORDERS)
-                        EnumerableSort → Scan(LINEITEM)
-            EnumerableSort → Scan(SUPPLIER)
-        EnumerableSort → Scan(NATION)
+    EnumerableSort(n_name ASC, o_year DESC)    ← GROUP BY (boundary, direction fixed)
+      EnumerableProject → Filter → 5 nested MergeJoins...
 ```
 
 ```text
-AFTER — Root query plan (outermost pipeline only)
-EnumerableSort(n_name, o_year DESC)
-  EnumerableAggregate(n_name, o_year)
-    EnumerableProject
-      EnumerableFilter(p_name LIKE ...)
-        EnumerableMergeJoin(nationkey)                   ← STAYS
-          MIScan(MI_outer, src=inner_view, group=G5)
-          MIScan(MI_outer, src=NATION, group=G5)
+AFTER — Entire plan collapses to a single scan
+MIScan(ivMI)
 ```
 
-Inner pipelines (index creation plans, 4 levels):
+Inner pipelines (index creation plans, 5 levels):
 - L1: MI(OL) by orderkey — MergeJoin(ORDERS, LINEITEM)
 - L2: MI(OLP) by partkey — MergeJoin(OL_view, PART)
 - L3: MI(OLPS) by (partkey,suppkey) — MergeJoin(OLP_view, PARTSUPP)
 - L4: MI(OLPPS) by suppkey — MergeJoin(OLPS_view, SUPPLIER)
-
-Note: `EnumerableFilter(p_name LIKE '%green%')` stays in root query plan.
+- L5: MI(OLPPSN) by nationkey — MergeJoin(OLPPS_view, NATION)
 
 ---
 
@@ -419,17 +400,18 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 
 4. **End-to-end test with actual row production** — Q12, Q3-OL, Q9.
 
+5. **Maintenance plans for indexed views** — single-source pipelines need
+   a different maintenance strategy (single delta branch, not union of two).
+   Currently skipped (no `setMaintenancePlan` for indexed view pipelines).
+
 ### Medium Term
 
-1. **Direction-agnostic sort injection** — propagate downstream direction requirements
-   to eliminate redundant sorts (e.g., Q9 GROUP BY ASC vs ORDER BY DESC).
-
-2. **`extractCollation` specificity** — choose most specific collation when both MergeJoin
+1. **`extractCollation` specificity** — choose most specific collation when both MergeJoin
    inputs have collations.
 
-3. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI).
+2. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI).
 
-4. **Realistic cost model** — adapt Calcite's cost model for merged index access.
+3. **Realistic cost model** — adapt Calcite's cost model for merged index access.
 
 ### Long Term
 
