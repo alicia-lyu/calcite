@@ -388,18 +388,20 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
    - Wire `indexCreationPlan` field into `MergedIndexTpchPlanTest` multi-stage loop.
    - After each HEP pass (except root), capture `pipeline.root` as the index creation plan via setter.
 
-2. **EnumerableMergedIndexScan.java — Implement cost model with scan group sharing**
-   - Update `computeSelfCost()` to account for shared `MergedIndexScanGroup`: N scans → O(1) IO cost.
-   - Cost formula remains `rowCount=ΣTᵢ, cpu=ΣTᵢ*0.1, io=ΣTᵢ`; ensure group sharing prevents N×IO.
-
-3. **MergedIndexTpchPlanTest.java — Add root pipeline execution assertions**
+2. **MergedIndexTpchPlanTest.java — Add root pipeline execution assertions**
    - Assert that root pipeline remains in final plan (not replaced by MIScan).
    - Q12: verify ORDER BY Sort (l_shipmode) stays after MIScan absorbs join.
    - Q3-OL: verify outer MergeJoin assembly operator stays (not replaced).
 
-4. **Test utilities cleanup — Verify and remove deprecated methods**
+3. **Test utilities cleanup — Verify and remove deprecated methods**
    - Check that no production or test code calls `MergedIndexTestUtil.buildPipelineTree()`, `flattenPipelines()`.
    - Migrate callers to `Pipeline.buildTree()` (production) and `pipelineTree.flatten()`.
+
+4. **EnumerableMergedIndexScan.java — Implement cost model with scan group sharing**
+   - To maintain the tree shape of query plans, scanning different sources in the same merged index are captured by separate `MergedIndexScan`.
+   However, they require only 1 scan, as referred by all of them in the `scanGroup` field.
+   - Therefore, a realistic cost model should be provided by the `scanGroup` instead of each scan operator.
+   - For the purpose of our research, merely document this design.
 
 ### [Medium-term] (Future Sessions)
 
