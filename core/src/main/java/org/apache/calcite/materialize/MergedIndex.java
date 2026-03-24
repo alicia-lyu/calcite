@@ -74,6 +74,18 @@ public class MergedIndex {
   private @Nullable RelNode maintenancePlan;
 
   /**
+   * Physical execution plan for this pipeline. Reads from this MI (via
+   * MIScans), executes pipeline operators (join, aggregate, etc.), and
+   * produces output rows that become a source in the parent pipeline
+   * and are stored in the parent's merged index.
+   *
+   * <p>Data flow: {@code this.mergedIndex → [execution] → parent.mergedIndex}
+   *
+   * <p>Null for the root pipeline (its execution IS the query plan).
+   */
+  private @Nullable RelNode indexCreationPlan;
+
+  /**
    * Creates a MergedIndex from a {@link Pipeline}. Sources, collation, and
    * row count are derived from the pipeline's structure, eliminating field
    * duplication. Also sets the pipeline's back-reference to this index.
@@ -141,6 +153,14 @@ public class MergedIndex {
 
   public @Nullable RelNode getMaintenancePlan() {
     return maintenancePlan;
+  }
+
+  public void setIndexCreationPlan(RelNode plan) {
+    this.indexCreationPlan = plan;
+  }
+
+  public @Nullable RelNode getIndexCreationPlan() {
+    return indexCreationPlan;
   }
 
   /**

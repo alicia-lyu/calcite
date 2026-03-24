@@ -160,7 +160,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q12 BEFORE (order-based pipeline) ===");
     System.out.println(dumpText(phase1Plan));
-    writeDotFile("q12_before", phase1Plan);
+    writeDotFile("q12/before-pipeline", phase1Plan);
 
     // ── Discover pipelines and register merged index ──────────────────────
     final Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
@@ -187,7 +187,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q12 MAINTENANCE PLAN (incremental) ===");
     System.out.println(dumpText(p.mergedIndex.getMaintenancePlan()));
-    writeDotFile("q12_maintenance", p.mergedIndex.getMaintenancePlan());
+    writeDotFile("q12/maintenance", p.mergedIndex.getMaintenancePlan());
 
     // ── Phase 2: HEP planner fires PipelineToMergedIndexScanRule ──────────
     final HepProgram hepProgram = HepProgram.builder()
@@ -200,7 +200,7 @@ class MergedIndexTpchPlanTest {
 
     System.out.println("=== Q12 AFTER (merged index plan) ===");
     System.out.println(dumpText(phase2Plan));
-    writeDotFile("q12_after", phase2Plan);
+    writeDotFile("q12/root-pipeline-query-plan", phase2Plan);
 
     // ── Assert ────────────────────────────────────────────────────────────
     // Per-source MI scan: MergeJoin stays, boundary Sorts replaced by 2 MIScans
@@ -348,7 +348,7 @@ class MergedIndexTpchPlanTest {
     final String beforeStr = dumpText(phase1Plan);
     System.out.println("=== Q3 OL BEFORE (order-based pipeline) ===");
     System.out.println(beforeStr);
-    writeDotFile("q3ol_before", phase1Plan);
+    writeDotFile("q3ol/before-pipeline", phase1Plan);
 
     // ── Discover all interesting-ordering pipelines (bottom-up) ──────────
     // buildPipelineTree walks top-down, cutting at Sort boundaries.
@@ -401,12 +401,12 @@ class MergedIndexTpchPlanTest {
 
     printMaintenancePlans("Q3-OL", pipelines);
     for (int i = 0; i < pipelines.size(); i++) {
-      writeDotFile("q3ol_maintenance_" + i, pipelines.get(i).mergedIndex.getMaintenancePlan());
+      writeDotFile("q3ol/maintenance-" + i, pipelines.get(i).mergedIndex.getMaintenancePlan());
     }
 
     // ── Phase 2: incremental MI registration with multi-stage HEP ────────
     // Each pass registers ONE level's MI and replaces that level's boundary
-    // Sorts with per-source MIScans. Inner pipeline first, then outer.
+    // Sorts with per-source MIScans. Leaf pipeline first, then root.
     // After each pass, deeper Sorts are already replaced, so the rule only
     // matches the current level's Sorts.
     final HepProgram hepPass = HepProgram.builder()
@@ -415,23 +415,52 @@ class MergedIndexTpchPlanTest {
         .build();
 
     RelNode currentPlan = phase1Plan;
-    for (Pipeline p : pipelines) {
+    for (int i = 0; i < pipelines.size(); i++) {
+      Pipeline p = pipelines.get(i);
       MergedIndexRegistry.register(p.mergedIndex);
       final HepPlanner hp = new HepPlanner(hepPass);
       hp.setRoot(currentPlan);
       currentPlan = hp.findBestExp();
+
+      // Capture index creation plan for non-root pipelines.
+      // The creation plan = entire pipeline execution, producing output
+      // rows for the parent MI. Found below the parent's boundary Sort.
+      boolean isRoot = (i == pipelines.size() - 1);
+      if (!isRoot) {
+        RelNode creationRoot = MergedIndexTestUtil.findCreationPlanRoot(
+            currentPlan, p.mergedIndex);
+        if (creationRoot != null) {
+          p.mergedIndex.setIndexCreationPlan(creationRoot);
+        }
+      }
     }
     final RelNode phase2Plan = currentPlan;
 
     final String afterStr = dumpText(phase2Plan);
     System.out.println("=== Q3 OL AFTER (merged index plan) ===");
     System.out.println(afterStr);
-    writeDotFile("q3ol_after", phase2Plan);
+    writeDotFile("q3ol/root-pipeline-query-plan", phase2Plan);
+
+    // ── Index creation plans ─────────────────────────────────────────────
+    System.out.println("=== Q3-OL INDEX CREATION PLANS ===");
+    for (int i = 0; i < pipelines.size() - 1; i++) {
+      String level = (i == 0) ? "leaf" : "branch";
+      Pipeline p = pipelines.get(i);
+      RelNode cp = p.mergedIndex.getIndexCreationPlan();
+      System.out.println("-- " + level + " level " + i
+          + ": reads from " + p.mergedIndex + " → populates parent MI");
+      System.out.println(cp != null ? dumpText(cp) : "(none)");
+      if (cp != null) {
+        // Number from root: smaller = closer to root
+        int fromRoot = pipelines.size() - 1 - i;
+        writeDotFile("q3ol/" + level + "-" + fromRoot + "-index-creation-plan", cp);
+      }
+    }
 
     // ── Assert ────────────────────────────────────────────────────────────
     // Per-source MI scan architecture: MergeJoins stay, boundary Sorts replaced.
-    // Inner pipeline: 2 MIScans (LINEITEM, ORDERS on orderkey).
-    // Outer pipeline: 2 MIScans (inner_view, CUSTOMER on custkey).
+    // Leaf pipeline: 2 MIScans (LINEITEM, ORDERS on orderkey).
+    // Root pipeline: 2 MIScans (leaf_view, CUSTOMER on custkey).
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
     // No EnumerableMergedIndexJoin (obsolete under per-source architecture)
     assertThat(afterStr, not(containsString("EnumerableMergedIndexJoin")));
@@ -445,6 +474,17 @@ class MergedIndexTpchPlanTest {
           p.mergedIndex.getMaintenancePlan() != null, is(true));
       final String m = dumpText(p.mergedIndex.getMaintenancePlan());
       assertThat(MergedIndexTestUtil.countOccurrences(m, "LogicalDelta"), is(2));
+    }
+    // Non-root pipelines have index creation plans
+    for (int i = 0; i < pipelines.size() - 1; i++) {
+      RelNode cp = pipelines.get(i).mergedIndex.getIndexCreationPlan();
+      assertThat("Q3-OL creation plan should exist for level " + i,
+          cp != null, is(true));
+      String cpStr = dumpText(cp);
+      assertThat(cpStr, containsString("EnumerableMergedIndexScan"));
+      // No boundary sorts within the creation plan (they were replaced)
+      assertThat(MergedIndexTestUtil.countOccurrences(cpStr,
+          "EnumerableSort("), is(0));
     }
 
     // ── Verify DeltaToMergedIndexDeltaScanRule ────────────────────────────
@@ -600,7 +640,7 @@ class MergedIndexTpchPlanTest {
     final String beforeStr = dumpText(phase1Plan);
     System.out.println("=== Q9 BEFORE (order-based pipeline) ===");
     System.out.println(beforeStr);
-    writeDotFile("q9_before", phase1Plan);
+    writeDotFile("q9/before-pipeline", phase1Plan);
 
     // Discover all 5 join pipelines bottom-up (inner first) and register nested MergedIndexes.
     final Pipeline pipelineTree = MergedIndexTestUtil.buildPipelineTree(phase1Plan);
@@ -634,31 +674,60 @@ class MergedIndexTpchPlanTest {
 
     printMaintenancePlans("Q9", pipelines);
     for (int i = 0; i < pipelines.size(); i++) {
-      writeDotFile("q9_maintenance_" + i, pipelines.get(i).mergedIndex.getMaintenancePlan());
+      writeDotFile("q9/maintenance-" + i, pipelines.get(i).mergedIndex.getMaintenancePlan());
     }
 
     // ── Phase 2: incremental MI registration with multi-stage HEP ────────
     // Each pass registers ONE level's MI and replaces that level's boundary
     // Sorts with per-source MIScans. Registering incrementally ensures each
     // pass only matches the current level's Sorts (deeper Sorts were already
-    // replaced in prior passes).
+    // replaced in prior passes). Leaf pipeline first, root last.
     final HepProgram hepPass = HepProgram.builder()
         .addRuleInstance(
             EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
         .build();
     RelNode current = phase1Plan;
-    for (Pipeline p : pipelines) {
+    for (int i = 0; i < pipelines.size(); i++) {
+      Pipeline p = pipelines.get(i);
       MergedIndexRegistry.register(p.mergedIndex);
       final HepPlanner hp = new HepPlanner(hepPass);
       hp.setRoot(current);
       current = hp.findBestExp();
+
+      // Capture index creation plan for non-root pipelines.
+      // The creation plan = entire pipeline execution, producing output
+      // rows for the parent MI. Found below the parent's boundary Sort.
+      boolean isRoot = (i == pipelines.size() - 1);
+      if (!isRoot) {
+        RelNode creationRoot = MergedIndexTestUtil.findCreationPlanRoot(
+            current, p.mergedIndex);
+        if (creationRoot != null) {
+          p.mergedIndex.setIndexCreationPlan(creationRoot);
+        }
+      }
     }
     final RelNode phase2Plan = current;
 
     final String afterStr = dumpText(phase2Plan);
     System.out.println("=== Q9 AFTER (merged index plan) ===");
     System.out.println(afterStr);
-    writeDotFile("q9_after", phase2Plan);
+    writeDotFile("q9/root-pipeline-query-plan", phase2Plan);
+
+    // ── Index creation plans ─────────────────────────────────────────────
+    System.out.println("=== Q9 INDEX CREATION PLANS ===");
+    for (int i = 0; i < pipelines.size() - 1; i++) {
+      String level = (i == 0) ? "leaf" : "branch";
+      Pipeline p = pipelines.get(i);
+      RelNode cp = p.mergedIndex.getIndexCreationPlan();
+      System.out.println("-- " + level + " level " + i
+          + ": reads from " + p.mergedIndex + " → populates parent MI");
+      System.out.println(cp != null ? dumpText(cp) : "(none)");
+      if (cp != null) {
+        // Number from root: smaller = closer to root
+        int fromRoot = pipelines.size() - 1 - i;
+        writeDotFile("q9/" + level + "-" + fromRoot + "-index-creation-plan", cp);
+      }
+    }
 
     // ── Assert ────────────────────────────────────────────────────────────
     // Per-source MI scan architecture: MergeJoins stay, boundary Sorts replaced.
@@ -666,19 +735,24 @@ class MergedIndexTpchPlanTest {
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
     // No EnumerableMergedIndexJoin (obsolete under per-source architecture)
     assertThat(afterStr, not(containsString("EnumerableMergedIndexJoin")));
-    // Non-boundary Sorts may remain (GROUP BY, ORDER BY):
-    // 1. Before the Aggregate: Sort(n_name ASC, o_year ASC) on GROUP BY keys,
-    //    injected by injectSortsBeforeSortBasedOps.
-    // 2. After the Aggregate: Sort(n_name ASC, o_year DESC) for ORDER BY.
-    //    This cannot be dropped because the Aggregate output is sorted
-    //    (n_name ASC, o_year ASC) which differs in direction from the required
-    //    (n_name ASC, o_year DESC).
+    // Non-boundary Sorts may remain (GROUP BY, ORDER BY).
     // All pipelines have maintenance plans; each has exactly 2 LogicalDelta branches.
     for (Pipeline p : pipelines) {
       assertThat("Q9 pipeline missing maintenance plan",
           p.mergedIndex.getMaintenancePlan() != null, is(true));
       final String m = dumpText(p.mergedIndex.getMaintenancePlan());
       assertThat(MergedIndexTestUtil.countOccurrences(m, "LogicalDelta"), is(2));
+    }
+    // Non-root pipelines have index creation plans
+    for (int i = 0; i < pipelines.size() - 1; i++) {
+      RelNode cp = pipelines.get(i).mergedIndex.getIndexCreationPlan();
+      assertThat("Q9 creation plan should exist for level " + i,
+          cp != null, is(true));
+      String cpStr = dumpText(cp);
+      assertThat(cpStr, containsString("EnumerableMergedIndexScan"));
+      // No boundary sorts within the creation plan (they were replaced)
+      assertThat(MergedIndexTestUtil.countOccurrences(cpStr,
+          "EnumerableSort("), is(0));
     }
   }
 
@@ -742,10 +816,9 @@ class MergedIndexTpchPlanTest {
   }
 
   private static void writeDotToFile(String filename, String content) {
-    final java.nio.file.Path dir = java.nio.file.Paths.get("test-dot-output");
+    final java.nio.file.Path file = java.nio.file.Paths.get("test-dot-output", filename);
     try {
-      java.nio.file.Files.createDirectories(dir);
-      final java.nio.file.Path file = dir.resolve(filename);
+      java.nio.file.Files.createDirectories(file.getParent());
       java.nio.file.Files.writeString(file, content);
       System.out.println("DOT written → " + file.toAbsolutePath());
     } catch (java.io.IOException e) {

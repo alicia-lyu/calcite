@@ -16,7 +16,9 @@
  */
 package org.apache.calcite.test;
 
+import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan;
 import org.apache.calcite.adapter.enumerable.EnumerableSort;
+import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.Pipeline;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelCollation;
@@ -297,5 +299,67 @@ public final class MergedIndexTestUtil {
       idx += sub.length();
     }
     return count;
+  }
+
+  // ── Index creation plan helpers ───────────────────────────────────────
+
+  /**
+   * Finds the index creation plan root for pipeline {@code p} in a
+   * post-HEP plan. The creation plan is the entire pipeline subtree:
+   * the node directly below a parent boundary Sort whose subtree
+   * contains MIScans referencing {@code mi}.
+   *
+   * <p>This captures all pipeline operators (MergeJoin, SortedAggregate,
+   * Project, etc.), not just the join node. The creation plan reads from
+   * {@code mi} (via MIScans) and produces rows for the parent MI.
+   *
+   * @return the creation plan root, or null if not found
+   */
+  public static @Nullable RelNode findCreationPlanRoot(
+      RelNode plan, MergedIndex mi) {
+    return findBelowBoundarySort(plan, mi);
+  }
+
+  /**
+   * Walks the plan tree looking for the <b>innermost</b> (deepest) boundary
+   * Sort whose input subtree contains MIScans for {@code mi}. Returns the
+   * Sort's input (the pipeline root — the entire pipeline subtree).
+   *
+   * <p>For nested pipelines (Q9), the outermost boundary Sort's subtree
+   * contains all levels. We must recurse through boundary Sorts to find
+   * the nearest one to the MIScans.
+   */
+  private static @Nullable RelNode findBelowBoundarySort(
+      RelNode node, MergedIndex mi) {
+    for (RelNode input : node.getInputs()) {
+      if (Pipeline.isBoundarySort(input)) {
+        RelNode below = ((EnumerableSort) input).getInput();
+        if (containsMIScan(below, mi)) {
+          // Try to find a deeper boundary Sort within this subtree
+          RelNode deeper = findBelowBoundarySort(below, mi);
+          return deeper != null ? deeper : below;
+        }
+      } else {
+        RelNode found = findBelowBoundarySort(input, mi);
+        if (found != null) {
+          return found;
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Checks if the subtree contains an MIScan referencing {@code mi}. */
+  private static boolean containsMIScan(RelNode node, MergedIndex mi) {
+    if (node instanceof EnumerableMergedIndexScan
+        && ((EnumerableMergedIndexScan) node).mergedIndex == mi) {
+      return true;
+    }
+    for (RelNode input : node.getInputs()) {
+      if (containsMIScan(input, mi)) {
+        return true;
+      }
+    }
+    return false;
   }
 }
