@@ -320,7 +320,7 @@ Both ORDER BY and GROUP BY sorts are boundary sorts → two indexed view levels.
 
 ```text
 BEFORE (after sort-direction fix)
-EnumerableSort(n_name ASC, o_year DESC)        ← ORDER BY (boundary)
+  <!-- EnumerableSort(n_name ASC, o_year DESC)        ← ORDER BY (boundary) --> # REMOVED! 
   EnumerableAggregate(n_name, o_year)
     EnumerableSort(n_name ASC, o_year DESC)    ← GROUP BY (boundary, direction fixed)
       EnumerableProject → Filter → 5 nested MergeJoins...
