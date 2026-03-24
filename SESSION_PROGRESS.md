@@ -355,72 +355,66 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 
 ---
 
+## What Was Done (2026-03-10 to 2026-03-24)
+
+### Indexed Views Feature (Single-Source Pipelines)
+- `Pipeline.buildTree()` moved to production code; now identifies both multi-source (join) and single-source (indexed view) pipelines.
+- `Pipeline.flatten()` now includes pipelines with `sources.size() >= 1` (was `>= 2`).
+- Multi-stage HEP planner: each pipeline level registered incrementally, one per HEP pass (leaf-to-root).
+- Q12 now demonstrates indexed view absorption: join pipeline (ORDERS ⋈ LINEITEM) feeds single-source indexed view (GROUP BY l_shipmode); final result is one MIScan.
+
+### Index Creation Plan Capture (Subtask 2)
+- Added `indexCreationPlan` field to `MergedIndex` with getter/setter.
+- Javadoc added: "Physical execution plan for this pipeline. Reads from this MI (via MIScans), executes pipeline operators (join, aggregate, etc.), and produces output rows that become a source in the parent pipeline."
+- Extract point: after each HEP pass (except root), capture `pipeline.root` as the index creation plan.
+- Not yet wired into multi-stage loop (ready for next session).
+
+### Q12, Q3-OL, Q9 Javadoc & Plan Updates
+- `tpchQ12()`: restructured to show 2-pipeline discovery (join + indexed view); affirms indexed view absorption.
+- `tpchQ3OrdersLineitem()`: multi-stage HEP loop with per-pipeline registration; intermediate plans written to DOT.
+- `tpchQ9()`: sort direction fix via `propagateOrderByDirection()`; 6 pipelines (5 joins + 1 indexed view); entire plan collapses to single MIScan.
+- All tests use `Pipeline.buildTree()` and `pipelineTree.flatten()` (not custom test utils).
+
+### Terminology & Design Notes
+- "Bottom side" = input side (leaf pipelines, smaller indices).
+- "Top side" = output side (root pipeline, final result).
+- Two-pipeline test output structure added to SESSION_PROGRESS.md for Q12, Q3-OL, Q9.
+
 ## Next Steps
 
-### Completed
+### [Short-term] (Next Session)
 
-1. ~~**MergedIndex ↔ Pipeline deduplication**~~ **DONE** (commit `33779964c`)
-2. ~~**Subtask 0: Assembly subtree identification**~~ **DONE** (commit `f8c8981f8`) — moved to test utils
-3. ~~**Subtask 1: Tagged interleaved row type**~~ **DONE** (commit `c3a048e11`)
-   - `TaggedRowSchema` in `materialize/TaggedRowSchema.java`.
-   - Wired into `MergedIndex.getTaggedRowSchema()`.
-4. ~~**Test helpers extraction**~~ **DONE** (commit `cbd4908bb`)
-   - `MergedIndexTestUtil` in `testkit/`.
+1. **MergedIndex.java — Wire indexCreationPlan into multi-stage loop**
+   - In `MergedIndexTpchPlanTest`, after each HEP pass, capture the post-transformation plan as the index creation plan.
+   - For non-root pipeline `p`: `p.mergedIndex.setIndexCreationPlan(rootSubtreeAfterPass)`.
 
-### Short Term (completed) — Transparent Per-Source MI Scans
+2. **EnumerableMergedIndexScan.java — Implement cost model with scan group sharing**
+   - N leaf scans sharing one `MergedIndexScanGroup`: combined IO cost = one sequential scan, not N.
+   - Cost formula: `rowCount=ΣTᵢ, cpu=ΣTᵢ*0.1, io=ΣTᵢ` (same as current stub).
 
-1. ~~**Subtask 0 (revised): Per-source MI scan operator**~~ **DONE** (commit `84f1589a4`)
-   - `EnumerableMergedIndexScan`: added `sourceIndex`, `scanGroup`, source-native row type.
-   - New `MergedIndexScanGroup` class in `materialize/`.
-   - Old `create(cluster, mi, rowType)` kept as deprecated overload.
-   - `implement()`: stub returning empty enumerable (execution out of scope).
+3. **Q12, Q3-OL, Q9 tests — Verify root query plan execution path**
+   - Assert that root pipeline remains in final plan (not replaced by MIScan).
+   - Verify outer MergeJoin stays for Q3-OL root query plan.
 
-2. ~~**Subtask 1 (revised): PipelineToMergedIndexScanRule — Sort boundary matching**~~ **DONE** (commits `69911832f`, `82c5ffbec`)
-   - Rule rewritten to match `EnumerableSort` (not `EnumerableMergeJoin`).
-   - `findForSource()`: structural matching (leaf table name + mergedIndex identity),
-     per-source boundary collation, HepRelVertex-aware traversal.
-   - Incremental MI registration: one level per HEP pass (leaf-to-root).
-   - Scan groups discovered via plan tree search for sibling MIScans.
-   - `EnumerableMergedIndexJoin` deleted (parent MergeJoin stays in plan).
-   - `@Execution(SAME_THREAD)` on core tests (registry race condition fix).
+4. **Clean up test utilities**
+   - Verify no test code calls deprecated `MergedIndexTestUtil.buildPipelineTree()`, `flattenPipelines()`.
+   - Remove if unused.
 
-### Short Term (next session)
+5. **Add `.claudignore` file** to reduce Gradle build cache scanning.
 
-1. **Subtask 2: Index creation plan capture** (file: `Pipeline.java`, `MergedIndex.java`)
-   - After each non-root HEP pass, the subtree rooted at `pipeline.root` has
-     MIScan leaves — this IS the index creation plan.
-   - Store as `indexCreationPlan` field on MergedIndex.
-   - Extract from post-HEP plan in the multi-stage loop.
+### [Medium-term] (Future Sessions)
 
-2. **Subtask 4: Cost model with scan group sharing** (file: `EnumerableMergedIndexScan.java`)
-   - N leaf scans sharing one physical scan: combined IO = one sequential scan, not N.
-   - `MergedIndexScanGroup` enables cost sharing.
+1. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI).
 
-3. **Remove deprecated `create(cluster, mi, rowType)`** if no callers remain outside delta tests.
+2. **Maintenance plans for indexed views** — single-source pipelines currently skip `setMaintenancePlan`.
+   Design: single delta branch (not union of two). Reconcile with existing delta infrastructure.
 
-4. **End-to-end test with actual row production** — Q12, Q3-OL, Q9.
+3. **PATH B: Native merged index support** — tables report collation via `getStatistic()`;
+   rule matches bare `EnumerableTableScan` with collation traits (no explicit Sorts).
 
-5. **Maintenance plans for indexed views** — single-source pipelines need
-   a different maintenance strategy (single delta branch, not union of two).
-   Currently skipped (no `setMaintenancePlan` for indexed view pipelines).
+4. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
+   ORDERKEY→CUSTKEY recognition; enable 3-table merged indexes without manual index registration.
 
-### Medium Term
+5. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
 
-1. **`extractCollation` specificity** — choose most specific collation when both MergeJoin
-   inputs have collations.
-
-2. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI).
-
-3. **Realistic cost model** — adapt Calcite's cost model for merged index access.
-
-### Long Term
-
-1. **PATH B: Native merged index support** — tables report collation via `getStatistic()`,
-   rule matches bare `EnumerableTableScan` with collation traits.
-
-2. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
-   ORDERKEY→CUSTKEY recognition.
-
-3. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
-
-4. **`implement()` stub** — real sequential B-tree scan; LeanStore integration.
+6. **End-to-end execution** — real sequential B-tree scan; LeanStore or in-memory storage integration.
