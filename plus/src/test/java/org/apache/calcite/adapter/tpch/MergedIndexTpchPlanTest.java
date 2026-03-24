@@ -211,17 +211,42 @@ class MergedIndexTpchPlanTest {
             EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
         .build();
     RelNode currentPlan = phase1Plan;
-    for (Pipeline p : pipelines) {
+    for (int i = 0; i < pipelines.size(); i++) {
+      Pipeline p = pipelines.get(i);
       MergedIndexRegistry.register(p.mergedIndex);
       final HepPlanner hp = new HepPlanner(hepProgram);
       hp.setRoot(currentPlan);
       currentPlan = hp.findBestExp();
+
+      // Capture index creation plan for non-root pipelines.
+      // The creation plan = entire pipeline execution, producing output
+      // rows for the parent MI. Found below the parent's boundary Sort.
+      boolean isRoot = (i == pipelines.size() - 1);
+      if (!isRoot) {
+        RelNode creationRoot = MergedIndexTestUtil.findCreationPlanRoot(
+            currentPlan, p.mergedIndex);
+        if (creationRoot != null) {
+          p.mergedIndex.setIndexCreationPlan(creationRoot);
+        }
+      }
     }
     final RelNode phase2Plan = currentPlan;
 
     System.out.println("=== Q12 AFTER (merged index plan) ===");
     System.out.println(dumpText(phase2Plan));
     writeDotFile("q12/root-pipeline-query-plan", phase2Plan);
+
+    // ── Index creation plans ─────────────────────────────────────────────
+    System.out.println("=== Q12 INDEX CREATION PLANS ===");
+    for (int i = 0; i < pipelines.size() - 1; i++) {
+      Pipeline p = pipelines.get(i);
+      RelNode cp = p.mergedIndex.getIndexCreationPlan();
+      System.out.println("-- pipeline " + i + ": " + p.mergedIndex);
+      System.out.println(cp != null ? dumpText(cp) : "(none)");
+      if (cp != null) {
+        writeDotFile("q12/pipeline-" + i + "-index-creation-plan", cp);
+      }
+    }
 
     // ── Assert ────────────────────────────────────────────────────────────
     // After indexed view replacement: the Sort(l_shipmode) above MergeJoin
@@ -243,6 +268,14 @@ class MergedIndexTpchPlanTest {
     assertThat(maintStr12, containsString("LogicalUnion"));
     assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalJoin"), is(0));
     assertThat(MergedIndexTestUtil.countOccurrences(maintStr12, "LogicalDelta"), is(2));
+    // Non-root pipelines have index creation plans with MIScans, no boundary Sorts
+    for (int i = 0; i < pipelines.size() - 1; i++) {
+      RelNode cp = pipelines.get(i).mergedIndex.getIndexCreationPlan();
+      assertThat("creation plan should exist for level " + i, cp != null, is(true));
+      String cpStr = dumpText(cp);
+      assertThat(cpStr, containsString("EnumerableMergedIndexScan"));
+      assertThat(MergedIndexTestUtil.countOccurrences(cpStr, "EnumerableSort("), is(0));
+    }
 
     // ── TaggedRowSchema for Q12 (ORDERS ⋈ LINEITEM on orderkey) ──────────
     // Verify byte-width metadata for cost estimation and slot counts.
