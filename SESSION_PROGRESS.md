@@ -27,6 +27,7 @@
 | Pipeline discovery moved to `Pipeline.java` (production code)            | Done ✓  |
 | Single-source indexed views (Q12, Q9)                                    | Done ✓  |
 | Q9 sort direction fix (`propagateOrderByDirection`)                      | Done ✓  |
+| Index Creation Plan Capture (Subtask 2) — Q12 wired into HEP loop        | Done ✓  |
 
 ## Terminology
 
@@ -366,8 +367,8 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 ### Index Creation Plan Capture (Subtask 2)
 - Added `indexCreationPlan` field to `MergedIndex` with getter/setter.
 - Javadoc added: "Physical execution plan for this pipeline. Reads from this MI (via MIScans), executes pipeline operators (join, aggregate, etc.), and produces output rows that become a source in the parent pipeline."
-- Extract point: after each HEP pass (except root), capture `pipeline.root` as the index creation plan.
-- Not yet wired into multi-stage loop (ready for next session).
+- Wired into Q12 multi-stage HEP loop (commit `128b1fb53`): after each HEP pass except root, `pipeline.root` captured as index creation plan.
+- Test verification: all intermediate pipelines have non-null `indexCreationPlan` fields (except root).
 
 ### Q12, Q3-OL, Q9 Javadoc & Plan Updates
 - `tpchQ12()`: restructured to show 2-pipeline discovery (join + indexed view); affirms indexed view absorption.
@@ -384,9 +385,9 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 
 ### [Short-term] (Next Session)
 
-1. **MergedIndex.java — Capture indexCreationPlan in multi-stage HEP loop**
-   - Wire `indexCreationPlan` field into `MergedIndexTpchPlanTest` multi-stage loop.
-   - After each HEP pass (except root), capture `pipeline.root` as the index creation plan via setter.
+1. **MergedIndex.java — Implement getter for indexCreationPlan**
+   - Verify getter/setter wired and tested in Q12, Q3-OL, Q9.
+   - Extend to Q3-OL and Q9 multi-stage HEP loops (currently only Q12 captures plans).
 
 2. **MergedIndexTpchPlanTest.java — Add root pipeline execution assertions**
    - Assert that root pipeline remains in final plan (not replaced by MIScan).
@@ -397,11 +398,10 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
    - Check that no production or test code calls `MergedIndexTestUtil.buildPipelineTree()`, `flattenPipelines()`.
    - Migrate callers to `Pipeline.buildTree()` (production) and `pipelineTree.flatten()`.
 
-4. **EnumerableMergedIndexScan.java — Implement cost model with scan group sharing**
-   - To maintain the tree shape of query plans, scanning different sources in the same merged index are captured by separate `MergedIndexScan`.
-   However, they require only 1 scan, as referred by all of them in the `scanGroup` field.
-   - Therefore, a realistic cost model should be provided by the `scanGroup` instead of each scan operator.
-   - For the purpose of our research, merely document this design.
+4. **EnumerableMergedIndexScan.java — Document cost model with scan group sharing**
+   - Different sources in same MI are separate MIScans but share one physical scan.
+   - Realistic cost model delegates to `scanGroup` instead of per-scan overhead.
+   - For research purposes, add Javadoc explaining the design decision.
 
 ### [Medium-term] (Future Sessions)
 
