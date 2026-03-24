@@ -143,9 +143,35 @@ public class EnumerableMergedIndexScan extends AbstractRelNode
   }
 
   /**
-   * Cost model: source's share of total MI rows for cpu/rowCount; full MI
-   * size for I/O (the entire index is scanned, shared across siblings).
-   * Future work in {@link MergedIndexScanGroup} will refine cost sharing.
+   * Cost model for a per-source scan over a merged index.
+   *
+   * <p>A merged index stores records from N sources interleaved by a shared
+   * sort key. At query time, a single sequential I/O pass reads the entire
+   * index, but each per-source scan only processes its own rows (filtering
+   * by domain tag). Multiple per-source scans within the same pipeline share
+   * one physical I/O pass via their common {@link MergedIndexScanGroup}.
+   *
+   * <p>Cost formula:
+   * <ul>
+   *   <li><b>rowCount</b> = totalRows / sourceCount (only this source's rows)
+   *   <li><b>cpu</b> = sourceRows * 0.1 (tag filtering is cheap)
+   *   <li><b>io</b> = totalRows (full index scan, shared across siblings)
+   * </ul>
+   *
+   * <p><b>Design decision — why IO is NOT divided by N:</b> each per-source
+   * scan reports the full index size as its IO cost. This is intentional:
+   * dividing by N would under-count physical IO when the planner evaluates
+   * a single scan in isolation. The shared-scan benefit is a buffer-manager
+   * property (co-located pages are read once and served to all consumers)
+   * that cannot be expressed in Calcite's per-operator cost model. In
+   * practice, the Volcano planner compares this scan's cost against the
+   * Sort-then-TableScan alternative; even with full IO, the merged index
+   * scan wins because it eliminates the O(N log N) sort CPU cost.
+   *
+   * <p><b>Future refinement:</b> {@link MergedIndexScanGroup} is a
+   * placeholder for a cost-sharing model where sibling scans collectively
+   * amortize IO. This would require extending {@code RelOptCost} with a
+   * group-aware summation (not currently supported by Calcite).
    */
   @Override public RelOptCost computeSelfCost(RelOptPlanner planner,
       RelMetadataQuery mq) {

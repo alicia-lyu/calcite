@@ -158,8 +158,7 @@ public final class MergedIndexRegistry {
   private static @org.checkerframework.checker.nullness.qual.Nullable
       RelOptTable findLeafScanHep(RelNode node) {
     final RelNode n = unwrap(node);
-    if (n instanceof
-        org.apache.calcite.adapter.enumerable.EnumerableTableScan) {
+    if (n instanceof org.apache.calcite.adapter.enumerable.EnumerableTableScan) {
       return ((org.apache.calcite.adapter.enumerable.EnumerableTableScan) n)
           .getTable();
     }
@@ -176,8 +175,7 @@ public final class MergedIndexRegistry {
    */
   private static boolean containsMergedIndex(RelNode node, MergedIndex mi) {
     final RelNode n = unwrap(node);
-    if (n instanceof
-        org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan) {
+    if (n instanceof org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan) {
       if (((org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan)
           n).mergedIndex == mi) {
         return true;

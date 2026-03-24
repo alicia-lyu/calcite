@@ -233,15 +233,15 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
   - "Multi-stage HEP for nested pipelines" (replaced outdated two-pass section)
 - Updated Q9 plan documentation: removed redundant ORDER BY sort note; clarified indexed view scan as final step.
 - Cleaned up SESSION_PROGRESS.md to keep only ephemeral session content (status table, commands, test summaries).
+- Added detailed cost model Javadoc to `EnumerableMergedIndexScan.computeSelfCost()` and expanded
+  `MergedIndexScanGroup` class-level Javadoc explaining why the class exists and the IO sharing design decision.
+  Fixed pre-existing checkstyle violations in `MergedIndexRegistry.java` (`instanceof` line-wrap).
 
 ## Next Steps
 
 ### [Short-term] (Next Session)
 
-1. **EnumerableMergedIndexScan.java — Document cost model with scan group sharing**
-   - Different sources in same MI are separate MIScans but share one physical scan.
-   - Realistic cost model delegates to `scanGroup` instead of per-scan overhead.
-   - Add Javadoc explaining the design decision and cost formula.
+1. ~~**EnumerableMergedIndexScan.java — Document cost model with scan group sharing**~~ Done.
 
 2. ~~**isBoundarySort() Javadoc — Add future-work note on LimitSort**~~ Done:
    `Pipeline.java` lines 100–106 already document `EnumerableLimitSort` exclusion
@@ -251,24 +251,23 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
    No `leaf-4` or `branch-1` files exist in `plus/test-dot-output/`; no stale
    references in `MergedIndexTpchPlanTest.java`.
 
-### [Medium-term] (Future Sessions)
-
-1. **Sort direction alignment** — `injectSortsBeforeSortBasedOps` should honor downstream direction
-   requirements (e.g., `ORDER BY o_year DESC`); avoid redundant re-sorts.
-
-2. **Window functions and DISTINCT** — extend sort injection to handle `OVER`, `INTERSECT`, `EXCEPT`.
-
-3. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI), Q14 (complex filters).
-
 4. **Maintenance plans for indexed views** — single-source pipelines currently skip `setMaintenancePlan`.
    Design: single delta branch (not union of two). Reconcile with existing delta infrastructure.
 
-5. **PATH B: Native merged index support** — tables report collation via `getStatistic()`;
-   rule matches bare `EnumerableTableScan` with collation traits (no explicit Sorts).
+### [Medium-term] (Future Sessions)
 
-6. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
+1. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI), Q14 (complex filters).
+
+2. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
    ORDERKEY→CUSTKEY recognition; enable 3-table merged indexes without manual registration.
 
-7. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
+3. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
 
-8. **End-to-end execution** — real sequential B-tree scan; LeanStore or in-memory storage integration.
+### [Long-term]
+
+1. **Window functions and DISTINCT** — extend sort injection to handle `OVER`, `INTERSECT`, `EXCEPT`.
+
+2. **End-to-end execution** — real sequential B-tree scan; LeanStore or in-memory storage integration.
+
+3. **PATH B: Native merged index support** — tables report collation via `getStatistic()`;
+   rule matches bare `EnumerableTableScan` with collation traits (no explicit Sorts).

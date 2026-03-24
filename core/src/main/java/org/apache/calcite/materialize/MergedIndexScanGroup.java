@@ -19,14 +19,26 @@ package org.apache.calcite.materialize;
 /**
  * Shared metadata object representing a single physical scan over a
  * {@link MergedIndex}. All per-source {@code EnumerableMergedIndexScan} nodes
- * that belong to the same assembly subtree hold a reference to the same
+ * that belong to the same pipeline hold a reference to the same
  * {@code MergedIndexScanGroup} instance, signifying that they share one
  * physical I/O pass over the merged index.
  *
- * <p>Deliberately minimal for now — future work (cost model refinement) will
- * add cost-sharing logic here. The class exists so that the scan operator can
- * reference it and plan output can show group identity (e.g., same label for
- * sibling scans).
+ * <p><b>Why this class exists:</b> a merged index with N sources produces N
+ * separate {@code EnumerableMergedIndexScan} nodes in the plan (one per
+ * source), but these N nodes correspond to one physical sequential scan of
+ * the B-tree. The scan group makes this sharing explicit so that:
+ * <ul>
+ *   <li>The cost model in {@code EnumerableMergedIndexScan.computeSelfCost()}
+ *       can reference {@link #sourceCount} to split row counts.
+ *   <li>Future cost-sharing refinements (amortized IO across siblings) have a
+ *       natural home — extend this class rather than adding cross-references
+ *       between scan operators.
+ *   <li>Plan output can show group identity (e.g., same label for sibling scans).
+ * </ul>
+ *
+ * <p>Deliberately minimal for now — contains only the merged index reference
+ * and source count. Future work: track cumulative IO, support group-aware
+ * cost summation in the planner.
  *
  * <p>See: "Storing and Indexing Multiple Tables by Interesting Orderings",
  * Wenhui Lyu &amp; Goetz Graefe, VLDB 2026.
