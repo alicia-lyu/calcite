@@ -243,14 +243,13 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
    - Realistic cost model delegates to `scanGroup` instead of per-scan overhead.
    - Add Javadoc explaining the design decision and cost formula.
 
-2. **isBoundarySort() Javadoc — Add future-work note on LimitSort**
-   - Current implementation marks `LIMIT` + `OFFSET` as non-boundary (correct).
-   - Note: `LimitSort` (fetch + order by) may become a boundary in future (e.g., for top-K indexed views).
-   - Reference: Q3-OL test, where `LimitSort` correctly stays in the final plan.
+2. ~~**isBoundarySort() Javadoc — Add future-work note on LimitSort**~~ Done:
+   `Pipeline.java` lines 100–106 already document `EnumerableLimitSort` exclusion
+   and the future-work note for top-K indexed views.
 
-3. **Cleanup: Remove stale DOT artifacts**
-   - Check `plus/test-dot-output/` for Q9 leaf-4, Q3-OL branch-1 references in comments.
-   - Ensure all Javadoc plan diagrams use current final structure (no obsolete node counts).
+3. ~~**Cleanup: Remove stale DOT artifacts**~~ Done:
+   No `leaf-4` or `branch-1` files exist in `plus/test-dot-output/`; no stale
+   references in `MergedIndexTpchPlanTest.java`.
 
 ### [Medium-term] (Future Sessions)
 
