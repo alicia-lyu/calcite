@@ -101,14 +101,19 @@ class MergedIndexTpchPlanTest {
   /**
    * TPC-H Q12 (no date filter): ORDERS ⋈ LINEITEM on orderkey.
    *
-   * <p>Demonstrates <em>full</em> 2-table pipeline substitution: the entire
-   * Sort(ORDERS) ⋈ Sort(LINEITEM) pipeline collapses into one scan.
+   * <p>Two pipelines are discovered:
+   * <ol>
+   *   <li>Join pipeline (orderkey): ORDERS ⋈ LINEITEM — merged index
+   *   <li>Indexed view (l_shipmode): single-source pipeline above the join,
+   *       sorted by the GROUP BY key. The boundary Sort(l_shipmode) is replaced
+   *       by a MIScan that absorbs the MergeJoin.
+   * </ol>
    *
    * <p>Expected AFTER structure:
    * <pre>
-   *   (Sort / Aggregate ...)
-   *     EnumerableMergedIndexScan([TPCH, ORDERS]:O_ORDERKEY,
-   *                               [TPCH, LINEITEM]:L_ORDERKEY)
+   *   EnumerableSort(l_shipmode)                  — ORDER BY (no-op)
+   *     EnumerableSortedAggregate(l_shipmode)
+   *       EnumerableMergedIndexScan(ivMI)          — indexed view scan
    * </pre>
    */
   @Test void tpchQ12() throws Exception {
@@ -501,38 +506,27 @@ class MergedIndexTpchPlanTest {
    * {@code EnumerableFilter(p_name LIKE '%green%')} remains in the query-time plan
    * because the PART filter cannot be pushed below the assembled join result.
    *
-   * <h3>Expected BEFORE structure (order-based pipeline)</h3>
+   * <h3>Expected BEFORE structure (after sort-direction fix)</h3>
    * <pre>
-   *   EnumerableSort(n_name ASC, o_year DESC)
+   *   EnumerableSort(n_name ASC, o_year DESC)       ← ORDER BY (boundary)
    *     EnumerableAggregate(n_name, o_year)
-   *       EnumerableFilter(p_name LIKE '%green%')
-   *         EnumerableMergeJoin(s_nationkey = n_nationkey)
-   *           EnumerableSort(s_nationkey)
-   *             EnumerableMergeJoin(l_suppkey = s_suppkey)
-   *               EnumerableSort(l_suppkey)
-   *                 EnumerableMergeJoin(l_partkey, l_suppkey = ps_partkey, ps_suppkey)
-   *                   EnumerableSort(l_partkey, l_suppkey)
-   *                     EnumerableMergeJoin(l_partkey = p_partkey)
-   *                       EnumerableSort(l_partkey)
-   *                         EnumerableMergeJoin(o_orderkey = l_orderkey)
-   *                           EnumerableSort → Scan(ORDERS)
-   *                           EnumerableSort → Scan(LINEITEM)
-   *                       EnumerableSort → Scan(PART)
-   *                   EnumerableSort → Scan(PARTSUPP)
-   *               EnumerableSort → Scan(SUPPLIER)
-   *           EnumerableSort → Scan(NATION)
+   *       EnumerableSort(n_name ASC, o_year DESC)   ← GROUP BY (boundary, direction fixed)
+   *         EnumerableProject
+   *           EnumerableFilter(p_name LIKE '%green%')
+   *             EnumerableMergeJoin(s_nationkey = n_nationkey)
+   *               EnumerableSort(s_nationkey) → ... 4 nested MergeJoins ...
+   *               EnumerableSort(s_nationkey) → Scan(NATION)
    * </pre>
    *
-   * <h3>Expected AFTER structure (per-source MI scan plan)</h3>
+   * <h3>Expected AFTER structure (indexed view)</h3>
    * <pre>
-   *   EnumerableSort(n_name ASC, o_year DESC)   ← ORDER BY only
-   *     EnumerableAggregate(n_name, o_year)
-   *       EnumerableProject
-   *         EnumerableFilter(p_name LIKE '%green%')
-   *           EnumerableMergeJoin(nationkey)     ← stays in plan (per-source architecture)
-   *             EnumerableMergedIndexScan(MI_root, source=view(OLPPS))
-   *             EnumerableMergedIndexScan(MI_root, source=NATION)
+   *   EnumerableMergedIndexScan(ivMI)   ← single scan, entire plan collapsed
    * </pre>
+   *
+   * <p>Six pipelines are discovered: 5 join pipelines (nested bottom-up) plus
+   * 1 indexed view on (n_name ASC, o_year DESC). The ORDER BY Sort is also a
+   * boundary sort that becomes a second indexed view, ultimately collapsing
+   * the entire plan to a single MIScan.
    *
    * <p>Full DOT diagrams for BEFORE/AFTER are in {@code test-dot-output/q9_before.dot}
    * and {@code test-dot-output/q9_after.dot}.
