@@ -74,168 +74,8 @@ EnumerableLimitSort
 MIScan(ivMI)                               ← single scan, entire plan collapsed
 ```
 
-After `propagateOrderByDirection`, both ORDER BY and GROUP BY sorts have
-(n_name ASC, o_year DESC). Both are boundary sorts → two indexed view
-levels. The final MIScan absorbs all 5 joins + filter + aggregate.
-
----
-
-## Calcite Planner Architecture: Volcano vs HEP
-
-Calcite has **two independent planner engines**. Understanding both is essential for
-this project because we use them in sequence.
-
-### Volcano (Phase 1) — Cost-Based Optimizer
-
-The classic Cascade/Volcano framework:
-- Explores equivalent plans via **rules** that fire on pattern matches
-- Maintains a **memo** of equivalent expressions grouped by properties (traits like
-  sort order, convention/physical-operator-set)
-- Multiple rules can fire on the same node, producing **alternatives**
-- The planner picks the **cheapest** plan using the cost model
-
-**In our pipeline**: Phase 1 uses Volcano to convert the logical plan (LogicalJoin,
-LogicalTableScan, etc.) to a physical plan (EnumerableMergeJoin, EnumerableSort,
-EnumerableTableScan, etc.). It chooses between hash join vs merge join, hash aggregate
-vs sorted aggregate, etc. — all based on cost.
-
-### HEP (Phase 2) — Heuristic/Deterministic Rewriter
-
-A simpler, **deterministic rewrite engine** (no cost comparison):
-- Applies rules as **unconditional rewrites** — if a rule matches, the replacement happens
-- Processes the plan in a configurable traversal order:
-  - `BOTTOM_UP`: leaves first, then ancestors (what we use — inner Sorts fire before outer)
-  - `TOP_DOWN`: root first, then descendants
-  - `DEPTH_FIRST`: avoids re-processing after each transformation
-  - `ARBITRARY`: default, efficient, order doesn't matter
-- Think of HEP as **"find-and-replace for plan trees"**
-
-**In our pipeline**: Phase 2 uses HEP to apply `PipelineToMergedIndexScanRule`. This is
-a deterministic rewrite — if a Sort's input matches a registered MI, replace it. No cost
-comparison needed (MI scan is always preferred). HEP is ideal because we want unconditional
-substitution and need control over traversal order.
-
-### What Is a "Rule"?
-
-A **rule** is a pattern-match-and-transform unit with two parts:
-1. **Operand pattern**: What plan node to match (e.g., `EnumerableSort` with no FETCH/OFFSET)
-2. **`onMatch(call)`**: Inspect the node, optionally call `call.transformTo(replacement)`
-
-In Volcano, multiple rules can fire on the same node → produces alternatives → cost picks
-winner. In HEP, rules fire and replace unconditionally.
-
-### Why BOTTOM_UP Matters for Nested Pipelines
-
-For nested pipelines (Q3-OL, Q9), inner boundary Sorts must be replaced by MIScans
-**before** outer Sorts fire. Otherwise, the outer Sort can't recognize its inner subtree
-as an MI view. `BOTTOM_UP` guarantees this ordering:
-
-```text
-Step 1: Inner Sort(orderkey) over ORDERS    → MIScan(innerMI, 0)  ← leaf, fires first
-Step 2: Inner Sort(orderkey) over LINEITEM  → MIScan(innerMI, 1)  ← leaf, fires second
-Step 3: Outer Sort(custkey) over inner result → sees MIScans → recognizes innerMI → MIScan(outerMI, 0)
-Step 4: Outer Sort(custkey) over CUSTOMER   → MIScan(outerMI, 1)
-```
-
-Previously we used **N sequential HepPlanner instances** (one per nesting level) to
-achieve this ordering. With `BOTTOM_UP`, a single HEP pass suffices.
-
----
-
-## Flow Chart A — Calcite's Normal Planning Workflow
-
-```text
-SQL String
-    │
-    ▼
-[SqlParser]                         → SqlNode  (AST)
-    │
-    ▼
-[SqlValidator]                      → SqlNode  (type-annotated)
-    │
-    ▼
-[SqlToRelConverter]                 → LogicalPlan  (convention = NONE)
-    │                                 e.g.  LogicalProject
-    │                                         └─ LogicalJoin
-    │                                              ├─ LogicalTableScan(A)
-    │                                              └─ LogicalTableScan(B)
-    │
-    ▼  Volcano planner (EnumerableRules)
-[Phase 1: logical → physical]       → Physical Pipeline  (convention = ENUMERABLE)
-    ENUMERABLE_TABLE_SCAN_RULE          e.g.  EnumerableProject
-    ENUMERABLE_MERGE_JOIN_RULE                  └─ EnumerableMergeJoin
-    ENUMERABLE_SORT_RULE                             ├─ EnumerableSort
-    ENUMERABLE_PROJECT_RULE                          │    └─ EnumerableTableScan(A)
-                                                     └─ EnumerableSort
-                                                          └─ EnumerableTableScan(B)
-    │
-    ▼  (code generation via Janino)
-[EnumerableRel.implement()]         → Java bytecode → execution
-```
-
----
-
-## Flow Chart B — Merged Index Substitution (Transparent Per-Source MI Scans)
-
-```text
-          ┌─────────────────────────────────────────────┐
-          │  (same physical pipeline from Flow A)       │
-          │   EnumerableMergeJoin                       │
-          │     ├─ EnumerableSort → EnumerableTableScan │
-          │     └─ EnumerableSort → EnumerableTableScan │
-          └───────────────┬─────────────────────────────┘
-                          │
-    ┌─────────────────────┼──────────────────────────┐
-    │  Between phases:    │                           │
-    │  walk plan tree, discover pipelines             │
-    │  register MergedIndex per pipeline              │
-    │  create MergedIndexScanGroup per pipeline       │
-    └─────────────────────┼──────────────────────────┘
-                          │
-                          ▼  HEP planner
-          [PipelineToMergedIndexScanRule]
-          Matches: EnumerableSort at pipeline boundary
-          Checks:  Sort's input is part of a registered MI
-          Fires:   Sort(input_chain) → MIScan(MI, srcIdx, group)
-                          │
-                          ▼
-          [Merged Index Plan — operators stay, Sorts replaced]
-          EnumerableMergeJoin                    ← STAYS
-            ├─ MIScan(MI, src=A, group=G1)      ← replaces Sort→Scan(A)
-            └─ MIScan(MI, src=B, group=G1)      ← replaces Sort→Scan(B)
-               G1 = shared physical scan object
-               (one sequential scan; MergeJoin assembles on-the-fly)
-```
-
-**Pipeline categories:**
-
-|              | Root pipeline | Other pipelines      |
-|--------------|---------------|----------------------|
-| Data flow    | Query plan    | Index creation plan  |
-| Delta flow   | N/A           | Maintenance plan     |
-
----
-
-## Flow Chart C — Merged Index Concept (Why It Matters)
-
-```
-TRADITIONAL QUERY EXECUTION                  WITH MERGED INDEX
-────────────────────────────────────         ──────────────────────────────────
-At query time:                               At update time (like a B-tree):
-  Scan(ORDERS)  ──sort(orderkey)──┐            Insert into merged index:
-  Scan(LINEITEM)──sort(orderkey)──┴►MergeJoin  k=1, tag=ORDERS,  row=(...)
-                                               k=1, tag=LINEITEM, row=(...)
-  Cost: O(N log N) sorts + O(N) join           k=2, tag=ORDERS,  row=(...)
-                                               k=2, tag=LINEITEM, row=(...)
-
-                                               At query time:
-                                               Scan merged index (one pass)
-                                               → assemble join on the fly
-
-                                               Cost: O(N) sequential read only
-                                               Space: same as two separate indexes
-                                               Update: 1 base insert → 1 index insert
-```
+ORDER BY is redundant after GROUP BY and was removed. The final MIScan absorbs
+all 5 joins + filter + aggregate, sorted by the GROUP BY key (n_name, o_year DESC).
 
 ---
 
@@ -320,15 +160,14 @@ Both ORDER BY and GROUP BY sorts are boundary sorts → two indexed view levels.
 
 ```text
 BEFORE (after sort-direction fix)
-  <!-- EnumerableSort(n_name ASC, o_year DESC)        ← ORDER BY (boundary) --> # REMOVED! 
-  EnumerableAggregate(n_name, o_year)
-    EnumerableSort(n_name ASC, o_year DESC)    ← GROUP BY (boundary, direction fixed)
-      EnumerableProject → Filter → 5 nested MergeJoins...
+EnumerableAggregate(n_name, o_year)
+  EnumerableSort(n_name ASC, o_year DESC)    ← GROUP BY (boundary sort)
+    EnumerableProject → Filter → 5 nested MergeJoins...
 ```
 
 ```text
-AFTER — Entire plan collapses to a single scan
-MIScan(ivMI)
+AFTER — Entire plan collapses to indexed view scan
+EnumerableMergedIndexScan(ivMI)               ← indexed view, sorted by n_name, o_year DESC
 ```
 
 Inner pipelines (index creation plans, 5 levels):
@@ -386,6 +225,15 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 - "Top side" = output side (root pipeline, final result).
 - Two-pipeline test output structure added to SESSION_PROGRESS.md for Q12, Q3-OL, Q9.
 
+### Documentation Migration (2026-03-24)
+- Migrated stable reference content from SESSION_PROGRESS.md to CLAUDE.md:
+  - "Calcite Planner Architecture: Volcano vs HEP" (revised with current single-pass BOTTOM_UP approach)
+  - "Architecture: Sort-Boundary-Based Pipeline Replacement" (documents current operand pattern)
+  - "Flow Chart A/B/C" (planning workflow and merged index concept)
+  - "Multi-stage HEP for nested pipelines" (replaced outdated two-pass section)
+- Updated Q9 plan documentation: removed redundant ORDER BY sort note; clarified indexed view scan as final step.
+- Cleaned up SESSION_PROGRESS.md to keep only ephemeral session content (status table, commands, test summaries).
+
 ## Next Steps
 
 ### [Short-term] (Next Session)
@@ -393,7 +241,16 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 1. **EnumerableMergedIndexScan.java — Document cost model with scan group sharing**
    - Different sources in same MI are separate MIScans but share one physical scan.
    - Realistic cost model delegates to `scanGroup` instead of per-scan overhead.
-   - For research purposes, add Javadoc explaining the design decision.
+   - Add Javadoc explaining the design decision and cost formula.
+
+2. **isBoundarySort() Javadoc — Add future-work note on LimitSort**
+   - Current implementation marks `LIMIT` + `OFFSET` as non-boundary (correct).
+   - Note: `LimitSort` (fetch + order by) may become a boundary in future (e.g., for top-K indexed views).
+   - Reference: Q3-OL test, where `LimitSort` correctly stays in the final plan.
+
+3. **Cleanup: Remove stale DOT artifacts**
+   - Check `plus/test-dot-output/` for Q9 leaf-4, Q3-OL branch-1 references in comments.
+   - Ensure all Javadoc plan diagrams use current final structure (no obsolete node counts).
 
 ### [Medium-term] (Future Sessions)
 

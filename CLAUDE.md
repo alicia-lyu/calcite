@@ -166,10 +166,11 @@ Even though `o_orderkey → o_custkey` (FK), orderkey is NOT structured as
 (LINEITEM+ORDERS by orderkey), outer (inner_view+CUSTOMER by custkey). `MergedIndex
 .satisfies()` uses exact prefix matching; FD-based equivalence is future work.
 
-**Q9 two-tier plan** — the AFTER plan has a query tier (one `EnumerableMergedIndexJoin`
-backed by one scan) and a maintenance tier (the 5 intermediate joins, absorbed into the
-nested merged indexes at update time). `EnumerableFilter(p_name LIKE '%green%')` remains
-in the query tier because the PART filter cannot be pushed below the assembled join result.
+**Q9 two-tier plan** — the AFTER plan has a query tier (one `EnumerableMergedIndexScan`
+of the indexed view on nationkey and o_year DESC) and a maintenance tier (the 5 intermediate
+join pipelines, absorbed into nested merged indexes at update time). `EnumerableFilter(p_name
+LIKE '%green%')` is applied after the indexed view scan because the PART filter cannot be
+pushed below the assembled join result.
 
 ## Key Files for the Merged Index Feature
 
@@ -207,30 +208,109 @@ in the query tier because the PART filter cannot be pushed below the assembled j
 
 "Bottom side"/earlier refers to input side. "Top side"/later refers to output side. Use smaller number for bottom side.
 
-### Two cases in PipelineToMergedIndexScanRule
+### Calcite Planner Architecture: Volcano vs HEP
 
-**Inner pipeline** — both sources are base tables (`RelOptTable`):
+Calcite has **two independent planner engines**. Understanding both is essential for
+this project because we use them in sequence.
+
+#### Volcano (Phase 1) — Cost-Based Optimizer
+
+The classic Cascade/Volcano framework:
+- Explores equivalent plans via **rules** that fire on pattern matches
+- Maintains a **memo** of equivalent expressions grouped by properties (traits like
+  sort order, convention/physical-operator-set)
+- Multiple rules can fire on the same node, producing **alternatives**
+- The planner picks the **cheapest** plan using the cost model
+
+**In our pipeline**: Phase 1 uses Volcano to convert the logical plan (LogicalJoin,
+LogicalTableScan, etc.) to a physical plan (EnumerableMergeJoin, EnumerableSort,
+EnumerableTableScan, etc.). It chooses between hash join vs merge join, hash aggregate
+vs sorted aggregate, etc. — all based on cost.
+
+#### HEP (Phase 2) — Heuristic/Deterministic Rewriter
+
+A simpler, **deterministic rewrite engine** (no cost comparison):
+- Applies rules as **unconditional rewrites** — if a rule matches, the replacement happens
+- Processes the plan in a configurable traversal order:
+  - `BOTTOM_UP`: leaves first, then ancestors (what we use — inner Sorts fire before outer)
+  - `TOP_DOWN`: root first, then descendants
+  - `DEPTH_FIRST`: avoids re-processing after each transformation
+  - `ARBITRARY`: default, efficient, order doesn't matter
+- Think of HEP as **"find-and-replace for plan trees"**
+
+**In our pipeline**: Phase 2 uses HEP to apply `PipelineToMergedIndexScanRule`. This is
+a deterministic rewrite — if a Sort's input matches a registered MI, replace it. No cost
+comparison needed (MI scan is always preferred). HEP is ideal because we want unconditional
+substitution and need control over traversal order.
+
+#### What Is a "Rule"?
+
+A **rule** is a pattern-match-and-transform unit with two parts:
+1. **Operand pattern**: What plan node to match (e.g., `EnumerableSort` with no FETCH/OFFSET)
+2. **`onMatch(call)`**: Inspect the node, optionally call `call.transformTo(replacement)`
+
+In Volcano, multiple rules can fire on the same node → produces alternatives → cost picks
+winner. In HEP, rules fire and replace unconditionally.
+
+#### Why BOTTOM_UP Matters for Nested Pipelines
+
+For nested pipelines (Q3-OL, Q9), inner boundary Sorts must be replaced by MIScans
+**before** outer Sorts fire. Otherwise, the outer Sort can't recognize its inner subtree
+as an MI view. `BOTTOM_UP` guarantees this ordering:
 
 ```text
-EnumerableMergeJoin
-  EnumerableSort → (aggregate/project chain →) EnumerableTableScan [A]
-  EnumerableSort → EnumerableTableScan [B]
+Step 1: Inner Sort(orderkey) over ORDERS    → MIScan(innerMI, 0)  ← leaf, fires first
+Step 2: Inner Sort(orderkey) over LINEITEM  → MIScan(innerMI, 1)  ← leaf, fires second
+Step 3: Outer Sort(custkey) over inner result → sees MIScans → recognizes innerMI → MIScan(outerMI, 0)
+Step 4: Outer Sort(custkey) over CUSTOMER   → MIScan(outerMI, 1)
 ```
 
-Replaced by a single leaf `EnumerableMergedIndexScan`. Join assembly + aggregation
-are pre-computed at maintenance time; no assembly needed at query time.
+Previously we used **N sequential HepPlanner instances** (one per nesting level) to
+achieve this ordering. With `BOTTOM_UP`, a single HEP pass suffices.
 
-**Outer pipeline** — left source is an inner `MergedIndex` view:
+### Architecture: Sort-Boundary-Based Pipeline Replacement
 
-```text
-EnumerableMergeJoin
-  EnumerableSort → EnumerableMergedIndexScan [inner view]
-  EnumerableSort → EnumerableTableScan [C]
-```
+**Current design** (as of 2026-03-23): `PipelineToMergedIndexScanRule` is centered on
+`EnumerableSort` nodes at pipeline boundaries, not on `MergeJoin` nodes.
 
-Replaced by `EnumerableMergedIndexJoin → EnumerableMergedIndexScan(outer)`. The
-outer scan reads co-located (inner join result + C) records by the shared key; the
-join operator assembles the Cartesian product at query time.
+**Why**: A Sort boundary marks the transition between two pipelines. When a Sort's input
+contains a registered merged index, the entire subtree (including joins, aggregations,
+and filters) gets absorbed into that index at update time. The query-time plan replaces
+the Sort with a direct scan (`EnumerableMergedIndexScan`).
+
+**Two cases**:
+
+1. **Inner pipeline** — both sources are base tables (`RelOptTable`):
+   ```text
+   EnumerableSort(key)
+     EnumerableMergeJoin(key)
+       EnumerableSort → (aggregate/project chain →) EnumerableTableScan [A]
+       EnumerableSort → EnumerableTableScan [B]
+   ```
+   Replaced by: `EnumerableMergedIndexScan(innerMI, sourceIdx, group)` (per source).
+   Join assembly + aggregation are pre-computed at maintenance time; no assembly at query time.
+
+2. **Outer pipeline** — source is an inner `MergedIndex` view plus a base table:
+   ```text
+   EnumerableSort(key)
+     EnumerableMergeJoin(key)
+       EnumerableSort → EnumerableMergedIndexScan [inner view]
+       EnumerableSort → EnumerableTableScan [C]
+   ```
+   Replaced by: `EnumerableMergedIndexScan(outerMI, sourceIdx, group)` (per source).
+   The parent `MergeJoin` stays in the plan; it assembles outer records at query time.
+
+**Matching strategy** (structural, not identity-based):
+- For each registered `MergedIndex`, check if the Sort's input contains a leaf table
+  matching one of the MI's sources.
+- Use qualified table name (schema + table) for matching because HEP copies non-leaf
+  RelNodes, destroying identity.
+- Leaf `EnumerableTableScan` nodes survive HEP's node-copying because they have no
+  children (not wrapped in `HepRelVertex`).
+
+### Two Production Paths for Merged Index Optimization
+
+There are two distinct scenarios; the current rule only handles PATH A:
 
 ### MergedIndex.of() — mixed sources factory
 
@@ -261,30 +341,36 @@ private static RelNode unwrap(RelNode node) {
 Every access to `join.getLeft()`, `join.getRight()`, and `sort.getInput()` must
 call `unwrap()` first to get the actual rel node.
 
-### Two-pass HEP for multi-level pipelines (tpchQ3OrdersLineitem)
+### Multi-stage HEP for nested pipelines (Q3-OL, Q9)
 
-When an outer pipeline depends on replacing an inner pipeline first, a **single**
-HEP pass is unreliable: HEP may process the outer join before firing the inner
-replacement, leaving the outer join unmatched. Fix: use **two separate `HepPlanner`
-instances** — pass 1 replaces inner joins (producing `MergedIndexScan`), pass 2
-replaces the outer join (which now sees `Sort → MergedIndexScan`).
+When an outer pipeline depends on an inner pipeline, use **BOTTOM_UP traversal** in
+HEP to ensure leaf pipelines are replaced first. Register merged indexes incrementally
+(leaf-to-root) across multiple HEP passes:
 
 ```java
-HepPlanner pass1 = new HepPlanner(hepPass);
+// Pass 1: Replace inner Sort(orderkey) → MIScan(innerMI, 0 and 1)
+HepPlanner pass1 = new HepPlanner(hepProgram);
 pass1.setRoot(phase1Plan);
 RelNode afterPass1 = pass1.findBestExp();
 
-HepPlanner pass2 = new HepPlanner(hepPass);
+// Between passes: register inner MI, extract indexCreationPlan
+MergedIndex innerMI = new MergedIndex(innerPipeline);
+MergedIndexRegistry.register(innerMI);
+
+// Pass 2: Replace outer Sort(custkey) → MIScan(outerMI, 0 and 1)
+HepPlanner pass2 = new HepPlanner(hepProgram);
 pass2.setRoot(afterPass1);
 RelNode phase2Plan = pass2.findBestExp();
+
+// Register outer MI, extract indexCreationPlan
+MergedIndex outerMI = new MergedIndex(outerPipeline);
+MergedIndexRegistry.register(outerMI);
 ```
 
-### findAllPipelines — test helper for multi-level discovery
-
-For tests with nested pipelines, `findAllPipelines(RelNode)` does a post-order
-walk and collects each `EnumerableMergeJoin` that can be resolved. Inner pipelines
-are collected before outer ones because of post-order traversal. Sources are stored
-as `RelOptTable` or `Pipeline` (resolved to `MergedIndex` during registration).
+**Why multiple passes**: a single pass with BOTTOM_UP can replace multiple pipeline
+levels, but for complex queries (Q9 with 6 tables), explicit per-level registration
+makes the index creation plan structure clear. Each pass writes `pipeline.indexCreationPlan`
+after HEP completes.
 
 ### Cost model for EnumerableMergedIndexScan
 
