@@ -116,6 +116,15 @@ public abstract class SetOp extends AbstractRelNode implements Hintable {
   @Override protected RelDataType deriveRowType() {
     final List<RelDataType> inputRowTypes =
         Util.transform(inputs, RelNode::getRowType);
+    // Fast path: if all inputs have the same row type, return it directly.
+    // Avoids leastRestrictive() reconstruction which may produce a structurally
+    // different type object (e.g., JavaType vs reconstructed SQL type), causing
+    // HepRuleCall.verifyTypeEquivalence to fail.
+    // Correctness: leastRestrictive([T, T, ..., T]) = T by definition.
+    final RelDataType first = inputRowTypes.get(0);
+    if (inputRowTypes.stream().allMatch(first::equals)) {
+      return first;
+    }
     final RelDataType rowType =
         getCluster().getTypeFactory().leastRestrictive(inputRowTypes);
     if (rowType == null) {
