@@ -220,6 +220,8 @@ class MergedIndexTpchPlanTest {
     System.out.println("=== Q12 MAINTENANCE PLAN (incremental) ===");
     System.out.println(dumpText(joinPipeline.mergedIndex.getMaintenancePlan()));
     writeDotFile("q12/maintenance", joinPipeline.mergedIndex.getMaintenancePlan());
+    writeDotFile("q12/maintenance-tree",
+        MergedIndexTestUtil.treeifyPlan(joinPipeline.mergedIndex.getMaintenancePlan()));
 
     // ── Phase 2: incremental MI registration with multi-stage HEP ────────
     // Pass 1: replace join pipeline boundary Sorts (orderkey) with MIScans.
@@ -479,6 +481,8 @@ class MergedIndexTpchPlanTest {
       final RelNode mp = pipelines.get(i).mergedIndex.getMaintenancePlan();
       if (mp != null) {
         writeDotFile("q3ol/maintenance-" + i, mp);
+        writeDotFile("q3ol/maintenance-" + i + "-tree",
+            MergedIndexTestUtil.treeifyPlan(mp));
       }
     }
 
@@ -784,6 +788,8 @@ class MergedIndexTpchPlanTest {
       final RelNode mp = joinPipelinesQ9.get(i).mergedIndex.getMaintenancePlan();
       if (mp != null) {
         writeDotFile("q9/maintenance-" + i, mp);
+        writeDotFile("q9/maintenance-" + i + "-tree",
+            MergedIndexTestUtil.treeifyPlan(mp));
       }
     }
 
@@ -981,16 +987,34 @@ class MergedIndexTpchPlanTest {
    * <p>Wraps the logical pipeline subtree in {@link LogicalDelta} and applies
    * {@link StreamRules} via HEP to push Delta down through all operators:
    * <pre>
-   *   Delta(A join B)     = (A join Delta(B)) UNION ALL (Delta(A) join B)
-   *   Delta(Project(X))   = Project(Delta(X))
-   *   Delta(Aggregate(X)) = Aggregate(Delta(X))
-   *   Delta(Filter(X))    = Filter(Delta(X))
-   *   Delta(Sort(X))      = Sort(Delta(X))
+   *   Delta(A &#x22CA; B)          &#x2192; (A &#x22CA; Delta(B)) &#x222A; (Delta(A) &#x22CA; B)
+   *   Delta(Project(X))      &#x2192; Project(Delta(X))
+   *   Delta(Aggregate(X))    &#x2192; Aggregate(Delta(X))
+   *   Delta(Filter(X))       &#x2192; Filter(Delta(X))
+   *   Delta(Sort(X))         &#x2192; Sort(Delta(X))
    * </pre>
    *
    * <p>{@code LogicalDelta(TableScan)} at leaves represents the change stream.
    * DeltaTableScanRule and DeltaTableScanToEmptyRule are excluded so that
    * Delta markers remain on leaf scans for consumer use.
+   *
+   * <h3>DAG shape</h3>
+   *
+   * <p>The returned plan may be a DAG (not a tree): {@code DeltaJoinTransposeRule}
+   * reuses the same {@link RelNode} references in both union branches, so base
+   * table scans can have multiple parents. This is standard Calcite behavior and
+   * is correct — use {@link MergedIndexTestUtil#treeifyPlan} for tree-shaped
+   * presentation in DOT/text dumps.
+   *
+   * <h3>Batch-delta semantics</h3>
+   *
+   * <p>The IVM join formula {@code &#x394;(A &#x22CA; B) = (&#x394;A &#x22CA; B) &#x222A; (A &#x22CA; &#x394;B)} is exact
+   * for single-tuple deltas (one insert at a time) but double-counts
+   * {@code &#x394;A &#x22CA; &#x394;B} for simultaneous batch deltas to both sides. Production
+   * systems resolve this via ordered application: process &#x394;A against old B first,
+   * then &#x394;B against new A (= A &#x222A; &#x394;A). This ordering is an execution-tier concern
+   * outside Calcite's plan-generation scope; the plan structure is correct
+   * regardless.
    *
    * @param logicalSubtree the full logical subtree for this pipeline
    *        (input of the upper boundary Sort, excluding the Sort itself)

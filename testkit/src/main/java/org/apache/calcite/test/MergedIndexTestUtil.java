@@ -34,6 +34,8 @@ import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.logical.LogicalSort;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -252,5 +254,68 @@ public final class MergedIndexTestUtil {
       }
     }
     return false;
+  }
+
+  // ── DAG → tree conversion ─────────────────────────────────────────────
+
+  /**
+   * Converts a DAG-shaped RelNode graph into a proper tree by copying
+   * any node that is visited more than once.
+   *
+   * <p>Calcite's {@code DeltaJoinTransposeRule} reuses the same RelNode
+   * references in both union branches of the IVM formula, producing a DAG
+   * where base table scans have multiple parents. This is correct and
+   * efficient internally, but DOT/text dumps render shared nodes as
+   * multi-parent edges which obscures the tree structure.
+   *
+   * <p>This method walks the graph and creates fresh copies (via
+   * {@link RelNode#copy}) of any subtree rooted at a previously visited
+   * node, producing a tree where every node has exactly one parent.
+   *
+   * @param root the (possibly DAG-shaped) plan
+   * @return a tree-shaped copy with no shared nodes
+   */
+  public static RelNode treeifyPlan(RelNode root) {
+    return treeifyPlan(root, new IdentityHashMap<>());
+  }
+
+  private static RelNode treeifyPlan(RelNode node,
+      IdentityHashMap<RelNode, Boolean> visited) {
+    // First, recursively treeify all children
+    final List<RelNode> oldInputs = node.getInputs();
+    final List<RelNode> newInputs = new ArrayList<>(oldInputs.size());
+    boolean inputChanged = false;
+    for (RelNode input : oldInputs) {
+      RelNode newInput;
+      if (visited.containsKey(input)) {
+        // This subtree was already visited — deep copy it
+        newInput = deepCopy(input);
+      } else {
+        visited.put(input, Boolean.TRUE);
+        newInput = treeifyPlan(input, visited);
+      }
+      newInputs.add(newInput);
+      if (newInput != input) {
+        inputChanged = true;
+      }
+    }
+    if (inputChanged) {
+      return node.copy(node.getTraitSet(), newInputs);
+    }
+    return node;
+  }
+
+  /** Deep-copies a RelNode subtree so that no node is shared with the original. */
+  private static RelNode deepCopy(RelNode node) {
+    final List<RelNode> oldInputs = node.getInputs();
+    if (oldInputs.isEmpty()) {
+      // Leaf node — copy it to get a new Java object
+      return node.copy(node.getTraitSet(), Collections.emptyList());
+    }
+    final List<RelNode> newInputs = new ArrayList<>(oldInputs.size());
+    for (RelNode input : oldInputs) {
+      newInputs.add(deepCopy(input));
+    }
+    return node.copy(node.getTraitSet(), newInputs);
   }
 }
