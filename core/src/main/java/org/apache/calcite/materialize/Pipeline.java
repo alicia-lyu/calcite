@@ -22,6 +22,7 @@ import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Sort;
+import org.apache.calcite.rel.logical.LogicalSort;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -80,6 +81,19 @@ public class Pipeline {
    * Null for pipelines that have not (yet) been matched to a merged index.
    */
   public @Nullable MergedIndex mergedIndex;
+
+  /**
+   * Logical plan subtree corresponding to this pipeline's content
+   * (assembly subtree + remaining operators above assembly LCA).
+   * Set by {@link #captureLogicalRoots} after sort injection; null
+   * until then.
+   *
+   * <p>Used to derive the IVM maintenance plan: wrapping this subtree
+   * in {@link org.apache.calcite.rel.logical.LogicalDelta} and applying
+   * StreamRules pushes Delta through all pipeline operators to the leaf
+   * table scans.
+   */
+  public @Nullable RelNode logicalRoot;
 
   // future work: physicalPlan // query-time or update-time
 
@@ -249,6 +263,64 @@ public class Pipeline {
       this.nodes = nodes;
       this.boundarySorts = boundarySorts;
     }
+  }
+
+  // ── Logical root capture for IVM derivation ─────────────────────────────
+
+  /**
+   * Captures the logical subtree for each non-root pipeline by walking
+   * the logical plan's boundary {@link LogicalSort} nodes in post-order.
+   *
+   * <p>Every non-root pipeline has a parent that stores its output.
+   * The maintenance plan for that parent MI is derived from this
+   * pipeline's {@link #logicalRoot}. The criterion is structural
+   * (parent exists), not content-based (no join/aggregate filtering).
+   *
+   * @param pipelineTree the root pipeline from {@link #buildTree}
+   * @param logicalPlan the full logical plan after sort injection
+   */
+  public static void captureLogicalRoots(Pipeline pipelineTree,
+      RelNode logicalPlan) {
+    final List<RelNode> logicalSubtrees = new ArrayList<>();
+    collectAllBoundarySortInputs(logicalPlan, logicalSubtrees);
+
+    final List<Pipeline> nonRootPipelines = new ArrayList<>();
+    collectAllNonRootPipelines(pipelineTree, nonRootPipelines);
+
+    for (int i = 0; i < nonRootPipelines.size()
+        && i < logicalSubtrees.size(); i++) {
+      nonRootPipelines.get(i).logicalRoot = logicalSubtrees.get(i);
+    }
+  }
+
+  /** Post-order collection of ALL boundary LogicalSort inputs. */
+  private static void collectAllBoundarySortInputs(RelNode node,
+      List<RelNode> result) {
+    for (RelNode input : node.getInputs()) {
+      collectAllBoundarySortInputs(input, result);
+    }
+    if (isLogicalBoundarySort(node)) {
+      result.add(((Sort) node).getInput());
+    }
+  }
+
+  /** Post-order collection of all non-root pipelines (all sources,
+   *  recursively). Matches the boundary Sort traversal order. */
+  private static void collectAllNonRootPipelines(Pipeline p,
+      List<Pipeline> result) {
+    for (Pipeline child : p.sources) {
+      collectAllNonRootPipelines(child, result);
+      result.add(child);
+    }
+  }
+
+  private static boolean isLogicalBoundarySort(RelNode node) {
+    if (!(node instanceof LogicalSort)) {
+      return false;
+    }
+    final Sort sort = (Sort) node;
+    return sort.fetch == null && sort.offset == null
+        && !sort.getCollation().getFieldCollations().isEmpty();
   }
 
   // ── Pipeline discovery (moved from MergedIndexTestUtil) ─────────────────
