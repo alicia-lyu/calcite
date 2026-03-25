@@ -291,6 +291,28 @@ public class Pipeline {
         && i < logicalSubtrees.size(); i++) {
       nonRootPipelines.get(i).logicalRoot = logicalSubtrees.get(i);
     }
+
+    // Also set the root pipeline's logicalRoot to the full logical plan root.
+    // The root pipeline has no parent boundary sort — its content spans from
+    // the plan root down to its own boundary Sorts. Setting logicalRoot to the
+    // plan root (or its single input if it is a LimitSort) allows callers to
+    // derive a maintenance plan for the root pipeline's assembly subtree too.
+    pipelineTree.logicalRoot = stripTopLevelLimitSort(logicalPlan);
+  }
+
+  /**
+   * If {@code node} is a Sort with FETCH or OFFSET (LimitSort), returns its
+   * input; otherwise returns {@code node} unchanged. Used to strip ORDER BY
+   * LIMIT wrappers before assigning a pipeline's logicalRoot.
+   */
+  private static RelNode stripTopLevelLimitSort(RelNode node) {
+    if (node instanceof Sort) {
+      final Sort sort = (Sort) node;
+      if (sort.fetch != null || sort.offset != null) {
+        return sort.getInput();
+      }
+    }
+    return node;
   }
 
   /** Post-order collection of ALL boundary LogicalSort inputs. */
