@@ -225,7 +225,7 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 - "Top side" = output side (root pipeline, final result).
 - Two-pipeline test output structure added to SESSION_PROGRESS.md for Q12, Q3-OL, Q9.
 
-### Documentation Migration & Cost Model Refinement (2026-03-24)
+### Documentation Migration & Cost Model Refinement (2026-03-24 Session A)
 - Migrated stable reference content from SESSION_PROGRESS.md to CLAUDE.md:
   - "Calcite Planner Architecture: Volcano vs HEP" (revised with current single-pass BOTTOM_UP approach)
   - "Architecture: Sort-Boundary-Based Pipeline Replacement" (documents current operand pattern)
@@ -237,30 +237,53 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
   - Expanded `MergedIndexScanGroup` class-level Javadoc explaining why the class exists and the I/O sharing design decision for future cost refinements.
 - Fixed checkstyle violations in `MergedIndexRegistry.java` (instanceof line-wrap).
 
+### Incremental Maintenance Plan Rewrite (2026-03-24 Session B)
+- **Core issue resolved:** `HepPlanner` + `StreamRules` were failing on TPC-H plans due to type-equivalence mismatch.
+- **Root cause:** `SetOp.deriveRowType()` was reconstructing union row types via `leastRestrictive()` even when all inputs had structurally identical types (JavaType → VARCHAR conversion).
+- **Solution (commit `cdaa4b637`):** Added fast-path in `SetOp.deriveRowType()` — when all inputs have structurally equal row types, return first directly without reconstruction.
+  - Mathematically correct: `leastRestrictive([T,T,...,T]) = T`.
+  - Eliminates spurious type-equivalence failures in HEP.
+  - Enables general-purpose HEP + StreamRules approach for deriving maintenance plans.
+- **Pipeline.logicalRoot field (commit `9c01144a7`):**
+  - Added `logicalRoot` field to store corresponding logical subtree per pipeline.
+  - Added `captureLogicalRoots(Pipeline, RelNode)` helper to walk logical plan post-order, matching boundary LogicalSort inputs to non-root pipelines.
+  - Criterion is structural (parent exists), not content-based — every non-root pipeline gets a logicalRoot.
+- **deriveMaintenancePlan rewrite (commit `e27b14124`):**
+  - Wrapped in `LogicalDelta` + applied `StreamRules` via HEP (6 rules: all except DeltaTableScanRule/EmptyRule).
+  - Updated all 3 test call sites (Q12, Q3-OL, Q9) to use `Pipeline.captureLogicalRoots()` + `p.logicalRoot`.
+  - Q12 maintenance plan now correctly includes LogicalProject above the union (remaining op above assembly).
+  - All 3 tests pass — entire maintenance-plan derivation is now general-purpose (not join-only).
+
 ## Next Steps
 
 ### [Short-term] (Next Session)
 
-1. **Pipeline.java — Add `getIndexCreationPlan()` getter for explicit access**
-   Currently `mergedIndex.indexCreationPlan` must be accessed via MergedIndex reference.
-   Add convenience getter to Pipeline for direct query-time access by PipelineToMergedIndexScanRule.
+1. **MergedIndexTpchPlanTest.java — Verify maintenance plan structure across Q12, Q3-OL, Q9**
+   Inspect serialized maintenance plans (index creation plans) to confirm:
+   - Q12: indexed view maintenance includes LogicalProject above union assembly.
+   - Q3-OL: two-level maintenance cascade (inner MI populates, outer MI consumes delta).
+   - Q9: five-level maintenance cascade (leaf-to-root).
+   Add test assertions verifying `indexCreationPlan` node types for each level.
 
-2. **MergedIndex.java — Document indexCreationPlan lifecycle across nested levels**
-   Clarify: non-root pipelines capture `root` as indexCreationPlan after HEP pass.
+2. **MergedIndex.java — Add Javadoc for indexCreationPlan lifecycle**
+   Clarify: non-root pipelines capture `pipeline.root` as indexCreationPlan after HEP pass.
    Root pipeline (query-time) does NOT capture; indexCreationPlan remains null.
-   Document exception handling for future incremental maintenance delta logic.
+   Document incremental maintenance delta logic for future implementation.
 
 ### [Medium-term] (Future Sessions)
 
-1. **Maintenance plans for indexed views** — single-source pipelines currently skip `setMaintenancePlan`.
+1. **Maintenance-time assembly operator** — extend `EnumerableMergedIndexScan` to execute maintenance plans.
+   Currently MIScans only handle query-time assembly. Maintenance requires variant reading delta stream instead of full data.
+
+2. **Single-source pipeline maintenance** — `setMaintenancePlan` for indexed views.
    Design: single delta branch (not union of two). Reconcile with existing delta infrastructure.
 
-2. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI), Q14 (complex filters).
+3. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI), Q14 (complex filters).
 
-3. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
+4. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
    ORDERKEY→CUSTKEY recognition; enable 3-table merged indexes without manual registration.
 
-4. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
+5. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
 
 ### [Long-term]
 
