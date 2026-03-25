@@ -220,8 +220,8 @@ class MergedIndexTpchPlanTest {
     System.out.println("=== Q12 MAINTENANCE PLAN (incremental) ===");
     System.out.println(dumpText(joinPipeline.mergedIndex.getMaintenancePlan()));
     writeDotFile("q12/maintenance", joinPipeline.mergedIndex.getMaintenancePlan());
-    writeDotFile("q12/maintenance-tree",
-        MergedIndexTestUtil.treeifyPlan(joinPipeline.mergedIndex.getMaintenancePlan()));
+    writeDotFileTree("q12/maintenance-tree",
+        joinPipeline.mergedIndex.getMaintenancePlan());
 
     // ── Phase 2: incremental MI registration with multi-stage HEP ────────
     // Pass 1: replace join pipeline boundary Sorts (orderkey) with MIScans.
@@ -481,8 +481,7 @@ class MergedIndexTpchPlanTest {
       final RelNode mp = pipelines.get(i).mergedIndex.getMaintenancePlan();
       if (mp != null) {
         writeDotFile("q3ol/maintenance-" + i, mp);
-        writeDotFile("q3ol/maintenance-" + i + "-tree",
-            MergedIndexTestUtil.treeifyPlan(mp));
+        writeDotFileTree("q3ol/maintenance-" + i + "-tree", mp);
       }
     }
 
@@ -788,8 +787,7 @@ class MergedIndexTpchPlanTest {
       final RelNode mp = joinPipelinesQ9.get(i).mergedIndex.getMaintenancePlan();
       if (mp != null) {
         writeDotFile("q9/maintenance-" + i, mp);
-        writeDotFile("q9/maintenance-" + i + "-tree",
-            MergedIndexTestUtil.treeifyPlan(mp));
+        writeDotFileTree("q9/maintenance-" + i + "-tree", mp);
       }
     }
 
@@ -1003,8 +1001,8 @@ class MergedIndexTpchPlanTest {
    * <p>The returned plan may be a DAG (not a tree): {@code DeltaJoinTransposeRule}
    * reuses the same {@link RelNode} references in both union branches, so base
    * table scans can have multiple parents. This is standard Calcite behavior and
-   * is correct — use {@link MergedIndexTestUtil#treeifyPlan} for tree-shaped
-   * presentation in DOT/text dumps.
+   * is correct — use {@code writeDotFileTree} for guaranteed tree-shaped DOT
+   * output (per-visit IDs; no identity dedup).
    *
    * <h3>Batch-delta semantics</h3>
    *
@@ -1160,6 +1158,93 @@ class MergedIndexTpchPlanTest {
       sb.append(";\n");
     }
     return id;
+  }
+
+  /**
+   * Renders a RelNode graph as a DOT string in tree mode (no dedup).
+   * Each visit to a shared node produces a separate DOT node,
+   * ensuring the output is always a tree even if the input is a DAG.
+   *
+   * <p>Motivation: {@code LogicalTableScan.copy()} returns {@code this},
+   * so identity-based dedup in {@link #dumpDotColor} cannot be fixed by
+   * copying leaf nodes. Per-visit IDs bypass the problem entirely.
+   */
+  private static String dumpDotTree(RelNode rel) {
+    final StringBuilder sb = new StringBuilder("digraph {\n  rankdir=BT;\n");
+    final int[] counter = {0};
+    dumpDotTreeNode(rel, sb, counter);
+    sb.append("}\n");
+    return sb.toString();
+  }
+
+  /** Recursively renders nodes in tree mode — no identity dedup.
+   * Returns the node ID assigned to this visit. */
+  private static int dumpDotTreeNode(RelNode node, StringBuilder sb,
+      int[] counter) {
+    final int id = counter[0]++;
+    final String explain = RelOptUtil.dumpPlan("", node,
+        SqlExplainFormat.TEXT, SqlExplainLevel.EXPPLAN_ATTRIBUTES).trim();
+    final String label = explain.lines().findFirst()
+        .orElse(node.getClass().getSimpleName()).trim().replace("\"", "'");
+    sb.append("  n").append(id).append(" [label=\"").append(label).append("\"];\n");
+    final List<RelNode> inputs = node.getInputs();
+    for (int i = 0; i < inputs.size(); i++) {
+      final int childId = dumpDotTreeNode(inputs.get(i), sb, counter);
+      sb.append("  n").append(childId).append(" -> n").append(id).append(";\n");
+    }
+    return id;
+  }
+
+  /**
+   * Renders a RelNode graph as a colorful DOT string in tree mode (no dedup).
+   * Each visit to a shared node produces a separate DOT node,
+   * ensuring the output is always a tree even if the input is a DAG.
+   */
+  private static String dumpDotColorTree(RelNode rel) {
+    final StringBuilder sb = new StringBuilder(
+        "digraph {\n  rankdir=BT;\n  node [fontname=\"Helvetica\"];\n");
+    final int[] counter = {0};
+    dumpDotColorTreeNode(rel, sb, counter);
+    sb.append("}\n");
+    return sb.toString();
+  }
+
+  /** Recursively renders nodes in tree mode with colors — no identity dedup.
+   * Returns the node ID assigned to this visit. */
+  private static int dumpDotColorTreeNode(RelNode node, StringBuilder sb,
+      int[] counter) {
+    final int id = counter[0]++;
+    final String explain = RelOptUtil.dumpPlan("", node,
+        SqlExplainFormat.TEXT, SqlExplainLevel.EXPPLAN_ATTRIBUTES).trim();
+    final String firstLine = explain.lines().findFirst()
+        .orElse(node.getClass().getSimpleName()).trim();
+    final String label = nodeLabel(node, firstLine);
+    final String color = nodeColor(node);
+    sb.append("  n").append(id)
+        .append(" [label=\"").append(label).append("\"")
+        .append(", style=filled, fillcolor=\"").append(color).append("\"")
+        .append("];\n");
+    final List<RelNode> inputs = node.getInputs();
+    for (int i = 0; i < inputs.size(); i++) {
+      final int childId = dumpDotColorTreeNode(inputs.get(i), sb, counter);
+      final String edgeLabel = inputs.size() > 1 ? (i == 0 ? "left" : "right") : "";
+      sb.append("  n").append(childId).append(" -> n").append(id);
+      if (!edgeLabel.isEmpty()) {
+        sb.append(" [label=\"").append(edgeLabel).append("\"]");
+      }
+      sb.append(";\n");
+    }
+    return id;
+  }
+
+  /**
+   * Writes tree-mode DOT files (no identity dedup) for {@code rel}.
+   * Unlike {@link #writeDotFile}, this never merges shared nodes —
+   * each traversal visit gets a fresh DOT node ID.
+   */
+  private static void writeDotFileTree(String name, RelNode rel) {
+    writeDotToFile(name + ".dot", dumpDotTree(rel));
+    writeDotToFile(name + "_color.dot", dumpDotColorTree(rel));
   }
 
   /**

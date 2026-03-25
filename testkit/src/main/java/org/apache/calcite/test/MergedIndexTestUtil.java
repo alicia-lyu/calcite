@@ -259,21 +259,19 @@ public final class MergedIndexTestUtil {
   // ── DAG → tree conversion ─────────────────────────────────────────────
 
   /**
-   * Converts a DAG-shaped RelNode graph into a proper tree by copying
+   * Converts a DAG-shaped RelNode graph into a tree by copying
    * any node that is visited more than once.
    *
    * <p>Calcite's {@code DeltaJoinTransposeRule} reuses the same RelNode
-   * references in both union branches of the IVM formula, producing a DAG
-   * where base table scans have multiple parents. This is correct and
-   * efficient internally, but DOT/text dumps render shared nodes as
-   * multi-parent edges which obscures the tree structure.
+   * references in both union branches of the IVM formula, producing a DAG.
    *
-   * <p>This method walks the graph and creates fresh copies (via
-   * {@link RelNode#copy}) of any subtree rooted at a previously visited
-   * node, producing a tree where every node has exactly one parent.
+   * <p><b>Limitation:</b> Some leaf nodes (e.g., {@code LogicalTableScan})
+   * return {@code this} from {@link RelNode#copy}, so identity-based sharing
+   * may persist at leaves. For guaranteed tree-shaped DOT output, use
+   * per-visit ID rendering (tree-mode DOT) instead of this method.
    *
    * @param root the (possibly DAG-shaped) plan
-   * @return a tree-shaped copy with no shared nodes
+   * @return a copy with non-leaf shared nodes duplicated
    */
   public static RelNode treeifyPlan(RelNode root) {
     return treeifyPlan(root, new IdentityHashMap<>());
