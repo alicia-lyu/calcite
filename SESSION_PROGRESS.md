@@ -254,42 +254,33 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
   - Q12 maintenance plan now correctly includes LogicalProject above the union (remaining op above assembly).
   - All 3 tests pass — entire maintenance-plan derivation is now general-purpose (not join-only).
 
+### Maintenance Plan Scoping (2026-03-25)
+- **Maintenance Plan Scoping** (commit `b51533254`): Each pipeline's maintenance plan now only covers its own operators. Child pipeline subtrees replaced with `LogicalValues.createEmpty` placeholders at derivation time. `p.logicalRoot` stays immutable — scoping via temporary copy in `scopeLogicalRoot()`.
+- **DOT Visualization** (commits `fba86a614`, `44f20b0dc`, `4ccda821e`, `7165187a4`): Tree-mode rendering with per-visit IDs, branch suffixes for unique labels, distinguishable colors for all operator types (Delta=tomato, Union=yellow, Join=gold, ChildViewOutput=pale green).
+- **IVM Batch-Delta Documentation** (commit `7165187a4`): Documented DAG shape and batch-delta double-counting semantics in `deriveMaintenancePlan` Javadoc.
+
 ## Next Steps
 
-### [Short-term] (Next Session)
+### Short-term (next session)
 
-1. **MergedIndexTpchPlanTest.java — Verify maintenance plan structure across Q12, Q3-OL, Q9**
-   Inspect serialized maintenance plans (index creation plans) to confirm:
-   - Q12: indexed view maintenance includes LogicalProject above union assembly.
-   - Q3-OL: two-level maintenance cascade (inner MI populates, outer MI consumes delta).
-   - Q9: five-level maintenance cascade (leaf-to-root).
-   Add test assertions verifying `indexCreationPlan` node types for each level.
+1. **Logical → Physical maintenance plan conversion** — Convert logical maintenance
+   plans (LogicalJoin, LogicalDelta, etc.) to physical (Enumerable) plans. Key design
+   question: how to represent `LogicalDelta(TableScan)` physically — options include
+   new `EnumerableDeltaTableScan`, reusing stream infrastructure, or Volcano conversion.
+   Files: `MergedIndexTpchPlanTest.java`, possibly new physical nodes.
 
-2. **MergedIndex.java — Add Javadoc for indexCreationPlan lifecycle**
-   Clarify: non-root pipelines capture `pipeline.root` as indexCreationPlan after HEP pass.
-   Root pipeline (query-time) does NOT capture; indexCreationPlan remains null.
-   Document incremental maintenance delta logic for future implementation.
+2. **Single-source pipeline maintenance** — Indexed views (e.g., Q12's l_shipmode view,
+   Q9's n_name/o_year view) need maintenance plans too. Currently only multi-source
+   (join) pipelines get maintenance plans via `deriveMaintenancePlan`.
 
-### [Medium-term] (Future Sessions)
+### Medium-term
 
-1. **Maintenance-time assembly operator** — extend `EnumerableMergedIndexScan` to execute maintenance plans.
-   Currently MIScans only handle query-time assembly. Maintenance requires variant reading delta stream instead of full data.
+3. Maintenance-time assembly operator design (how the executor uses the physical plan)
+4. Additional TPC-H queries (Q5, Q7, Q10) for more operator combinations
+5. PATH B: native merged index support (tables report collation via `getStatistic()`)
 
-2. **Single-source pipeline maintenance** — `setMaintenancePlan` for indexed views.
-   Design: single delta branch (not union of two). Reconcile with existing delta infrastructure.
+### Long-term
 
-3. **Additional TPC-H queries** — Q5 (hierarchical keys), Q6 (baseline, no MI), Q14 (complex filters).
-
-4. **Functional dependency metadata** — `RelMdFunctionalDependencies` for automatic
-   ORDERKEY→CUSTKEY recognition; enable 3-table merged indexes without manual registration.
-
-5. **JOB (Join Order Benchmark)** — generalization beyond TPC-H.
-
-### [Long-term]
-
-1. **Window functions and DISTINCT** — extend sort injection to handle `OVER`, `INTERSECT`, `EXCEPT`.
-
-2. **End-to-end execution** — real sequential B-tree scan; LeanStore or in-memory storage integration.
-
-3. **PATH B: Native merged index support** — tables report collation via `getStatistic()`;
-   rule matches bare `EnumerableTableScan` with collation traits (no explicit Sorts).
+6. Window functions, DISTINCT, set operators in sort-based pipelines
+7. End-to-end execution prototype
+8. Functional dependency-based index matching

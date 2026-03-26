@@ -141,25 +141,46 @@ physical sequential scan of the same merged index?
 ### 6. Maintenance Plan Structure
 
 **Question**: For cascading updates through nested MIs, what is the update
-propagation model?
+propagation model and how to represent it in the plan?
 
-**Alternatives**:
+**Logical Plan Derivation** (settled):
+- **Scoped logical maintenance plans** (commit `b51533254`): Each pipeline's
+  maintenance plan is derived only from its own `logicalRoot` subtree. Child
+  pipeline subtrees are replaced with `LogicalValues.createEmpty` placeholders at
+  derivation time to avoid re-deriving the same subtree twice. The original
+  `p.logicalRoot` stays immutable; scoping is performed via a temporary copy in
+  `scopeLogicalRoot()`.
+- **General-purpose derivation** (commits `cdaa4b637`, `e27b14124`): Wrapped in
+  `LogicalDelta` + applied `StreamRules` via HEP (6 rules: all except
+  DeltaTableScanRule/EmptyRule). Works for any logical subtree (not just joins).
+  Eliminates type-equivalence failures via `SetOp.deriveRowType()` fast-path.
 
+**Physical Plan Conversion** (open):
+- Current state: Logical maintenance plans are complete; physical conversion is
+  the next milestone.
+- Design question: how to represent `LogicalDelta(TableScan)` physically?
+  Options: (a) `EnumerableDeltaTableScan`, (b) reuse stream infrastructure,
+  (c) Volcano conversion of logical plan.
+- Single-source pipeline maintenance: indexed views currently lack maintenance
+  plans; need to extend `deriveMaintenancePlan` to cover single-source pipelines.
+
+**Update Propagation Model** (future):
 - **Eager cascade** — a base-table update immediately propagates through all
   dependent MIs. Simple semantics, potentially high write amplification for
   deep nesting.
 - **Lazy (tag-based) propagation** — updates are tagged and deferred; dependent
   MIs are refreshed on next read or at batch boundaries. Lower write
-  amplification but stale reads possible. Propagate when compacting LSM?
+  amplification but stale reads possible.
 - **Hybrid** — leaf MIs updated eagerly (1-to-1 cost); outer MIs updated lazily
   or on demand.
 
-**Current default**: eager all the way.
+**Current default**: Eager cascade (no implementation yet; derived plans only).
 
 **Prior paper reference** (`main.md`): §5 (Index Maintenance).
 
-**Code reference**: `TRASH-option-b.md` (two-phase model, lazy propagation
-design).
+**Code reference**: `materialize/Pipeline.java` (`deriveMaintenancePlan`),
+`materialize/Pipeline.java` (`scopeLogicalRoot`),
+`async-spinning-beacon.md` (Grand Plan for logical→physical conversion).
 
 ---
 
