@@ -1449,9 +1449,16 @@ class MergedIndexTpchPlanTest {
   /** Returns a fill color for the colorful DOT node based on operator type. */
   private static String nodeColor(RelNode node) {
     final String cls = node.getClass().getSimpleName();
+    // Physical operators (query/creation plans)
     if (cls.contains("MergedIndexScan")) return "#90EE90"; // light green
     if (cls.contains("MergedIndexJoin")) return "#32CD32"; // lime green
     if (cls.contains("MergeJoin"))       return "#FFD700"; // gold
+    // Logical operators (maintenance plans)
+    if (cls.contains("Delta"))           return "#FF6347"; // tomato — change stream
+    if (cls.contains("Union"))           return "#FFFFE0"; // light yellow — set union
+    if (cls.contains("Join"))            return "#FFD700"; // gold — same concept as MergeJoin
+    if (cls.contains("Values"))          return "#98FB98"; // pale green — child view output
+    // Shared operators
     if (cls.contains("LimitSort"))       return "#FFA07A"; // light salmon
     if (cls.contains("Sort"))            return "#FFA07A"; // light salmon
     if (cls.contains("TableScan"))       return "#ADD8E6"; // light blue
