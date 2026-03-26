@@ -144,6 +144,11 @@ class MergedIndexTpchPlanTest {
         + "     THEN 1 ELSE 0 END) AS low_line_count"
         + " FROM tpch.orders o"
         + " JOIN tpch.lineitem l ON o.o_orderkey = l.l_orderkey"
+        + "AND l_shipmode IN ('[SHIP1]', '[SHIP2]')\n" + //
+                    "AND l_commitdate < l_receiptdate\n" + //
+                    "AND l_shipdate < l_commitdate\n" + //
+                    "AND l_receiptdate >= DATE '[DATE]'\n" + //
+                    "AND l_receiptdate < DATE '[DATE]' + INTERVAL '1' YEAR"
         + " GROUP BY l.l_shipmode"
         + " ORDER BY l.l_shipmode"; // Note o_orderpriority was deleted per TPC-H 2017 spec
 
