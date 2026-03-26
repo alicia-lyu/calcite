@@ -77,6 +77,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.nullValue;
 
 /**
  * TPC-H plan observation test for {@link EnumerableMergedIndexScan}.
@@ -224,7 +225,7 @@ class MergedIndexTpchPlanTest {
 
     // Set maintenance plans for all pipelines with captured logical roots
     for (Pipeline p : pipelines) {
-      if (p.logicalRoot != null) {
+      if (p != rootPipeline && p.logicalRoot != null) {
         p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p));
       }
     }
@@ -483,7 +484,7 @@ class MergedIndexTpchPlanTest {
     }
     // Set maintenance plans for all pipelines with captured logical roots
     for (Pipeline p : pipelines) {
-      if (p.logicalRoot != null) {
+      if (p != rootPipeline && p.logicalRoot != null) {
         p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p));
       }
     }
@@ -569,29 +570,22 @@ class MergedIndexTpchPlanTest {
         MergedIndexTestUtil.countOccurrences(afterStr, "EnumerableMergedIndexScan"), is(2));
     // No base TableScans remain (all absorbed into MI scans)
     assertThat(afterStr, not(containsString("EnumerableTableScan")));
-    // All pipelines have maintenance plans.
-    // Inner pipeline (leaf): exactly 2 LogicalDelta branches (LINEITEM + ORDERS).
-    // Outer pipeline (root): scoped to its own operators only — inner view
-    //   replaced by LogicalValues placeholder. Exactly 2 LogicalDelta leaves
-    //   (inner_view_placeholder + CUSTOMER). No inner pipeline operators
-    //   (no LogicalAggregate). Exactly 2 LogicalJoin nodes.
+    // Only non-root pipelines have maintenance plans.
+    // Root pipeline (outer custkey join) is the final query result — not stored
+    // in any parent merged index — so it does not need a maintenance plan.
+    // Inner pipeline (leaf, orderkey): exactly 2 LogicalDelta branches (LINEITEM + ORDERS).
     for (Pipeline p : pipelines) {
-      assertThat("Q3-OL pipeline missing maintenance plan",
-          p.mergedIndex.getMaintenancePlan() != null, is(true));
-      final String m = dumpText(p.mergedIndex.getMaintenancePlan());
-      assertThat(MergedIndexTestUtil.countOccurrences(m, "LogicalDelta"),
-          greaterThanOrEqualTo(2));
+      if (p == rootPipeline) {
+        assertThat("Q3-OL root pipeline should NOT have a maintenance plan",
+            p.mergedIndex.getMaintenancePlan(), nullValue());
+      } else {
+        assertThat("Q3-OL non-root pipeline missing maintenance plan",
+            p.mergedIndex.getMaintenancePlan() != null, is(true));
+        final String m = dumpText(p.mergedIndex.getMaintenancePlan());
+        assertThat(MergedIndexTestUtil.countOccurrences(m, "LogicalDelta"),
+            greaterThanOrEqualTo(2));
+      }
     }
-    // Outer maintenance plan scoping assertions
-    final String outerMaint = dumpText(pipelines.get(1).mergedIndex.getMaintenancePlan());
-    // Inner view becomes a LogicalValues placeholder (ChildViewOutput)
-    assertThat(outerMaint, containsString("LogicalValues"));
-    // Exactly 2 LogicalDelta leaves: one per delta branch (inner_view + CUSTOMER)
-    assertThat(MergedIndexTestUtil.countOccurrences(outerMaint, "LogicalDelta"), is(2));
-    // Exactly 2 LogicalJoin nodes: one per union branch (outer join only)
-    assertThat(MergedIndexTestUtil.countOccurrences(outerMaint, "LogicalJoin"), is(2));
-    // No LogicalAggregate: inner pipeline's operator, scoped out
-    assertThat(outerMaint, not(containsString("LogicalAggregate")));
     // Non-root pipelines have index creation plans
     for (int i = 0; i < pipelines.size() - 1; i++) {
       RelNode cp = pipelines.get(i).mergedIndex.getIndexCreationPlan();
@@ -800,7 +794,7 @@ class MergedIndexTpchPlanTest {
     }
     // Set maintenance plans for all pipelines with captured logical roots
     for (Pipeline p : pipelines) {
-      if (p.logicalRoot != null) {
+      if (p != rootPipeline && p.logicalRoot != null) {
         p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p));
       }
     }
@@ -882,16 +876,23 @@ class MergedIndexTpchPlanTest {
     assertThat(afterStr, containsString("EnumerableAggregate"));
     assertThat(MergedIndexTestUtil.countOccurrences(afterStr,
         "EnumerableMergedIndexScan"), is(1));
-    // Join pipelines have maintenance plans.
+    // Non-root join pipelines have maintenance plans.
+    // Root pipeline is the final query result — not stored in any parent MI —
+    // so it does not get a maintenance plan.
     // Leaf pipeline: exactly 2 LogicalDelta branches (one per direct join input).
     // Non-leaf pipelines: >= 2 LogicalDelta branches — the full subtree includes
     // nested join inputs, so Delta propagates to all leaf table scans.
     for (Pipeline p : joinPipelinesQ9) {
-      assertThat("Q9 pipeline missing maintenance plan",
-          p.mergedIndex.getMaintenancePlan() != null, is(true));
-      final String m = dumpText(p.mergedIndex.getMaintenancePlan());
-      assertThat(MergedIndexTestUtil.countOccurrences(m, "LogicalDelta"),
-          greaterThanOrEqualTo(2));
+      if (p == rootPipeline) {
+        assertThat("Q9 root pipeline should NOT have a maintenance plan",
+            p.mergedIndex.getMaintenancePlan(), nullValue());
+      } else {
+        assertThat("Q9 pipeline missing maintenance plan",
+            p.mergedIndex.getMaintenancePlan() != null, is(true));
+        final String m = dumpText(p.mergedIndex.getMaintenancePlan());
+        assertThat(MergedIndexTestUtil.countOccurrences(m, "LogicalDelta"),
+            greaterThanOrEqualTo(2));
+      }
     }
     // Non-root join pipelines have index creation plans
     for (int i = 0; i < joinPipelinesQ9.size() - 1; i++) {
