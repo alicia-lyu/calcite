@@ -1231,19 +1231,9 @@ class MergedIndexTpchPlanTest {
 
     for (RelNode input : node.getInputs()) {
       if (Pipeline.isBoundarySort(input)) {
-        // The boundary Sort itself belongs to current pipeline p.
-        if (!map.containsKey(input)) {
-          map.put(input, p);
-        }
-        // Look at what is below the boundary Sort.
-        final Sort sort = (Sort) input;
-        final RelNode below = sort.getInput();
-        if (nonLeafChildRoots.contains(below)) {
-          // Non-leaf child pipeline — stop; its nodes are claimed by its own cluster.
-          continue;
-        }
-        // Leaf child pipeline (0 sources): absorb its nodes into p's cluster.
-        assignPipelineNodes(p, below, map, nonLeafChildRoots);
+        // Boundary Sort and everything below it stays OUTSIDE all clusters.
+        // Do NOT assign the sort or its children to any pipeline.
+        continue;
       } else {
         assignPipelineNodes(p, input, map, nonLeafChildRoots);
       }
@@ -1404,9 +1394,9 @@ class MergedIndexTpchPlanTest {
           tables.append("inner_view");
         }
       }
-      return "Pipeline " + index + ": MI(" + tables + ")\\nby " + key;
+      return "Pipeline " + index + ": MI(" + tables + ")";
     } else {
-      return "Pipeline " + index + ": Indexed View\\nby " + key;
+      return "Pipeline " + index + ": Indexed View";
     }
   }
 
