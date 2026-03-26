@@ -63,8 +63,10 @@ import org.junit.jupiter.api.parallel.ExecutionMode;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -187,13 +189,13 @@ class MergedIndexTpchPlanTest {
     final RelNode phase1Plan =
         planner.transform(0, desiredTraits, logicalWithSorts);
 
-    System.out.println("=== Q12 BEFORE (order-based pipeline) ===");
-    System.out.println(dumpText(phase1Plan));
-    writeDotFile("q12/before-pipeline", phase1Plan);
-
-    // ── Discover pipelines and register merged index ──────────────────────
+    // ── Discover pipelines (before writing DOT so clusters can be annotated) ─
     final Pipeline rootPipeline = Pipeline.buildTree(phase1Plan);
     final List<Pipeline> pipelines = rootPipeline.flatten();
+
+    System.out.println("=== Q12 BEFORE (order-based pipeline) ===");
+    System.out.println(dumpText(phase1Plan));
+    writeDotFile("q12/before-pipeline", phase1Plan, rootPipeline);
     assertThat("Expected 2 pipelines for Q12 (1 join + 1 indexed view)",
         pipelines.size(), is(2));
 
@@ -429,17 +431,17 @@ class MergedIndexTpchPlanTest {
     final RelNode phase1Plan =
         planner.transform(0, desiredTraits, logicalWithSorts);
 
-    final String beforeStr = dumpText(phase1Plan);
-    System.out.println("=== Q3 OL BEFORE (order-based pipeline) ===");
-    System.out.println(beforeStr);
-    writeDotFile("q3ol/before-pipeline", phase1Plan);
-
     // ── Discover all interesting-ordering pipelines (bottom-up) ──────────
     // buildPipelineTree walks top-down, cutting at Sort boundaries.
     // flattenPipelines returns non-trivial pipelines in post-order
     // (inner first) so inner pipeline is registered before outer.
     final Pipeline rootPipeline = Pipeline.buildTree(phase1Plan);
     final List<Pipeline> pipelines = rootPipeline.flatten();
+
+    final String beforeStr = dumpText(phase1Plan);
+    System.out.println("=== Q3 OL BEFORE (order-based pipeline) ===");
+    System.out.println(beforeStr);
+    writeDotFile("q3ol/before-pipeline", phase1Plan, rootPipeline);
 
     // Capture logical subtrees for IVM — logical nodes have SQL row types
     // compatible with StreamRules; physical EnumerableMergeJoin uses JavaType.
@@ -749,14 +751,14 @@ class MergedIndexTpchPlanTest {
     final RelNode phase1Plan =
         planner.transform(0, desiredTraits, logicalWithSorts);
 
-    final String beforeStr = dumpText(phase1Plan);
-    System.out.println("=== Q9 BEFORE (order-based pipeline) ===");
-    System.out.println(beforeStr);
-    writeDotFile("q9/before-pipeline", phase1Plan);
-
     // Discover all 5 join pipelines bottom-up (inner first) and register nested MergedIndexes.
     final Pipeline rootPipeline = Pipeline.buildTree(phase1Plan);
     final List<Pipeline> pipelines = rootPipeline.flatten();
+
+    final String beforeStr = dumpText(phase1Plan);
+    System.out.println("=== Q9 BEFORE (order-based pipeline) ===");
+    System.out.println(beforeStr);
+    writeDotFile("q9/before-pipeline", phase1Plan, rootPipeline);
 
     // Capture logical subtrees for IVM — logical nodes have SQL row types
     // compatible with StreamRules; physical EnumerableMergeJoin uses JavaType.
@@ -1146,6 +1148,296 @@ class MergedIndexTpchPlanTest {
   private static void writeDotFile(String name, RelNode rel) {
     writeDotToFile(name + ".dot", dumpDot(rel));
     writeDotToFile(name + "_color.dot", dumpDotColor(rel));
+  }
+
+  /**
+   * Like {@link #writeDotFile(String, RelNode)} but annotates the color DOT
+   * with pipeline-boundary clusters when {@code rootPipeline} is non-null.
+   * The plain {@code .dot} file is unchanged.
+   */
+  private static void writeDotFile(String name, RelNode rel,
+      @org.checkerframework.checker.nullness.qual.Nullable Pipeline rootPipeline) {
+    writeDotToFile(name + ".dot", dumpDot(rel));
+    if (rootPipeline != null) {
+      writeDotToFile(name + "_color.dot", dumpDotColorWithPipelines(rel, rootPipeline));
+    } else {
+      writeDotToFile(name + "_color.dot", dumpDotColor(rel));
+    }
+  }
+
+  // ── Pipeline-annotated DOT helpers ────────────────────────────────────────
+
+  /**
+   * Builds a map from each {@link RelNode} in the plan to the {@link Pipeline}
+   * whose cluster it belongs to. Only pipelines with at least one source
+   * (i.e., appearing in {@link Pipeline#flatten()}) receive clusters.
+   * Leaf pipelines (0 sources — bare table scans) are absorbed into their
+   * parent pipeline's cluster.
+   *
+   * <p>Algorithm: recurse children-first so parent clusters do not override
+   * child claims. For each pipeline {@code p}:
+   * <ol>
+   *   <li>Walk down from {@code p.root}.
+   *   <li>At boundary sorts, assign the Sort itself to {@code p}, then look
+   *       one level below:
+   *       <ul>
+   *         <li>If the child below the Sort is the root of a <em>non-leaf</em>
+   *             child pipeline, stop — that subtree is claimed by the child.
+   *         <li>If the child is a <em>leaf</em> pipeline root (0 sources),
+   *             absorb it: assign its Sort + TableScan to {@code p}.
+   *       </ul>
+   *   <li>Skip nodes already claimed ({@code map.containsKey} guard).
+   * </ol>
+   */
+  private static IdentityHashMap<RelNode, Pipeline> assignNodesToPipelines(
+      Pipeline rootPipeline) {
+    final IdentityHashMap<RelNode, Pipeline> map = new IdentityHashMap<>();
+
+    // Collect the roots of non-leaf child pipelines — these get their own cluster.
+    final Set<RelNode> nonLeafChildRoots =
+        Collections.newSetFromMap(new IdentityHashMap<>());
+    collectNonLeafRoots(rootPipeline, nonLeafChildRoots);
+
+    // Process pipelines that appear in flatten() — children first (post-order).
+    final List<Pipeline> ordered = rootPipeline.flatten();
+    for (Pipeline p : ordered) {
+      assignPipelineNodes(p, p.root, map, nonLeafChildRoots);
+    }
+    return map;
+  }
+
+  /** Collects root nodes of all pipelines that have at least one source. */
+  private static void collectNonLeafRoots(Pipeline p, Set<RelNode> result) {
+    if (p.sources.size() > 0) {
+      result.add(p.root);
+    }
+    for (Pipeline child : p.sources) {
+      collectNonLeafRoots(child, result);
+    }
+  }
+
+  /**
+   * Recursively walks the plan rooted at {@code node}, assigning each visited
+   * node to pipeline {@code p} unless already claimed or blocked by a non-leaf
+   * child pipeline boundary.
+   */
+  private static void assignPipelineNodes(Pipeline p, RelNode node,
+      IdentityHashMap<RelNode, Pipeline> map,
+      Set<RelNode> nonLeafChildRoots) {
+    if (map.containsKey(node)) {
+      return; // already claimed by a child pipeline
+    }
+    map.put(node, p);
+
+    for (RelNode input : node.getInputs()) {
+      if (Pipeline.isBoundarySort(input)) {
+        // The boundary Sort itself belongs to current pipeline p.
+        if (!map.containsKey(input)) {
+          map.put(input, p);
+        }
+        // Look at what is below the boundary Sort.
+        final Sort sort = (Sort) input;
+        final RelNode below = sort.getInput();
+        if (nonLeafChildRoots.contains(below)) {
+          // Non-leaf child pipeline — stop; its nodes are claimed by its own cluster.
+          continue;
+        }
+        // Leaf child pipeline (0 sources): absorb its nodes into p's cluster.
+        assignPipelineNodes(p, below, map, nonLeafChildRoots);
+      } else {
+        assignPipelineNodes(p, input, map, nonLeafChildRoots);
+      }
+    }
+  }
+
+  /**
+   * Generates a colorful DOT string with {@code subgraph cluster_N} boxes
+   * drawn around each pipeline's nodes.
+   *
+   * <p>Two-phase approach:
+   * <ol>
+   *   <li>Phase A: walk the plan collecting node-definition strings and
+   *       edge strings, keyed by integer node ID.
+   *   <li>Phase B: group node IDs by pipeline, emit one {@code subgraph cluster_N}
+   *       per pipeline, then emit all edges outside the clusters.
+   * </ol>
+   */
+  private static String dumpDotColorWithPipelines(RelNode root,
+      Pipeline rootPipeline) {
+    // Phase A: collect IDs, node defs, edge defs.
+    final IdentityHashMap<RelNode, Integer> ids = new IdentityHashMap<>();
+    final int[] counter = {0};
+    final Map<Integer, String> nodeDefs = new HashMap<>();
+    final List<String> edgeDefs = new ArrayList<>();
+    collectNodesAndEdges(root, ids, counter, nodeDefs, edgeDefs);
+
+    // Build pipeline assignment map (node → pipeline).
+    final IdentityHashMap<RelNode, Pipeline> pipelineMap =
+        assignNodesToPipelines(rootPipeline);
+
+    // Group node IDs by pipeline (using identity of Pipeline objects).
+    final List<Pipeline> pipelineList = rootPipeline.flatten();
+    final IdentityHashMap<Pipeline, List<Integer>> pipelineNodeIds =
+        new IdentityHashMap<>();
+    for (Pipeline p : pipelineList) {
+      pipelineNodeIds.put(p, new ArrayList<>());
+    }
+    final List<Integer> ungrouped = new ArrayList<>();
+    for (Map.Entry<RelNode, Integer> entry : ids.entrySet()) {
+      final Pipeline p = pipelineMap.get(entry.getKey());
+      if (p != null && pipelineNodeIds.containsKey(p)) {
+        pipelineNodeIds.get(p).add(entry.getValue());
+      } else {
+        ungrouped.add(entry.getValue());
+      }
+    }
+
+    // Phase B: emit DOT.
+    final StringBuilder sb = new StringBuilder(
+        "digraph {\n  rankdir=BT;\n  node [fontname=\"Helvetica\"];\n");
+
+    for (int i = 0; i < pipelineList.size(); i++) {
+      final Pipeline p = pipelineList.get(i);
+      final List<Integer> nodeIds = pipelineNodeIds.get(p);
+      if (nodeIds == null || nodeIds.isEmpty()) {
+        continue;
+      }
+      sb.append("  subgraph cluster_").append(i).append(" {\n");
+      sb.append("    label=\"").append(pipelineLabel(p, i)).append("\";\n");
+      sb.append("    style=dashed; color=\"#666666\"; fontname=\"Helvetica\";\n");
+      for (int nid : nodeIds) {
+        final String def = nodeDefs.get(nid);
+        if (def != null) {
+          sb.append("  ").append(def);
+        }
+      }
+      sb.append("  }\n");
+    }
+
+    // Ungrouped nodes (root pipeline nodes above flatten'd pipelines, if any)
+    for (int nid : ungrouped) {
+      final String def = nodeDefs.get(nid);
+      if (def != null) {
+        sb.append(def);
+      }
+    }
+
+    // All edges outside clusters.
+    for (String edge : edgeDefs) {
+      sb.append(edge);
+    }
+
+    sb.append("}\n");
+    return sb.toString();
+  }
+
+  /**
+   * Phase-A walk: collects node-definition strings (keyed by ID) and
+   * edge-definition strings. Reuses {@link #nodeLabel} and {@link #nodeColor}.
+   */
+  private static int collectNodesAndEdges(RelNode node,
+      IdentityHashMap<RelNode, Integer> ids, int[] counter,
+      Map<Integer, String> nodeDefs, List<String> edgeDefs) {
+    if (ids.containsKey(node)) {
+      return ids.get(node);
+    }
+    final int id = counter[0]++;
+    ids.put(node, id);
+    final String explain = RelOptUtil.dumpPlan("", node,
+        SqlExplainFormat.TEXT, SqlExplainLevel.EXPPLAN_ATTRIBUTES).trim();
+    final String firstLine = explain.lines().findFirst()
+        .orElse(node.getClass().getSimpleName()).trim();
+    final String label = nodeLabel(node, firstLine);
+    final String color = nodeColor(node);
+    nodeDefs.put(id,
+        "  n" + id
+        + " [label=\"" + label + "\""
+        + ", style=filled, fillcolor=\"" + color + "\""
+        + "];\n");
+    final List<RelNode> inputs = node.getInputs();
+    for (int i = 0; i < inputs.size(); i++) {
+      final int childId = collectNodesAndEdges(
+          inputs.get(i), ids, counter, nodeDefs, edgeDefs);
+      final String edgeLabel = inputs.size() > 1 ? (i == 0 ? "left" : "right") : "";
+      final StringBuilder edge = new StringBuilder();
+      edge.append("  n").append(childId).append(" -> n").append(id);
+      if (!edgeLabel.isEmpty()) {
+        edge.append(" [label=\"").append(edgeLabel).append("\"]");
+      }
+      edge.append(";\n");
+      edgeDefs.add(edge.toString());
+    }
+    return id;
+  }
+
+  /**
+   * Returns the DOT cluster label for a pipeline.
+   *
+   * <ul>
+   *   <li>Multi-source (>=2): {@code "Pipeline N: MI(TABLE1, TABLE2)\nby KEY"}
+   *   <li>Single-source (==1): {@code "Pipeline N: Indexed View\nby KEY"}
+   * </ul>
+   */
+  private static String pipelineLabel(Pipeline p, int index) {
+    final String key = collationKeyNames(p);
+    if (p.sources.size() >= 2) {
+      final StringBuilder tables = new StringBuilder();
+      for (int i = 0; i < p.sources.size(); i++) {
+        if (i > 0) {
+          tables.append(", ");
+        }
+        final Pipeline src = p.sources.get(i);
+        if (src.sources.isEmpty()) {
+          // Leaf source: resolve table name via findLeafScan.
+          final org.apache.calcite.schema.Table tbl =
+              MergedIndex.findLeafScan(src.root) != null
+                  ? null : null; // placeholder, use name below
+          final org.apache.calcite.plan.RelOptTable relOptTable =
+              MergedIndex.findLeafScan(src.root);
+          if (relOptTable != null) {
+            final List<String> qname = relOptTable.getQualifiedName();
+            tables.append(qname.get(qname.size() - 1));
+          } else {
+            tables.append("src").append(i);
+          }
+        } else {
+          tables.append("inner_view");
+        }
+      }
+      return "Pipeline " + index + ": MI(" + tables + ")\\nby " + key;
+    } else {
+      return "Pipeline " + index + ": Indexed View\\nby " + key;
+    }
+  }
+
+  /**
+   * Returns a comma-separated string of sort-key column names for a pipeline,
+   * with " DESC" appended for descending fields.
+   *
+   * <p>The {@code sharedCollation} field indices are derived from the boundary
+   * Sort's collation, which references the Sort's <em>input</em> row type
+   * (i.e., the source pipeline root's row type), not the pipeline root's row
+   * type. We resolve against the first source's row type when sources exist,
+   * otherwise fall back to {@code p.root.getRowType()}.
+   */
+  private static String collationKeyNames(Pipeline p) {
+    // Use the first source's row type to correctly resolve field indices,
+    // since sharedCollation is derived from the boundary Sort over the source.
+    final List<org.apache.calcite.rel.type.RelDataTypeField> fields =
+        p.sources.isEmpty()
+            ? p.root.getRowType().getFieldList()
+            : p.sources.get(0).root.getRowType().getFieldList();
+    return p.sharedCollation.getFieldCollations().stream()
+        .map(fc -> {
+          final String name = fc.getFieldIndex() < fields.size()
+              ? fields.get(fc.getFieldIndex()).getName()
+              : "$" + fc.getFieldIndex();
+          final String dir =
+              fc.getDirection() == RelFieldCollation.Direction.DESCENDING
+                  ? " DESC" : "";
+          return name + dir;
+        })
+        .collect(Collectors.joining(", "));
   }
 
   private static void writeDotToFile(String filename, String content) {
