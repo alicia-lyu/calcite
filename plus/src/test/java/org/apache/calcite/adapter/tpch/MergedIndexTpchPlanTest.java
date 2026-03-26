@@ -144,11 +144,11 @@ class MergedIndexTpchPlanTest {
         + "     THEN 1 ELSE 0 END) AS low_line_count"
         + " FROM tpch.orders o"
         + " JOIN tpch.lineitem l ON o.o_orderkey = l.l_orderkey"
-        + "AND l_shipmode IN ('[SHIP1]', '[SHIP2]')\n" + //
-                    "AND l_commitdate < l_receiptdate\n" + //
-                    "AND l_shipdate < l_commitdate\n" + //
-                    "AND l_receiptdate >= DATE '[DATE]'\n" + //
-                    "AND l_receiptdate < DATE '[DATE]' + INTERVAL '1' YEAR"
+        + " WHERE l.l_shipmode IN ('MAIL', 'SHIP')"
+        + " AND l.l_commitdate < l.l_receiptdate"
+        + " AND l.l_shipdate < l.l_commitdate"
+        + " AND l.l_receiptdate >= DATE '1994-01-01'"
+        + " AND l.l_receiptdate < DATE '1994-01-01' + INTERVAL '1' YEAR"
         + " GROUP BY l.l_shipmode"
         + " ORDER BY l.l_shipmode"; // Note o_orderpriority was deleted per TPC-H 2017 spec
 
@@ -165,6 +165,7 @@ class MergedIndexTpchPlanTest {
                 EnumerableRules.ENUMERABLE_PROJECT_RULE,
                 EnumerableRules.ENUMERABLE_SORT_RULE,
                 EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
+                EnumerableRules.ENUMERABLE_FILTER_RULE,
                 EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
                 EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE,
                 EnumerableRules.ENUMERABLE_LIMIT_RULE,
