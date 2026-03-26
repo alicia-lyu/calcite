@@ -1498,44 +1498,80 @@ class MergedIndexTpchPlanTest {
    *   <li>Filter — peach (#FFDAB9)
    * </ul>
    */
+  /**
+   * Renders a RelNode graph as a colored DOT string.
+   *
+   * <p>Two-phase approach:
+   * <ol>
+   *   <li>Phase A: walk the plan collecting node-definition strings and edge strings.
+   *   <li>Phase B: group {@link EnumerableMergedIndexScan} nodes by shared
+   *       {@link MergedIndex} identity; emit one {@code subgraph cluster_mi_N} per
+   *       group of 2+ scans, then emit remaining nodes and all edges.
+   * </ol>
+   */
   private static String dumpDotColor(RelNode root) {
+    // Phase A: collect IDs, node defs, edge defs.
+    final IdentityHashMap<RelNode, Integer> ids = new IdentityHashMap<>();
+    final int[] counter = {0};
+    final Map<Integer, String> nodeDefs = new HashMap<>();
+    final List<String> edgeDefs = new ArrayList<>();
+    collectNodesAndEdges(root, ids, counter, nodeDefs, edgeDefs);
+
+    // Group MIScan node IDs by shared MergedIndex identity (groups of 2+ only).
+    final IdentityHashMap<MergedIndex, List<Integer>> miGroups = new IdentityHashMap<>();
+    for (Map.Entry<RelNode, Integer> entry : ids.entrySet()) {
+      if (entry.getKey() instanceof EnumerableMergedIndexScan) {
+        final EnumerableMergedIndexScan scan = (EnumerableMergedIndexScan) entry.getKey();
+        miGroups.computeIfAbsent(scan.mergedIndex, k -> new ArrayList<>())
+            .add(entry.getValue());
+      }
+    }
+
+    // Collect node IDs that belong to a cluster (2+ scans sharing one MI).
+    final IdentityHashMap<Integer, Boolean> clustered = new IdentityHashMap<>();
+    final List<Map.Entry<MergedIndex, List<Integer>>> clusterEntries = new ArrayList<>();
+    for (Map.Entry<MergedIndex, List<Integer>> e : miGroups.entrySet()) {
+      if (e.getValue().size() >= 2) {
+        clusterEntries.add(e);
+        for (int nid : e.getValue()) {
+          clustered.put(nid, Boolean.TRUE);
+        }
+      }
+    }
+
+    // Phase B: emit DOT.
     final StringBuilder sb = new StringBuilder(
         "digraph {\n  rankdir=BT;\n  node [fontname=\"Helvetica\"];\n");
-    final java.util.IdentityHashMap<RelNode, Integer> ids = new java.util.IdentityHashMap<>();
-    final int[] counter = {0};
-    dumpDotColorNode(root, sb, ids, counter);
+
+    // Emit MI clusters.
+    for (int i = 0; i < clusterEntries.size(); i++) {
+      final List<Integer> nodeIds = clusterEntries.get(i).getValue();
+      sb.append("  subgraph cluster_mi_").append(i).append(" {\n");
+      sb.append("    label=\"Shared Merged Index\";\n");
+      sb.append("    style=dashed; color=\"#228B22\"; fontname=\"Helvetica\";\n");
+      for (int nid : nodeIds) {
+        final String def = nodeDefs.get(nid);
+        if (def != null) {
+          sb.append("  ").append(def);
+        }
+      }
+      sb.append("  }\n");
+    }
+
+    // Emit non-clustered nodes.
+    for (Map.Entry<Integer, String> e : nodeDefs.entrySet()) {
+      if (!clustered.containsKey(e.getKey())) {
+        sb.append(e.getValue());
+      }
+    }
+
+    // All edges outside clusters.
+    for (String edge : edgeDefs) {
+      sb.append(edge);
+    }
+
     sb.append("}\n");
     return sb.toString();
-  }
-
-  private static int dumpDotColorNode(RelNode node, StringBuilder sb,
-      java.util.IdentityHashMap<RelNode, Integer> ids, int[] counter) {
-    if (ids.containsKey(node)) {
-      return ids.get(node);
-    }
-    final int id = counter[0]++;
-    ids.put(node, id);
-    final String explain = RelOptUtil.dumpPlan("", node,
-        SqlExplainFormat.TEXT, SqlExplainLevel.EXPPLAN_ATTRIBUTES).trim();
-    final String firstLine = explain.lines().findFirst()
-        .orElse(node.getClass().getSimpleName()).trim();
-    final String label = nodeLabel(node, firstLine);
-    final String color = nodeColor(node);
-    sb.append("  n").append(id)
-        .append(" [label=\"").append(label).append("\"")
-        .append(", style=filled, fillcolor=\"").append(color).append("\"")
-        .append("];\n");
-    final List<RelNode> inputs = node.getInputs();
-    for (int i = 0; i < inputs.size(); i++) {
-      final int childId = dumpDotColorNode(inputs.get(i), sb, ids, counter);
-      final String edgeLabel = inputs.size() > 1 ? (i == 0 ? "left" : "right") : "";
-      sb.append("  n").append(childId).append(" -> n").append(id);
-      if (!edgeLabel.isEmpty()) {
-        sb.append(" [label=\"").append(edgeLabel).append("\"]");
-      }
-      sb.append(";\n");
-    }
-    return id;
   }
 
   /**
