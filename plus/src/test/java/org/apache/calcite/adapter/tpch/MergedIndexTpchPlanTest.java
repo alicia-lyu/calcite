@@ -1186,7 +1186,8 @@ class MergedIndexTpchPlanTest {
         SqlExplainFormat.TEXT, SqlExplainLevel.EXPPLAN_ATTRIBUTES).trim();
     final String label = explain.lines().findFirst()
         .orElse(node.getClass().getSimpleName()).trim().replace("\"", "'");
-    sb.append("  n").append(id).append(" [label=\"").append(label).append("\"];\n");
+    sb.append("  n").append(id).append(" [label=\"").append(label)
+        .append("\\n#").append(id).append("\"];\n");
     final List<RelNode> inputs = node.getInputs();
     for (int i = 0; i < inputs.size(); i++) {
       final int childId = dumpDotTreeNode(inputs.get(i), sb, counter);
@@ -1221,7 +1222,7 @@ class MergedIndexTpchPlanTest {
     final String label = nodeLabel(node, firstLine);
     final String color = nodeColor(node);
     sb.append("  n").append(id)
-        .append(" [label=\"").append(label).append("\"")
+        .append(" [label=\"").append(label).append("\\n#").append(id).append("\"")
         .append(", style=filled, fillcolor=\"").append(color).append("\"")
         .append("];\n");
     final List<RelNode> inputs = node.getInputs();
