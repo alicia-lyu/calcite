@@ -39,6 +39,7 @@ import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.logical.LogicalSort;
+import org.apache.calcite.rel.logical.LogicalValues;
 import org.apache.calcite.rel.stream.LogicalDelta;
 import org.apache.calcite.rel.stream.StreamRules;
 
@@ -61,7 +62,10 @@ import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.hamcrest.CoreMatchers.containsString;
@@ -213,7 +217,7 @@ class MergedIndexTpchPlanTest {
     // Set maintenance plans for all pipelines with captured logical roots
     for (Pipeline p : pipelines) {
       if (p.logicalRoot != null) {
-        p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p.logicalRoot));
+        p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p));
       }
     }
 
@@ -472,7 +476,7 @@ class MergedIndexTpchPlanTest {
     // Set maintenance plans for all pipelines with captured logical roots
     for (Pipeline p : pipelines) {
       if (p.logicalRoot != null) {
-        p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p.logicalRoot));
+        p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p));
       }
     }
 
@@ -559,9 +563,10 @@ class MergedIndexTpchPlanTest {
     assertThat(afterStr, not(containsString("EnumerableTableScan")));
     // All pipelines have maintenance plans.
     // Inner pipeline (leaf): exactly 2 LogicalDelta branches (LINEITEM + ORDERS).
-    // Outer pipeline (root): >= 2 LogicalDelta branches — the full subtree includes
-    // the inner join's leaf scans, so Delta propagates to all leaf table scans
-    // (LINEITEM + ORDERS + CUSTOMER = 3).
+    // Outer pipeline (root): scoped to its own operators only — inner view
+    //   replaced by LogicalValues placeholder. Exactly 2 LogicalDelta leaves
+    //   (inner_view_placeholder + CUSTOMER). No inner pipeline operators
+    //   (no LogicalAggregate). Exactly 2 LogicalJoin nodes.
     for (Pipeline p : pipelines) {
       assertThat("Q3-OL pipeline missing maintenance plan",
           p.mergedIndex.getMaintenancePlan() != null, is(true));
@@ -569,6 +574,16 @@ class MergedIndexTpchPlanTest {
       assertThat(MergedIndexTestUtil.countOccurrences(m, "LogicalDelta"),
           greaterThanOrEqualTo(2));
     }
+    // Outer maintenance plan scoping assertions
+    final String outerMaint = dumpText(pipelines.get(1).mergedIndex.getMaintenancePlan());
+    // Inner view becomes a LogicalValues placeholder (ChildViewOutput)
+    assertThat(outerMaint, containsString("LogicalValues"));
+    // Exactly 2 LogicalDelta leaves: one per delta branch (inner_view + CUSTOMER)
+    assertThat(MergedIndexTestUtil.countOccurrences(outerMaint, "LogicalDelta"), is(2));
+    // Exactly 2 LogicalJoin nodes: one per union branch (outer join only)
+    assertThat(MergedIndexTestUtil.countOccurrences(outerMaint, "LogicalJoin"), is(2));
+    // No LogicalAggregate: inner pipeline's operator, scoped out
+    assertThat(outerMaint, not(containsString("LogicalAggregate")));
     // Non-root pipelines have index creation plans
     for (int i = 0; i < pipelines.size() - 1; i++) {
       RelNode cp = pipelines.get(i).mergedIndex.getIndexCreationPlan();
@@ -778,7 +793,7 @@ class MergedIndexTpchPlanTest {
     // Set maintenance plans for all pipelines with captured logical roots
     for (Pipeline p : pipelines) {
       if (p.logicalRoot != null) {
-        p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p.logicalRoot));
+        p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p));
       }
     }
 
@@ -980,9 +995,16 @@ class MergedIndexTpchPlanTest {
   }
 
   /**
-   * Derives the IVM maintenance plan for a pipeline subtree.
+   * Derives the IVM maintenance plan for a pipeline.
    *
-   * <p>Wraps the logical pipeline subtree in {@link LogicalDelta} and applies
+   * <p>Creates a scoped copy of the pipeline's logical subtree where non-leaf
+   * child pipeline subtrees are replaced with {@link LogicalValues#createEmpty}
+   * placeholders. This ensures Delta only propagates through THIS pipeline's
+   * operators, not child pipeline operators. The original {@code p.logicalRoot}
+   * stays immutable — just as the physical pipeline uses {@code s.root} for
+   * each {@code p.sources} to define scope without modifying the physical tree.
+   *
+   * <p>Wraps the scoped subtree in {@link LogicalDelta} and applies
    * {@link StreamRules} via HEP to push Delta down through all operators:
    * <pre>
    *   Delta(A &#x22CA; B)          &#x2192; (A &#x22CA; Delta(B)) &#x222A; (Delta(A) &#x22CA; B)
@@ -1014,17 +1036,85 @@ class MergedIndexTpchPlanTest {
    * outside Calcite's plan-generation scope; the plan structure is correct
    * regardless.
    *
-   * @param logicalSubtree the full logical subtree for this pipeline
-   *        (input of the upper boundary Sort, excluding the Sort itself)
+   * @param pipeline the pipeline whose maintenance plan to derive
    */
-  private static RelNode deriveMaintenancePlan(RelNode logicalSubtree) {
-    final LogicalDelta delta = LogicalDelta.create(logicalSubtree);
+  private static RelNode deriveMaintenancePlan(Pipeline pipeline) {
+    final RelNode scoped = scopeLogicalRoot(pipeline);
+    final LogicalDelta delta = LogicalDelta.create(scoped);
     final HepProgram hepProgram = HepProgram.builder()
         .addRuleCollection(IVM_RULES)
         .build();
     final HepPlanner hep = new HepPlanner(hepProgram);
     hep.setRoot(delta);
     return hep.findBestExp();
+  }
+
+  /**
+   * Creates a scoped copy of a pipeline's logicalRoot, replacing non-leaf
+   * child pipeline subtrees with {@link LogicalValues#createEmpty} placeholders.
+   *
+   * <p>A "non-leaf child" is a child pipeline with its own sources
+   * ({@code child.sources.isEmpty() == false}) — it represents a merged index
+   * view whose maintenance is handled by its own maintenance plan. Leaf children
+   * (base table scans) are left intact so Delta propagates to their scans.
+   *
+   * <p>Identification: a child's logicalRoot was set from a boundary sort's
+   * input in {@link Pipeline#captureLogicalRoots}. This method finds boundary
+   * sorts whose {@code .getInput()} identity-matches a non-leaf child's
+   * logicalRoot and replaces them with empty Values placeholders.
+   *
+   * @param pipeline the pipeline to scope
+   * @return scoped copy (or original if no non-leaf children)
+   */
+  private static RelNode scopeLogicalRoot(Pipeline pipeline) {
+    if (pipeline.logicalRoot == null) {
+      throw new IllegalArgumentException("Pipeline has no logicalRoot");
+    }
+    if (pipeline.sources.isEmpty()) {
+      return pipeline.logicalRoot; // leaf pipeline, no scoping needed
+    }
+
+    // Collect logicalRoots of non-leaf children (merged index views)
+    final Set<RelNode> childLogicalRoots =
+        Collections.newSetFromMap(new IdentityHashMap<>());
+    for (Pipeline child : pipeline.sources) {
+      if (child.logicalRoot != null && !child.sources.isEmpty()) {
+        childLogicalRoots.add(child.logicalRoot);
+      }
+    }
+
+    if (childLogicalRoots.isEmpty()) {
+      return pipeline.logicalRoot; // all children are leaves
+    }
+
+    return replaceChildBoundaries(pipeline.logicalRoot, childLogicalRoots);
+  }
+
+  /**
+   * Walks a RelNode tree and replaces boundary sorts whose input
+   * identity-matches a child logicalRoot with a {@link LogicalValues} placeholder.
+   */
+  private static RelNode replaceChildBoundaries(RelNode node,
+      Set<RelNode> childLogicalRoots) {
+    if (Pipeline.isLogicalBoundarySort(node)) {
+      final Sort sort = (Sort) node;
+      if (childLogicalRoots.contains(sort.getInput())) {
+        return LogicalValues.createEmpty(
+            sort.getCluster(), sort.getRowType());
+      }
+    }
+    // Recurse into inputs
+    final List<RelNode> oldInputs = node.getInputs();
+    final List<RelNode> newInputs = new ArrayList<>(oldInputs.size());
+    boolean changed = false;
+    for (RelNode input : oldInputs) {
+      final RelNode newInput = replaceChildBoundaries(input, childLogicalRoots);
+      newInputs.add(newInput);
+      if (newInput != input) {
+        changed = true;
+      }
+    }
+    return changed ? node.copy(node.getTraitSet(), newInputs) : node;
   }
 
   /** Prints maintenance plans for all pipelines to stdout. */
@@ -1256,6 +1346,11 @@ class MergedIndexTpchPlanTest {
    * Drops internal attributes like {@code sort0=}, {@code dir0=}, {@code joinType=}.
    */
   private static String nodeLabel(RelNode node, String firstLine) {
+    // Empty LogicalValues placeholders inserted by replaceChildBoundaries
+    // represent the output of a child pipeline's merged index view.
+    if (node instanceof LogicalValues && ((LogicalValues) node).getTuples().isEmpty()) {
+      return "ChildViewOutput";
+    }
     final int parenIdx = firstLine.indexOf('(');
     final String fullCls = parenIdx >= 0 ? firstLine.substring(0, parenIdx) : firstLine;
     final String cls = fullCls.startsWith("Enumerable")

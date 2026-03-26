@@ -336,7 +336,7 @@ public class Pipeline {
     }
   }
 
-  private static boolean isLogicalBoundarySort(RelNode node) {
+  public static boolean isLogicalBoundarySort(RelNode node) {
     if (!(node instanceof LogicalSort)) {
       return false;
     }
