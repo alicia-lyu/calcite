@@ -68,7 +68,8 @@ local.properties
 .java-version
 
 # Generated DOT plan files from MergedIndexTpchPlanTest
-plus/test-dot-output/
+plus/test-dot-output/**/*.dot
+plus/test-dot-output/**/*.png
 
 # claude
 .claude/*
