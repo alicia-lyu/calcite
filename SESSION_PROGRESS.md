@@ -263,24 +263,25 @@ with existing `deriveIncrementalPlan()` and delta scan infrastructure.
 
 ### Short-term (next session)
 
-1. **Logical → Physical maintenance plan conversion** — Convert logical maintenance
-   plans (LogicalJoin, LogicalDelta, etc.) to physical (Enumerable) plans. Key design
-   question: how to represent `LogicalDelta(TableScan)` physically — options include
-   new `EnumerableDeltaTableScan`, reusing stream infrastructure, or Volcano conversion.
-   Files: `MergedIndexTpchPlanTest.java`, possibly new physical nodes.
+1. **Logical → Physical maintenance plan conversion** — The key challenge is the physical
+   representation of a **merged index delta**: a merged index spans multiple source tables,
+   so its delta must cover changes arriving from any of those sources. The simpler sub-problem
+   (converting `LogicalDelta(TableScan)` to a physical scan node) is secondary to this.
+   Options: new `EnumerableDeltaTableScan` per source, reusing stream infrastructure, or
+   Volcano conversion with a cost model. Files: `MergedIndexTpchPlanTest.java`, possibly
+   new physical nodes in `adapter/enumerable/`.
 
-2. **Single-source pipeline maintenance** — Indexed views (e.g., Q12's l_shipmode view,
-   Q9's n_name/o_year view) need maintenance plans too. Currently only multi-source
-   (join) pipelines get maintenance plans via `deriveMaintenancePlan`.
+   Note: `deriveMaintenancePlan` already handles single-source (indexed view) pipelines
+   — the only excluded case is the root pipeline. No special handling needed.
 
 ### Medium-term
 
-3. Maintenance-time assembly operator design (how the executor uses the physical plan)
-4. Additional TPC-H queries (Q5, Q7, Q10) for more operator combinations
-5. PATH B: native merged index support (tables report collation via `getStatistic()`)
+2. Maintenance-time assembly operator design (how the executor uses the physical plan)
+3. Additional TPC-H queries (Q5, Q7, Q10) for more operator combinations
+4. PATH B: native merged index support (tables report collation via `getStatistic()`)
 
 ### Long-term
 
-6. Window functions, DISTINCT, set operators in sort-based pipelines
-7. End-to-end execution prototype
-8. Functional dependency-based index matching
+5. Window functions, DISTINCT, set operators in sort-based pipelines
+6. End-to-end execution prototype
+7. Functional dependency-based index matching
