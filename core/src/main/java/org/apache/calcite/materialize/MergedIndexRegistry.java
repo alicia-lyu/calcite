@@ -212,6 +212,14 @@ public final class MergedIndexRegistry {
     return true;
   }
 
+  /**
+   * Returns an unmodifiable snapshot of all registered merged indexes.
+   * The returned list reflects the state at the time of the call.
+   */
+  public static synchronized List<MergedIndex> allIndexes() {
+    return List.copyOf(INDEXES);
+  }
+
   /** Removes all registered indexes. Useful for test isolation. */
   public static synchronized void clear() {
     INDEXES.clear();

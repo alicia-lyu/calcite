@@ -124,6 +124,34 @@ public class EnumerableRules {
       ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE =
           DeltaToMergedIndexDeltaScanRule.Config.DEFAULT.toRule();
 
+  /**
+   * Rule that converts a
+   * {@link org.apache.calcite.rel.logical.LogicalTableScan} to an
+   * {@link EnumerableMergedIndexScan} when the table is a source in a
+   * registered {@link org.apache.calcite.materialize.MergedIndex}.
+   *
+   * <p>Used during physical conversion of maintenance plans.
+   *
+   * <p>Not included in {@link #ENUMERABLE_RULES}; callers opt in explicitly.
+   */
+  public static final LogicalTableScanToMergedIndexRule
+      LOGICAL_TABLE_SCAN_TO_MERGED_INDEX_RULE =
+          LogicalTableScanToMergedIndexRule.Config.DEFAULT.toRule();
+
+  /**
+   * Rule that converts a
+   * {@link org.apache.calcite.rel.logical.LogicalPipelineOutputScan} to an
+   * {@link EnumerableMergedIndexScan} by resolving the child pipeline to its
+   * source position in the parent merged index.
+   *
+   * <p>Used during physical conversion of maintenance plans.
+   *
+   * <p>Not included in {@link #ENUMERABLE_RULES}; callers opt in explicitly.
+   */
+  public static final PipelineOutputScanRule
+      PIPELINE_OUTPUT_SCAN_RULE =
+          PipelineOutputScanRule.Config.DEFAULT.toRule();
+
   public static final EnumerableLimitSortRule ENUMERABLE_LIMIT_SORT_RULE =
       EnumerableLimitSortRule.Config.DEFAULT.toRule();
 
