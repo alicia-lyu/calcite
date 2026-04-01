@@ -179,100 +179,67 @@ Inner pipelines (index creation plans, 5 levels):
 
 ---
 
-## Maintenance & Index Creation (design notes)
+## Maintenance & Index Creation
 
-Archived Option B maintenance plan content → `TRASH-option-b.md`.
-
-### Index creation plan
-
-For non-root pipelines, the BEFORE plan IS the index creation plan. It populates the
-MI from base tables (or inner MI views). Store as `physicalPlan` field on `Pipeline`.
-
-### Maintenance plan
-
-Same as index creation but processes deltas instead of full data. Future work — reconcile
-with existing `deriveIncrementalPlan()` and delta scan infrastructure.
+- **Index creation plan**: For non-root pipelines, stored as `pipeline.indexCreationPlan` (the BEFORE physical plan).
+- **Maintenance plan**: Logical-only so far — `deriveMaintenancePlan()` produces a `LogicalDelta`-wrapped plan per pipeline. Physical conversion is the next step (see Next Steps).
 
 ---
 
-## What Was Done (2026-03-10 to 2026-03-24)
+## What Was Done (2026-03-10 to 2026-03-25)
 
-### Indexed Views Feature (Single-Source Pipelines)
-- `Pipeline.buildTree()` moved to production code; now identifies both multi-source (join) and single-source (indexed view) pipelines.
-- `Pipeline.flatten()` now includes pipelines with `sources.size() >= 1` (was `>= 2`).
-- Multi-stage HEP planner: each pipeline level registered incrementally, one per HEP pass (leaf-to-root).
-- Q12 now demonstrates indexed view absorption: join pipeline (ORDERS ⋈ LINEITEM) feeds single-source indexed view (GROUP BY l_shipmode); final result is one MIScan.
+All code below is stable and tested. Per-commit details omitted; see git log.
 
-### Index Creation Plan Capture (Subtask 2)
-- Added `indexCreationPlan` field to `MergedIndex` with getter/setter.
-- Javadoc added: "Physical execution plan for this pipeline. Reads from this MI (via MIScans), executes pipeline operators (join, aggregate, etc.), and produces output rows that become a source in the parent pipeline."
-- Wired into Q12 multi-stage HEP loop (commit `128b1fb53`): after each HEP pass except root, `pipeline.root` captured as index creation plan.
-- Wired into Q3-OL and Q9 HEP loops (same pattern as Q12) — both already present in the code.
-- Test verification: all intermediate pipelines have non-null `indexCreationPlan` fields (except root).
-- Q3-OL root pipeline assertion added: exactly 2 `EnumerableMergedIndexScan` nodes in final plan
-  (inner pipeline MIScans absorbed into outer `view([0])` reference; not separate nodes in root plan).
-- `MergedIndexTestUtil`: no deprecated `buildPipelineTree`/`flattenPipelines` methods found; all tests
-  already use `Pipeline.buildTree()` and `pipelineTree.flatten()` directly.
-
-### Q12, Q3-OL, Q9 Javadoc & Plan Updates
-- `tpchQ12()`: restructured to show 2-pipeline discovery (join + indexed view); affirms indexed view absorption.
-- `tpchQ3OrdersLineitem()`: multi-stage HEP loop with per-pipeline registration; intermediate plans written to DOT.
-- `tpchQ9()`: sort direction fix via `propagateOrderByDirection()`; 6 pipelines (5 joins + 1 indexed view); entire plan collapses to single MIScan.
-- All tests use `Pipeline.buildTree()` and `pipelineTree.flatten()` (not custom test utils).
-
-### Terminology & Design Notes
-- "Bottom side" = input side (leaf pipelines, smaller indices).
-- "Top side" = output side (root pipeline, final result).
-- Two-pipeline test output structure added to SESSION_PROGRESS.md for Q12, Q3-OL, Q9.
-
-### Documentation Migration & Cost Model Refinement (2026-03-24 Session A)
-- Migrated stable reference content from SESSION_PROGRESS.md to CLAUDE.md:
-  - "Calcite Planner Architecture: Volcano vs HEP" (revised with current single-pass BOTTOM_UP approach)
-  - "Architecture: Sort-Boundary-Based Pipeline Replacement" (documents current operand pattern)
-  - "Multi-stage HEP for nested pipelines" (replaced outdated two-pass section)
-- Updated Q9 plan documentation: removed redundant ORDER BY sort note; clarified indexed view scan as final step.
-- Cleaned up SESSION_PROGRESS.md to keep only ephemeral session content (status table, commands, test summaries).
-- **Cost model documentation** (commit `32c4c6d03`):
-  - Expanded `EnumerableMergedIndexScan.computeSelfCost()` Javadoc explaining per-source row/cpu cost split and shared I/O cost.
-  - Expanded `MergedIndexScanGroup` class-level Javadoc explaining why the class exists and the I/O sharing design decision for future cost refinements.
-- Fixed checkstyle violations in `MergedIndexRegistry.java` (instanceof line-wrap).
-
-### Incremental Maintenance Plan Rewrite (2026-03-24 Session B)
-- **Core issue resolved:** `HepPlanner` + `StreamRules` were failing on TPC-H plans due to type-equivalence mismatch.
-- **Root cause:** `SetOp.deriveRowType()` was reconstructing union row types via `leastRestrictive()` even when all inputs had structurally identical types (JavaType → VARCHAR conversion).
-- **Solution (commit `cdaa4b637`):** Added fast-path in `SetOp.deriveRowType()` — when all inputs have structurally equal row types, return first directly without reconstruction.
-  - Mathematically correct: `leastRestrictive([T,T,...,T]) = T`.
-  - Eliminates spurious type-equivalence failures in HEP.
-  - Enables general-purpose HEP + StreamRules approach for deriving maintenance plans.
-- **Pipeline.logicalRoot field (commit `9c01144a7`):**
-  - Added `logicalRoot` field to store corresponding logical subtree per pipeline.
-  - Added `captureLogicalRoots(Pipeline, RelNode)` helper to walk logical plan post-order, matching boundary LogicalSort inputs to non-root pipelines.
-  - Criterion is structural (parent exists), not content-based — every non-root pipeline gets a logicalRoot.
-- **deriveMaintenancePlan rewrite (commit `e27b14124`):**
-  - Wrapped in `LogicalDelta` + applied `StreamRules` via HEP (6 rules: all except DeltaTableScanRule/EmptyRule).
-  - Updated all 3 test call sites (Q12, Q3-OL, Q9) to use `Pipeline.captureLogicalRoots()` + `p.logicalRoot`.
-  - Q12 maintenance plan now correctly includes LogicalProject above the union (remaining op above assembly).
-  - All 3 tests pass — entire maintenance-plan derivation is now general-purpose (not join-only).
-
-### Maintenance Plan Scoping (2026-03-25)
-- **Maintenance Plan Scoping** (commit `b51533254`): Each pipeline's maintenance plan now only covers its own operators. Child pipeline subtrees replaced with `LogicalValues.createEmpty` placeholders at derivation time. `p.logicalRoot` stays immutable — scoping via temporary copy in `scopeLogicalRoot()`.
-- **DOT Visualization** (commits `fba86a614`, `44f20b0dc`, `4ccda821e`, `7165187a4`): Tree-mode rendering with per-visit IDs, branch suffixes for unique labels, distinguishable colors for all operator types (Delta=tomato, Union=yellow, Join=gold, ChildViewOutput=pale green).
-- **IVM Batch-Delta Documentation** (commit `7165187a4`): Documented DAG shape and batch-delta double-counting semantics in `deriveMaintenancePlan` Javadoc.
+- **Sort-boundary pipeline architecture**: `Pipeline.buildTree()` discovers pipelines
+  from `EnumerableSort` boundaries; `flatten()` returns post-order list including
+  single-source indexed views (`sources.size() >= 1`).
+- **PipelineToMergedIndexScanRule**: matches `EnumerableSort` operands; multi-stage
+  HEP (one pass per nesting level, BOTTOM_UP) replaces pipelines leaf-to-root.
+- **TPC-H tests**: Q12 (2-table + indexed view), Q3-OL (3-table nested), Q9 (6-table,
+  5 nested joins + indexed view). All pass with correct BEFORE/AFTER plans and DOT output.
+- **Index creation plan capture**: `pipeline.indexCreationPlan` set after each HEP pass
+  (except root). Wired into Q12, Q3-OL, Q9 test loops.
+- **Incremental maintenance plan**: `deriveMaintenancePlan()` wraps `pipeline.logicalRoot`
+  in `LogicalDelta`, applies 6 `StreamRules` via HEP. Fixed `SetOp.deriveRowType()`
+  fast-path for type equivalence. `scopeLogicalRoot()` replaces child views with
+  `LogicalValues.createEmpty` placeholders. DOT visualization with per-operator colors.
+- **Documentation**: stable reference content migrated to `CLAUDE.md`; cost model
+  Javadoc expanded on `EnumerableMergedIndexScan` and `MergedIndexScanGroup`.
 
 ## Next Steps
 
 ### Short-term (next session)
 
-1. **Logical → Physical maintenance plan conversion** — The key challenge is the physical
-   representation of a **merged index delta**: a merged index spans multiple source tables,
-   so its delta must cover changes arriving from any of those sources. The simpler sub-problem
-   (converting `LogicalDelta(TableScan)` to a physical scan node) is secondary to this.
-   Options: new `EnumerableDeltaTableScan` per source, reusing stream infrastructure, or
-   Volcano conversion with a cost model. Files: `MergedIndexTpchPlanTest.java`, possibly
-   new physical nodes in `adapter/enumerable/`.
+1. **Logical → Physical maintenance plan conversion** — Convert the logical
+   maintenance plan (from `deriveMaintenancePlan`) into a physical (enumerable)
+   plan that can actually execute.
 
-   Note: `deriveMaintenancePlan` already handles single-source (indexed view) pipelines
-   — the only excluded case is the root pipeline. No special handling needed.
+   **Current state:** Each non-root pipeline has a logical maintenance plan containing:
+   - `LogicalDelta(LogicalTableScan(T))` for each base table T in the pipeline
+   - `LogicalValues.createEmpty` placeholders where child pipeline views were scoped out
+   - Standard logical operators (LogicalJoin, LogicalProject, LogicalAggregate) above
+
+   **The key challenge — merged index delta representation:**
+   A merged index stores rows from multiple tables interleaved by a shared key.
+   When a row changes in source table A, the delta must flow through the assembly
+   pipeline (joins with other sources B, C, …) to produce the output delta for the
+   parent index. The physical plan needs operators that:
+   - Scan the *unchanged* sources from the existing merged index (not full table scans)
+   - Process the *delta* from the changed source
+   - Assemble the output delta via the pipeline's join/aggregate operators
+
+   This is distinct from simple `DeltaTableScan` (single-table change stream) because
+   the "unchanged" side of each join reads from the *merged index* (pre-sorted,
+   co-located), not from independent table scans.
+
+   **Approach options:**
+   - (a) New `EnumerableDeltaMergedIndexScan` that reads unchanged sources from MI
+   - (b) Reuse Calcite's stream infrastructure (`Chi` / `StreamRules`) with MI-aware physical rules
+   - (c) Volcano conversion pass with delta-aware cost model
+
+   **Files:** `MergedIndexTpchPlanTest.java` (test harness), `Pipeline.java`
+   (`scopeLogicalRoot`, `captureLogicalRoots`), possibly new physical nodes in
+   `adapter/enumerable/`. Reference: `deriveMaintenancePlan()` in test file.
 
 ### Medium-term
 
