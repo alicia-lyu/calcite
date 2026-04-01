@@ -54,7 +54,10 @@ public class DeltaToMergedIndexDeltaScanRule
     final EnumerableMergedIndexScan scan = call.rel(1);
     call.transformTo(
         EnumerableMergedIndexDeltaScan.create(
-            delta.getCluster(), scan.mergedIndex, scan.getRowType()));
+            delta.getCluster(),
+            scan.mergedIndex,
+            scan.sourceIndex,
+            scan.scanGroup));
   }
 
   /** Rule configuration. */

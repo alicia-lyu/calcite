@@ -38,8 +38,8 @@ import org.apache.calcite.rel.RelRoot;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.Sort;
+import org.apache.calcite.rel.logical.LogicalPipelineOutputScan;
 import org.apache.calcite.rel.logical.LogicalSort;
-import org.apache.calcite.rel.logical.LogicalValues;
 import org.apache.calcite.rel.stream.LogicalDelta;
 import org.apache.calcite.rel.stream.StreamRules;
 
@@ -281,6 +281,13 @@ class MergedIndexTpchPlanTest {
         writeDotFile("q12/pipeline-" + i + "-index-creation-plan", cp);
       }
     }
+
+    // ── Convert logical maintenance plan to physical ────────
+    System.out.println("=== Q12 PHYSICAL MAINTENANCE PLAN ===");
+    final RelNode physicalMaintQ12 = convertToPhysicalMaintenancePlan(
+        joinPipeline.mergedIndex.getMaintenancePlan());
+    System.out.println(dumpText(physicalMaintQ12));
+    writeDotFile("q12/physical-maintenance", physicalMaintQ12);
 
     // ── Assert ────────────────────────────────────────────────────────────
     // After indexed view replacement: the Sort(l_shipmode) above MergeJoin
@@ -551,6 +558,19 @@ class MergedIndexTpchPlanTest {
         // Number from root: smaller = closer to root
         int fromRoot = pipelines.size() - 1 - i;
         writeDotFile("q3ol/" + level + "-" + fromRoot + "-index-creation-plan", cp);
+      }
+    }
+
+    // ── Convert logical maintenance plans to physical ────────
+    System.out.println("=== Q3-OL PHYSICAL MAINTENANCE PLANS ===");
+    for (int i = 0; i < pipelines.size(); i++) {
+      final RelNode mp = pipelines.get(i).mergedIndex != null
+          ? pipelines.get(i).mergedIndex.getMaintenancePlan() : null;
+      if (mp != null) {
+        System.out.println("--- Pipeline " + i + " physical maintenance ---");
+        final RelNode physicalMaint = convertToPhysicalMaintenancePlan(mp);
+        System.out.println(dumpText(physicalMaint));
+        writeDotFile("q3ol/physical-maintenance-" + i, physicalMaint);
       }
     }
 
@@ -860,6 +880,18 @@ class MergedIndexTpchPlanTest {
       }
     }
 
+    // ── Convert logical maintenance plans to physical ────────
+    System.out.println("=== Q9 PHYSICAL MAINTENANCE PLANS ===");
+    for (int i = 0; i < joinPipelinesQ9.size(); i++) {
+      final RelNode mp = joinPipelinesQ9.get(i).mergedIndex.getMaintenancePlan();
+      if (mp != null) {
+        System.out.println("--- Pipeline " + i + " physical maintenance ---");
+        final RelNode physicalMaint = convertToPhysicalMaintenancePlan(mp);
+        System.out.println(dumpText(physicalMaint));
+        writeDotFile("q9/physical-maintenance-" + i, physicalMaint);
+      }
+    }
+
     // ── Assert ────────────────────────────────────────────────────────────
     // With the ORDER BY sort removed (redundant after direction propagation),
     // there is exactly 1 indexed view pipeline: the GROUP BY Sort(n_name ASC,
@@ -1059,6 +1091,54 @@ class MergedIndexTpchPlanTest {
   }
 
   /**
+   * Converts a logical maintenance plan to a physical (enumerable) plan.
+   *
+   * <p>Uses HEP (bottom-up) rather than Volcano because the maintenance plan
+   * contains {@link org.apache.calcite.rel.stream.LogicalDelta} nodes, which
+   * have no convention trait and cannot participate in Volcano's
+   * convention-conversion framework.
+   *
+   * <p>Two HEP passes:
+   * <ol>
+   *   <li>Pass 1: convert {@code LogicalPipelineOutputScan} nodes (which
+   *       represent child merged-index views used as inputs in outer-pipeline
+   *       maintenance plans) to {@link EnumerableMergedIndexScan} via
+   *       {@link EnumerableRules#PIPELINE_OUTPUT_SCAN_RULE}.
+   *       {@code LogicalTableScan} leaves inside {@code LogicalDelta} wrappers
+   *       are intentionally left as logical nodes — they represent the raw
+   *       change stream from a base table and have no per-source MI row type.
+   *   <li>Pass 2: fold {@code LogicalDelta(EnumerableMergedIndexScan)} →
+   *       {@link EnumerableMergedIndexDeltaScan} via
+   *       {@link EnumerableRules#ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE}.
+   *       This fires when a child pipeline output scan (converted in pass 1) is
+   *       wrapped in a {@code LogicalDelta}.
+   * </ol>
+   *
+   * <p>The result retains logical operators (LogicalJoin, LogicalUnion,
+   * LogicalDelta, LogicalTableScan etc.) for nodes that have no physical
+   * MI counterpart; only {@code LogicalPipelineOutputScan} and its delta
+   * wrappers are converted to physical MI operators.
+   */
+  private static RelNode convertToPhysicalMaintenancePlan(RelNode logicalPlan) {
+    // Pass 1: convert LogicalPipelineOutputScan → EnumerableMergedIndexScan
+    final HepProgram pass1 = HepProgram.builder()
+        .addRuleInstance(EnumerableRules.PIPELINE_OUTPUT_SCAN_RULE)
+        .build();
+    final HepPlanner hep1 = new HepPlanner(pass1);
+    hep1.setRoot(logicalPlan);
+    final RelNode afterPass1 = hep1.findBestExp();
+
+    // Pass 2: fold LogicalDelta(EnumerableMergedIndexScan) → EnumerableMergedIndexDeltaScan
+    final HepProgram pass2 = HepProgram.builder()
+        .addRuleInstance(
+            EnumerableRules.ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE)
+        .build();
+    final HepPlanner hep2 = new HepPlanner(pass2);
+    hep2.setRoot(afterPass1);
+    return hep2.findBestExp();
+  }
+
+  /**
    * Creates a scoped copy of a pipeline's logicalRoot, replacing non-leaf
    * child pipeline subtrees with {@link LogicalValues#createEmpty} placeholders.
    *
@@ -1084,11 +1164,10 @@ class MergedIndexTpchPlanTest {
     }
 
     // Collect logicalRoots of non-leaf children (merged index views)
-    final Set<RelNode> childLogicalRoots =
-        Collections.newSetFromMap(new IdentityHashMap<>());
+    final Map<RelNode, Pipeline> childLogicalRoots = new IdentityHashMap<>();
     for (Pipeline child : pipeline.sources) {
       if (child.logicalRoot != null && !child.sources.isEmpty()) {
-        childLogicalRoots.add(child.logicalRoot);
+        childLogicalRoots.put(child.logicalRoot, child);
       }
     }
 
@@ -1101,15 +1180,17 @@ class MergedIndexTpchPlanTest {
 
   /**
    * Walks a RelNode tree and replaces boundary sorts whose input
-   * identity-matches a child logicalRoot with a {@link LogicalValues} placeholder.
+   * identity-matches a child logicalRoot with a
+   * {@link LogicalPipelineOutputScan} placeholder carrying the child pipeline.
    */
   private static RelNode replaceChildBoundaries(RelNode node,
-      Set<RelNode> childLogicalRoots) {
+      Map<RelNode, Pipeline> childLogicalRoots) {
     if (Pipeline.isLogicalBoundarySort(node)) {
       final Sort sort = (Sort) node;
-      if (childLogicalRoots.contains(sort.getInput())) {
-        return LogicalValues.createEmpty(
-            sort.getCluster(), sort.getRowType());
+      final Pipeline childPipeline = childLogicalRoots.get(sort.getInput());
+      if (childPipeline != null) {
+        return LogicalPipelineOutputScan.create(
+            sort.getCluster(), childPipeline, sort.getRowType());
       }
     }
     // Recurse into inputs
@@ -1671,9 +1752,9 @@ class MergedIndexTpchPlanTest {
    * Drops internal attributes like {@code sort0=}, {@code dir0=}, {@code joinType=}.
    */
   private static String nodeLabel(RelNode node, String firstLine) {
-    // Empty LogicalValues placeholders inserted by replaceChildBoundaries
+    // LogicalPipelineOutputScan placeholders inserted by replaceChildBoundaries
     // represent the output of a child pipeline's merged index view.
-    if (node instanceof LogicalValues && ((LogicalValues) node).getTuples().isEmpty()) {
+    if (node instanceof LogicalPipelineOutputScan) {
       return "ChildViewOutput";
     }
     final int parenIdx = firstLine.indexOf('(');

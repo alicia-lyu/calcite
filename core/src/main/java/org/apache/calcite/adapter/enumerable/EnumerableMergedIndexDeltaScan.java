@@ -19,6 +19,7 @@ package org.apache.calcite.adapter.enumerable;
 import org.apache.calcite.linq4j.tree.BlockBuilder;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.materialize.MergedIndex;
+import org.apache.calcite.materialize.MergedIndexScanGroup;
 import org.apache.calcite.materialize.Pipeline;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptCost;
@@ -32,21 +33,27 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.util.BuiltInMethod;
 
-import java.util.ArrayList;
-import java.util.List;
-
 /**
  * Physical relational operator representing a <em>delta stream</em> of new
- * records arriving from a {@link MergedIndex}; used in incremental maintenance
- * plans.
+ * records arriving from one source of a {@link MergedIndex}; used in
+ * incremental maintenance plans.
+ *
+ * <p>Under the "Transparent Per-Source MI Scans" architecture, each boundary
+ * Sort in a pipeline is replaced independently by a per-source delta scan that
+ * returns <b>source-native rows</b> (the row type of just that one source).
+ * Parent operators (MergeJoin, SortedAggregate) remain in the plan unchanged.
+ *
+ * <p>All per-source delta scans within the same pipeline share a
+ * {@link MergedIndexScanGroup} instance, signifying that they share one
+ * physical I/O pass over the merged index's delta buffer.
  *
  * <p>Produced by {@link DeltaToMergedIndexDeltaScanRule} when it sees a
  * {@code LogicalDelta} whose input is an {@link EnumerableMergedIndexScan}.
  * The delta scan represents the stream of newly inserted rows that need to be
  * merged into the index during an incremental view maintenance step.
  *
- * <p>Cost model: slightly higher than {@link EnumerableMergedIndexScan} to
- * discourage accidental substitution in query plans.
+ * <p>Cost model: slightly higher cpu than {@link EnumerableMergedIndexScan}
+ * (0.2 vs 0.1) to discourage accidental substitution in query plans.
  *
  * <p>See: "Storing and Indexing Multiple Tables by Interesting Orderings",
  * Wenhui Lyu &amp; Goetz Graefe, VLDB 2026.
@@ -57,27 +64,64 @@ public class EnumerableMergedIndexDeltaScan extends AbstractRelNode
   /** The merged index whose delta stream this operator represents. */
   public final MergedIndex mergedIndex;
 
+  /** Which source (0..N-1) this delta scan filters for. */
+  public final int sourceIndex;
+
+  /** Shared physical scan reference — sibling scans share the same instance. */
+  public final MergedIndexScanGroup scanGroup;
+
   private final RelDataType rowType;
 
-  /** Creates an EnumerableMergedIndexDeltaScan. Use {@link #create} instead. */
+  /** Creates an EnumerableMergedIndexDeltaScan. Use a {@code create} factory instead. */
   protected EnumerableMergedIndexDeltaScan(
       RelOptCluster cluster,
       RelTraitSet traitSet,
       MergedIndex mergedIndex,
+      int sourceIndex,
+      MergedIndexScanGroup scanGroup,
       RelDataType rowType) {
     super(cluster, traitSet);
     this.mergedIndex = mergedIndex;
+    this.sourceIndex = sourceIndex;
+    this.scanGroup = scanGroup;
     this.rowType = rowType;
     assert getConvention() instanceof EnumerableConvention;
   }
 
   /**
-   * Creates an {@code EnumerableMergedIndexDeltaScan}.
+   * Creates a per-source {@code EnumerableMergedIndexDeltaScan}.
+   *
+   * <p>The delta scan returns rows matching the source pipeline's row type at
+   * {@code sourceIndex}, with collation matching the source's boundary
+   * collation.
    *
    * @param cluster     query planning cluster
    * @param mergedIndex the merged index whose delta stream to produce
-   * @param rowType     the output row type (same as the base scan's row type)
+   * @param sourceIndex which source (0..N-1) this delta scan filters for
+   * @param scanGroup   shared physical scan reference
    */
+  public static EnumerableMergedIndexDeltaScan create(
+      RelOptCluster cluster,
+      MergedIndex mergedIndex,
+      int sourceIndex,
+      MergedIndexScanGroup scanGroup) {
+    Pipeline source = mergedIndex.getSources().get(sourceIndex);
+    RelCollation boundaryCollation = source.boundaryCollation;
+    final RelTraitSet traitSet =
+        cluster.traitSetOf(EnumerableConvention.INSTANCE)
+            .replace(boundaryCollation);
+    RelDataType rowType = source.root.getRowType();
+    return new EnumerableMergedIndexDeltaScan(cluster, traitSet, mergedIndex,
+        sourceIndex, scanGroup, rowType);
+  }
+
+  /**
+   * Creates an {@code EnumerableMergedIndexDeltaScan} with explicit row type.
+   *
+   * @deprecated Use {@link #create(RelOptCluster, MergedIndex, int, MergedIndexScanGroup)}.
+   *     This overload exists for backward compatibility with existing callers.
+   */
+  @Deprecated
   public static EnumerableMergedIndexDeltaScan create(
       RelOptCluster cluster,
       MergedIndex mergedIndex,
@@ -85,44 +129,57 @@ public class EnumerableMergedIndexDeltaScan extends AbstractRelNode
     final RelTraitSet traitSet =
         cluster.traitSetOf(EnumerableConvention.INSTANCE)
             .replace(mergedIndex.getCollation());
-    return new EnumerableMergedIndexDeltaScan(cluster, traitSet, mergedIndex, rowType);
+    return new EnumerableMergedIndexDeltaScan(cluster, traitSet, mergedIndex,
+        0, new MergedIndexScanGroup(mergedIndex), rowType);
   }
 
   @Override protected RelDataType deriveRowType() {
     return rowType;
   }
 
+  /**
+   * Cost model for a per-source delta scan over a merged index.
+   *
+   * <p>Cost formula (mirrors {@link EnumerableMergedIndexScan} but with higher
+   * cpu to discourage accidental use in query plans):
+   * <ul>
+   *   <li><b>rowCount</b> = totalRows / sourceCount (only this source's rows)
+   *   <li><b>cpu</b> = sourceRows * 0.2 (slightly higher than full scan)
+   *   <li><b>io</b> = totalRows (full index scan, shared across siblings)
+   * </ul>
+   */
   @Override public RelOptCost computeSelfCost(RelOptPlanner planner,
       RelMetadataQuery mq) {
-    double rc = mergedIndex.getRowCount();
-    return planner.getCostFactory().makeCost(rc, rc * 0.2, rc);
+    double totalRows = mergedIndex.getRowCount();
+    double sourceRows = totalRows / scanGroup.sourceCount;
+    return planner.getCostFactory().makeCost(sourceRows, sourceRows * 0.2,
+        totalRows);
   }
 
   @Override public double estimateRowCount(RelMetadataQuery mq) {
-    return mergedIndex.getRowCount();
+    return mergedIndex.getRowCount() / scanGroup.sourceCount;
   }
 
   @Override public RelWriter explainTerms(RelWriter pw) {
-    List<String> descs = new ArrayList<>();
-    for (int i = 0; i < mergedIndex.getSources().size(); i++) {
-      Pipeline child = mergedIndex.getSources().get(i);
-      RelCollation tc = child.boundaryCollation;
-      if (child.mergedIndex != null) {
-        descs.add("delta:view(" + child.mergedIndex.getCollation() + ")");
+    Pipeline source = mergedIndex.getSources().get(sourceIndex);
+    String srcDesc;
+    if (source.mergedIndex != null) {
+      srcDesc = "delta:view(" + source.mergedIndex.getCollation() + ")";
+    } else {
+      RelOptTable t = MergedIndex.findLeafScan(source.root);
+      if (t != null) {
+        RelCollation tc = source.boundaryCollation;
+        int keyIdx = tc.getFieldCollations().get(0).getFieldIndex();
+        String keyName = t.getRowType().getFieldList().get(keyIdx).getName();
+        srcDesc = "delta:" + t.getQualifiedName() + ":" + keyName;
       } else {
-        RelOptTable t = MergedIndex.findLeafScan(child.root);
-        if (t != null) {
-          int keyIdx = tc.getFieldCollations().get(0).getFieldIndex();
-          String keyName = t.getRowType().getFieldList().get(keyIdx).getName();
-          descs.add("delta:" + t.getQualifiedName() + ":" + keyName);
-        } else {
-          descs.add("delta:unknown");
-        }
+        srcDesc = "delta:unknown";
       }
     }
     return super.explainTerms(pw)
-        .item("tables", descs)
-        .item("collation", mergedIndex.getCollation());
+        .item("mi", mergedIndex.getCollation())
+        .item("source", srcDesc)
+        .item("sourceIndex", sourceIndex);
   }
 
   /**
