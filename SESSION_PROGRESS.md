@@ -255,7 +255,9 @@ All code below is stable and tested. Per-commit details omitted; see git log.
 
 ## Next Steps
 
-### Short-term (next session)
+### Short-term (next session) 
+
+(Use numbering.)
 
 1. ~~**Logical → Physical maintenance plan conversion (leaf scans)**~~ — **Done** ✓
    Leaf scans converted to `EnumerableMergedIndexScan` / `EnumerableMergedIndexDeltaScan`
@@ -269,12 +271,16 @@ All code below is stable and tested. Per-commit details omitted; see git log.
 
 ### Medium-term
 
-2. Maintenance-time assembly operator design (how the executor uses the physical plan)
-3. Additional TPC-H queries (Q5, Q7, Q10) for more operator combinations
-4. PATH B: native merged index support (tables report collation via `getStatistic()`)
+(Do not use numbering.)
+
+- ~~Maintenance-time assembly operator design (how the executor uses the physical plan)~~ (obsolete along with [option B](./TRASH-option-b.md))
+- Additional TPC-H queries (Q5, Q7, Q10) for more operator combinations
 
 ### Long-term
+
+(Do not use numbering.)
 
 5. Window functions, DISTINCT, set operators in sort-based pipelines
 6. End-to-end execution prototype
 7. Functional dependency-based index matching
+- ~~PATH B: native merged index support (tables report collation via `getStatistic()`)~~ (Not necessary for story telling in research paper.)
