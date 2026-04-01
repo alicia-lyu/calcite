@@ -11,8 +11,11 @@
 | `core/.../adapter/enumerable/EnumerableMergedIndexJoin.java`            | Deleted (per-source arch) |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java` (Sort-boundary) | Done |
 | `core/.../adapter/enumerable/EnumerableRules.java` (constant)           | Done    |
-| `core/.../adapter/enumerable/EnumerableMergedIndexDeltaScan.java` (NEW) | Obsolete (Option B) |
-| `core/.../adapter/enumerable/DeltaToMergedIndexDeltaScanRule.java` (NEW)| Obsolete (Option B) |
+| `core/.../adapter/enumerable/EnumerableMergedIndexDeltaScan.java` (NEW) | Done ✓ (per-source with sourceIndex+scanGroup) |
+| `core/.../adapter/enumerable/DeltaToMergedIndexDeltaScanRule.java` (NEW)| Done ✓ (updated to pass through sourceIndex/scanGroup) |
+| `core/.../adapter/enumerable/LogicalPipelineOutputScan.java` (NEW)      | Done ✓ |
+| `core/.../adapter/enumerable/LogicalTableScanToMergedIndexRule.java` (NEW) | Done ✓ |
+| `core/.../adapter/enumerable/PipelineOutputScanRule.java` (NEW)         | Done ✓ |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
 | TPC-H Q3 (deleted — incorrect CUSTOMER+ORDERS example)                  | Removed |
 | TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓  |
@@ -182,7 +185,27 @@ Inner pipelines (index creation plans, 5 levels):
 ## Maintenance & Index Creation
 
 - **Index creation plan**: For non-root pipelines, stored as `pipeline.indexCreationPlan` (the BEFORE physical plan).
-- **Maintenance plan**: Logical-only so far — `deriveMaintenancePlan()` produces a `LogicalDelta`-wrapped plan per pipeline. Physical conversion is the next step (see Next Steps).
+- **Maintenance plan**: `deriveMaintenancePlan()` produces a `LogicalDelta`-wrapped logical plan per pipeline. Physical conversion via `convertToPhysicalMaintenancePlan()` runs two HEP passes.
+- **Physical maintenance plan**: `convertToPhysicalMaintenancePlan()` runs two HEP passes.
+  Both full-scan and delta branches use pipeline output type. Source subtrees identified
+  by pipeline boundary sorts, not join inputs.
+  - **Only leaf scans are physical**: `EnumerableMergedIndexScan` and
+    `EnumerableMergedIndexDeltaScan` are the only enumerable nodes; all other operators
+    (LogicalJoin, LogicalUnion, LogicalProject, LogicalFilter) remain logical.
+  - **Shared scan group**: all leaf scans (full and delta) within one pipeline's
+    maintenance plan share the same `MergedIndexScanGroup` — a single MI stores all
+    sources of that pipeline interleaved by the shared sort key.
+  - Example physical maintenance plan for a 2-source pipeline (MI over ORDERS+LINEITEM):
+    ```
+    LogicalUnion
+    ├─ LogicalJoin
+    │  ├─ EnumerableMergedIndexScan(MI, ORDERS, group=G)
+    │  └─ EnumerableMergedIndexDeltaScan(MI, LINEITEM, group=G)
+    └─ LogicalJoin
+       ├─ EnumerableMergedIndexDeltaScan(MI, ORDERS, group=G)
+       └─ EnumerableMergedIndexScan(MI, LINEITEM, group=G)
+    ```
+    All 4 scans share group G (same pipeline, same MI).
 
 ---
 
@@ -203,6 +226,30 @@ All code below is stable and tested. Per-commit details omitted; see git log.
   in `LogicalDelta`, applies 6 `StreamRules` via HEP. Fixed `SetOp.deriveRowType()`
   fast-path for type equivalence. `scopeLogicalRoot()` replaces child views with
   `LogicalValues.createEmpty` placeholders. DOT visualization with per-operator colors.
+- **`scopeLogicalRoot` fix (2026-04-01)**: Removed `!child.sources.isEmpty()` filter so
+  ALL child pipelines (both leaf table-scan and non-leaf MI-view) are replaced with
+  `LogicalPipelineOutputScan` placeholders before delta push-down. Previously only
+  non-leaf children were scoped, leaving leaf pipelines' `logicalRoot` exposed and
+  potentially allowing delta propagation to cross pipeline boundaries.
+- **Physical maintenance plan conversion (2026-04-01)**: Converts logical maintenance
+  plans to physical (enumerable) plans with MI-aware leaf scans.
+  - `LogicalPipelineOutputScan` (new logical node): placeholder for child pipeline output.
+    Carries `Pipeline` reference. Used in `scopeLogicalRoot` for ALL source pipelines
+    (leaf and non-leaf) — replaces old `LogicalValues.createEmpty` approach.
+  - `EnumerableMergedIndexDeltaScan`: repurposed as per-source with `sourceIndex` +
+    `scanGroup` fields, matching `EnumerableMergedIndexScan` design.
+  - Conversion rules: `PipelineOutputScanRule` (new), `DeltaToMergedIndexDeltaScanRule`
+    (updated to pass through sourceIndex/scanGroup), `LogicalTableScanToMergedIndexRule` (new).
+  - `convertToPhysicalMaintenancePlan()`: two HEP passes — (1) `PipelineOutputScanRule`
+    converts placeholders to `EnumerableMergedIndexScan`, (2) `DeltaToMergedIndexDeltaScanRule`
+    folds `LogicalDelta(scan)` to `EnumerableMergedIndexDeltaScan`.
+  - Key insight: MI stores output of each source pipeline. Both full-scan and delta
+    branches use pipeline output type; difference is which rows flow, not the type.
+  - Delta and full scans share the same `MergedIndexScanGroup` within a pipeline —
+    all sources in one pipeline are interleaved in a single MI, so one group covers all.
+  - Only leaf scans converted to physical; remaining operators (LogicalJoin, LogicalUnion,
+    LogicalProject, LogicalFilter) stay logical.
+  - Applied to Q12, Q3-OL, Q9 in `MergedIndexTpchPlanTest`.
 - **Documentation**: stable reference content migrated to `CLAUDE.md`; cost model
   Javadoc expanded on `EnumerableMergedIndexScan` and `MergedIndexScanGroup`.
 
@@ -210,36 +257,15 @@ All code below is stable and tested. Per-commit details omitted; see git log.
 
 ### Short-term (next session)
 
-1. **Logical → Physical maintenance plan conversion** — Convert the logical
-   maintenance plan (from `deriveMaintenancePlan`) into a physical (enumerable)
-   plan that can actually execute.
+1. ~~**Logical → Physical maintenance plan conversion (leaf scans)**~~ — **Done** ✓
+   Leaf scans converted to `EnumerableMergedIndexScan` / `EnumerableMergedIndexDeltaScan`
+   via two HEP passes in `convertToPhysicalMaintenancePlan()`. Applied to Q12, Q3-OL, Q9.
+   Delta and full scans share the same `MergedIndexScanGroup`; all other operators remain logical.
 
-   **Current state:** Each non-root pipeline has a logical maintenance plan containing:
-   - `LogicalDelta(LogicalTableScan(T))` for each base table T in the pipeline
-   - `LogicalValues.createEmpty` placeholders where child pipeline views were scoped out
-   - Standard logical operators (LogicalJoin, LogicalProject, LogicalAggregate) above
-
-   **The key challenge — merged index delta representation:**
-   A merged index stores rows from multiple tables interleaved by a shared key.
-   When a row changes in source table A, the delta must flow through the assembly
-   pipeline (joins with other sources B, C, …) to produce the output delta for the
-   parent index. The physical plan needs operators that:
-   - Scan the *unchanged* sources from the existing merged index (not full table scans)
-   - Process the *delta* from the changed source
-   - Assemble the output delta via the pipeline's join/aggregate operators
-
-   This is distinct from simple `DeltaTableScan` (single-table change stream) because
-   the "unchanged" side of each join reads from the *merged index* (pre-sorted,
-   co-located), not from independent table scans.
-
-   **Approach options:**
-   - (a) New `EnumerableDeltaMergedIndexScan` that reads unchanged sources from MI
-   - (b) Reuse Calcite's stream infrastructure (`Chi` / `StreamRules`) with MI-aware physical rules
-   - (c) Volcano conversion pass with delta-aware cost model
-
-   **Files:** `MergedIndexTpchPlanTest.java` (test harness), `Pipeline.java`
-   (`scopeLogicalRoot`, `captureLogicalRoots`), possibly new physical nodes in
-   `adapter/enumerable/`. Reference: `deriveMaintenancePlan()` in test file.
+2. **Convert remaining logical operators to enumerable** — run a full Volcano pass with
+   standard `ENUMERABLE_*` rules on the maintenance plan so that LogicalJoin, LogicalUnion,
+   LogicalProject, LogicalFilter above the leaf scans become their enumerable counterparts.
+   Target: `convertToPhysicalMaintenancePlan()` in `MergedIndexTpchPlanTest` or production code.
 
 ### Medium-term
 
