@@ -1139,21 +1139,24 @@ class MergedIndexTpchPlanTest {
   }
 
   /**
-   * Creates a scoped copy of a pipeline's logicalRoot, replacing non-leaf
-   * child pipeline subtrees with {@link LogicalValues#createEmpty} placeholders.
+   * Creates a scoped copy of a pipeline's logicalRoot, replacing ALL source
+   * pipeline boundaries (both leaf table scans and non-leaf MI views) with
+   * {@link LogicalPipelineOutputScan} placeholders before delta push-down.
    *
-   * <p>A "non-leaf child" is a child pipeline with its own sources
-   * ({@code child.sources.isEmpty() == false}) — it represents a merged index
-   * view whose maintenance is handled by its own maintenance plan. Leaf children
-   * (base table scans) are left intact so Delta propagates to their scans.
+   * <p>Every child pipeline boundary sort whose {@code .getInput()} identity-
+   * matches a child's logicalRoot is replaced with a
+   * {@link LogicalPipelineOutputScan} carrying the child pipeline. This ensures
+   * that delta propagation stays within the current pipeline's scope: it stops
+   * at all child pipeline boundaries, whether those boundaries are base-table
+   * scans (leaf pipelines) or inner merged-index views (non-leaf pipelines).
    *
    * <p>Identification: a child's logicalRoot was set from a boundary sort's
    * input in {@link Pipeline#captureLogicalRoots}. This method finds boundary
-   * sorts whose {@code .getInput()} identity-matches a non-leaf child's
-   * logicalRoot and replaces them with empty Values placeholders.
+   * sorts whose {@code .getInput()} identity-matches any child's logicalRoot
+   * and replaces them with {@link LogicalPipelineOutputScan} placeholders.
    *
    * @param pipeline the pipeline to scope
-   * @return scoped copy (or original if no non-leaf children)
+   * @return scoped copy (or original if no children have a logicalRoot)
    */
   private static RelNode scopeLogicalRoot(Pipeline pipeline) {
     if (pipeline.logicalRoot == null) {
@@ -1163,16 +1166,16 @@ class MergedIndexTpchPlanTest {
       return pipeline.logicalRoot; // leaf pipeline, no scoping needed
     }
 
-    // Collect logicalRoots of non-leaf children (merged index views)
+    // Collect logicalRoots of all children (both leaf table scans and MI views)
     final Map<RelNode, Pipeline> childLogicalRoots = new IdentityHashMap<>();
     for (Pipeline child : pipeline.sources) {
-      if (child.logicalRoot != null && !child.sources.isEmpty()) {
+      if (child.logicalRoot != null) {
         childLogicalRoots.put(child.logicalRoot, child);
       }
     }
 
     if (childLogicalRoots.isEmpty()) {
-      return pipeline.logicalRoot; // all children are leaves
+      return pipeline.logicalRoot; // no children with logicalRoot
     }
 
     return replaceChildBoundaries(pipeline.logicalRoot, childLogicalRoots);
