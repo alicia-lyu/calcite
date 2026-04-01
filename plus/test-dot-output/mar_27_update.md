@@ -1,5 +1,33 @@
 # Mar 27 Update
 
+## Background
+
+A cost-based query optimizer that favors **order-based algorithms** and optimizes for interesting orderings produces query plans that naturally decompose into *pipelines*: groups of operators that all share a common sort order. Within each pipeline, a single sort at the input feeds a cascade of joins and aggregations without any additional sorting. Pipeline boundaries are exactly where one sort order ends and another begins.
+
+## Key Idea: Merged Index
+
+Sorts of each boundary can be replaced by a **merged index** — a B-tree that physically stores records from multiple tables interleaved in sorted order. Because the data arrives pre-sorted from the index, the sort is eliminated. More importantly, the *entire pipeline* — sort, join, and aggregation together — collapses to a single sequential scan over the merged index, which assembles and combines records on the fly.
+
+## How to Read the Query Examples
+
+Each query below is shown as a set of plan diagrams. There are two roles a pipeline can play:
+
+- **Root pipeline** — the outermost pipeline that produces the final query result. At query time this executes as an ordinary query plan (a scan or a join over merged index scans). There is no separate maintenance step for the root pipeline because it is not stored.
+- **Non-root pipeline** — an inner pipeline whose output is stored in a merged index. It appears in two contexts: building the index initially (*index creation plan*) and keeping it current when base-table rows change (*maintenance plan*).
+
+| | root pipeline | non-root pipeline |
+|-|---------------|-------------------|
+|data flow| query plan | index creation plan |
+|delta flow | N/A | maintenance plan |
+
+The **traditional query plan** (shown first for each query) is what a standard optimizer produces before applying the merged-index substitution.
+
+The **maintenance plan** processes only the *changed rows* (a delta), not the full table. For nested indexes — where an inner merged index feeds an outer one — a base-table delta cascades level by level through the maintenance plans, each step still 1-to-1.
+
+The three queries below range from simple (Q12: 2 tables, 1 non-root pipeline) to complex (Q9: 6 tables, 5 non-root pipelines), demonstrating that the same substitution scales uniformly.
+
+---
+
 ## TPC-H Q12
 
 ```sql
@@ -38,6 +66,10 @@ order by l_shipmode;
 
 ![q12/maintenance-tree](./q12/maintenance-tree_color.png)
 
+Outer join
+
+Galindo Lagaria
+
 ## TPCH Q3
 
 ```sql
@@ -71,6 +103,8 @@ order by revenue desc, o_orderdate;
 
 ![q3ol/maintenance-0-tree](./q3ol/maintenance-0-tree_color.png)
 
+\delta Orders \join lineitem \union \delta Lineitem \join Orders(new)
+
 ## TPCH Q9
 
 ```sql
@@ -95,6 +129,10 @@ order by nation, o_year desc;
 
 ![q9/before-pipeline](./q9/before-pipeline_color.png)
 
+partkey or suppkey first (query vs maintenance)
+
+shared sort order between (partkey, suppkey) and partkey
+
 | | root pipeline | non-root pipeline |
 |-|---------------|-------------------|
 |data flow| query plan | index creation plan |
@@ -103,6 +141,8 @@ order by nation, o_year desc;
 ### Query Plan (for root pipeline)
 
 ![q9/root-pipeline-query-plan](./q9/root-pipeline-query-plan_color.png)
+
+
 
 ### Index Creation Plans (for non-root pipelines)
 
@@ -127,3 +167,19 @@ order by nation, o_year desc;
 ![q9/maintenance-3-tree](./q9/maintenance-3-tree_color.png)
 
 ![q9/maintenance-4-tree](./q9/maintenance-4-tree_color.png)
+
+## Query Performance
+
+Compared with materialized views, query execution with merged indexes require the record assembly of the last pipeline.
+
+## Maintenance Performance
+
+- Traditional IVM: Updates must propagate through the entire query.
+- DBToaster: Updates propagate through the entire query and update intermediate views along the way. Especially helps with the case where a full intermediate view is required (to be joined with the delta).
+- Merged index: Updates propagate through the entire query and update intermediate merged indexes along the way. When a full intermediate view is required (e.g. outcome of pipeline1), we just scan pipeline1.mergedIndex and process the operators of pipeline1, which is similar to scanning a fully computed intermediate view.
+
+Propagate until query: large merge fan-in
+
+---- Multi-level propagation (LSM compaction) 
+
+---- Propagate at updates: fresh up-to-date merged indexes
