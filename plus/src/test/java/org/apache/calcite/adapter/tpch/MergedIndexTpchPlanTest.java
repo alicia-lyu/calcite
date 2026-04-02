@@ -18,6 +18,7 @@ package org.apache.calcite.adapter.tpch;
 
 import org.apache.calcite.adapter.enumerable.EnumerableConvention;
 import org.apache.calcite.adapter.enumerable.EnumerableMergeJoin;
+import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexDeltaScan;
 import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan;
 import org.apache.calcite.adapter.enumerable.EnumerableRules;
 import org.apache.calcite.materialize.MergedIndex;
@@ -1624,6 +1625,12 @@ class MergedIndexTpchPlanTest {
     for (Map.Entry<RelNode, Integer> entry : ids.entrySet()) {
       if (entry.getKey() instanceof EnumerableMergedIndexScan) {
         final EnumerableMergedIndexScan scan = (EnumerableMergedIndexScan) entry.getKey();
+        miGroups.computeIfAbsent(scan.mergedIndex, k -> new ArrayList<>())
+            .add(entry.getValue());
+      }
+      if (entry.getKey() instanceof EnumerableMergedIndexDeltaScan) {
+        final EnumerableMergedIndexDeltaScan scan =
+            (EnumerableMergedIndexDeltaScan) entry.getKey();
         miGroups.computeIfAbsent(scan.mergedIndex, k -> new ArrayList<>())
             .add(entry.getValue());
       }
