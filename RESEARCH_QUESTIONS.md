@@ -83,8 +83,40 @@ fully compacted---
 
 At compaction of level `i`, it suffices to distinguish only two
 cases — whether a record originated from the upper SSTable (newer, may be
-unpropagated) or the lower SSTable (older, already propagated). No multi-bit tag is
+unpropagated) or the lower SSTable (older, already propagated). No multi-byte tag is
 needed; the merge step itself provides the necessary distinction.
+
+### Compaction-as-Maintenance vs. On-Demand Scan
+
+The B-tree model described above also applies to LSM when treated as ordinary ordered
+storage: cache the delta keys in memory and scan the key ranges on demand, exactly as
+with a B-tree. The compaction-based model is an LSM-native alternative. Its preliminary
+advantages are:
+
+**Amortized I/O.** On-demand scanning pays a random seek per delta key, even if many
+updates arrive in quick succession. Compaction folds all pending deltas accumulated in
+the MemTable into a single sequential pass over the affected key range. Multiple updates
+to the same key range between two compactions are handled together — one scan, not N.
+
+**No separate maintenance operation.** In the on-demand model, maintenance is an
+explicit step that must be triggered, tracked, and coordinated with writes. In the
+compaction model, maintenance is a side effect of the compaction that would happen
+anyway. There is no additional write-path instrumentation; the propagation tag is the
+only bookkeeping added.
+
+**Natural temporal batching.** Updates that arrive close in time but at different keys
+accumulate in the MemTable. When compaction fires, all of them are processed in one
+ordered sequential scan — optimal I/O for the storage medium. On-demand scanning has no
+such batching unless explicitly implemented.
+
+**Bounded maintenance lag.** The compaction schedule determines when propagation
+happens. This makes maintenance latency predictable and tunable via compaction
+policy, rather than tied to individual update latency.
+
+The trade-off is **freshness**: the compaction model propagates in batches, so the
+merged index at any point may contain unpropagated records from the last compaction
+interval. The on-demand model propagates immediately. Which matters depends on whether
+the workload requires read-your-own-writes consistency on the merged index output.
 
 ---
 
