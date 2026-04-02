@@ -64,7 +64,7 @@ key-range buffering and cartesian product computation described above. Compactio
 the maintenance plan.
 
 This works cleanly in a **two-level LSM** (one MemTable, one SSTable): all
-unpropagated records are in the MemTable; compaction propagates them all at once.
+unpropagated records are in the MemTable; compaction propagates them all at once. In this level, we may not need propagation tag at all, since all records in the MemTable are unpropagated (with tag 1), all records in the SSTable are propagated (with tag 0).
 
 For **multi-level LSM**, a more granular propagation tag is needed per record:
 
@@ -84,7 +84,7 @@ fully compacted---
 At compaction of level `i`, it suffices to distinguish only two
 cases — whether a record originated from the upper SSTable (newer, may be
 unpropagated) or the lower SSTable (older, already propagated). No multi-byte tag is
-needed; the merge step itself provides the necessary distinction.
+needed; the merge step itself provides the necessary distinction. We cannot avoid the tag in this case, since partially propagated changes mingle with propagated changes after the first compaction.
 
 ### Compaction-as-Maintenance vs. On-Demand Scan
 
@@ -95,14 +95,12 @@ advantages are:
 
 **Amortized I/O.** On-demand scanning pays a random seek per delta key, even if many
 updates arrive in quick succession. Compaction folds all pending deltas accumulated in
-the MemTable into a single sequential pass over the affected key range. Multiple updates
-to the same key range between two compactions are handled together — one scan, not N.
+the MemTable into a single sequential pass over the affected key range. Propagation incurs cost negligibly more than normal compaction.
 
 **No separate maintenance operation.** In the on-demand model, maintenance is an
 explicit step that must be triggered, tracked, and coordinated with writes. In the
 compaction model, maintenance is a side effect of the compaction that would happen
-anyway. There is no additional write-path instrumentation; the propagation tag is the
-only bookkeeping added.
+anyway.
 
 **Natural temporal batching.** Updates that arrive close in time but at different keys
 accumulate in the MemTable. When compaction fires, all of them are processed in one
