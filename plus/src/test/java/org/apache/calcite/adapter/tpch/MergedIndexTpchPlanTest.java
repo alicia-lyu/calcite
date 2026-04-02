@@ -30,6 +30,9 @@ import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgram;
+import org.apache.calcite.plan.volcano.VolcanoPlanner;
+import org.apache.calcite.rel.rules.CoreRules;
+import org.apache.calcite.tools.Program;
 import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelFieldCollation;
@@ -1091,33 +1094,23 @@ class MergedIndexTpchPlanTest {
   }
 
   /**
-   * Converts a logical maintenance plan to a physical (enumerable) plan.
+   * Converts a logical maintenance plan to a fully physical (enumerable) plan.
    *
-   * <p>Uses HEP (bottom-up) rather than Volcano because the maintenance plan
-   * contains {@link org.apache.calcite.rel.stream.LogicalDelta} nodes, which
-   * have no convention trait and cannot participate in Volcano's
-   * convention-conversion framework.
-   *
-   * <p>Two HEP passes:
+   * <p>Three passes:
    * <ol>
-   *   <li>Pass 1: convert {@code LogicalPipelineOutputScan} nodes (which
-   *       represent child merged-index views used as inputs in outer-pipeline
-   *       maintenance plans) to {@link EnumerableMergedIndexScan} via
+   *   <li>Pass 1 (HEP): convert {@code LogicalPipelineOutputScan} nodes to
+   *       {@link EnumerableMergedIndexScan} via
    *       {@link EnumerableRules#PIPELINE_OUTPUT_SCAN_RULE}.
-   *       {@code LogicalTableScan} leaves inside {@code LogicalDelta} wrappers
-   *       are intentionally left as logical nodes — they represent the raw
-   *       change stream from a base table and have no per-source MI row type.
-   *   <li>Pass 2: fold {@code LogicalDelta(EnumerableMergedIndexScan)} →
+   *   <li>Pass 2 (HEP): fold {@code LogicalDelta(EnumerableMergedIndexScan)} →
    *       {@link EnumerableMergedIndexDeltaScan} via
    *       {@link EnumerableRules#ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE}.
-   *       This fires when a child pipeline output scan (converted in pass 1) is
-   *       wrapped in a {@code LogicalDelta}.
+   *   <li>Pass 3 (Volcano): convert remaining logical operators
+   *       (LogicalJoin, LogicalUnion, LogicalProject, LogicalFilter, etc.)
+   *       to their enumerable counterparts using standard
+   *       {@code ENUMERABLE_*} rules. A fresh {@link VolcanoPlanner} is used
+   *       so the already-enumerable leaf scans from passes 1–2 are accepted
+   *       as-is; only the non-enumerable nodes above them are converted.
    * </ol>
-   *
-   * <p>The result retains logical operators (LogicalJoin, LogicalUnion,
-   * LogicalDelta, LogicalTableScan etc.) for nodes that have no physical
-   * MI counterpart; only {@code LogicalPipelineOutputScan} and its delta
-   * wrappers are converted to physical MI operators.
    */
   private static RelNode convertToPhysicalMaintenancePlan(RelNode logicalPlan) {
     // Pass 1: convert LogicalPipelineOutputScan → EnumerableMergedIndexScan
@@ -1135,7 +1128,31 @@ class MergedIndexTpchPlanTest {
         .build();
     final HepPlanner hep2 = new HepPlanner(pass2);
     hep2.setRoot(afterPass1);
-    return hep2.findBestExp();
+    final RelNode afterPass2 = hep2.findBestExp();
+
+    // Pass 3: Volcano — convert remaining logical operators to enumerable.
+    // The maintenance plan nodes share their cluster with the Phase 1
+    // VolcanoPlanner (HEP reuses the same cluster). We extract that planner
+    // so Volcano's registerImpl check passes. RuleSetProgram.run() calls
+    // planner.clear() first, which is safe since Phase 1 planning is done.
+    final VolcanoPlanner volcano =
+        (VolcanoPlanner) afterPass2.getCluster().getPlanner();
+    final Program pass3 = Programs.of(RuleSets.ofList(
+        EnumerableRules.ENUMERABLE_JOIN_RULE,
+        EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
+        EnumerableRules.ENUMERABLE_UNION_RULE,
+        EnumerableRules.ENUMERABLE_PROJECT_RULE,
+        EnumerableRules.ENUMERABLE_FILTER_RULE,
+        EnumerableRules.ENUMERABLE_SORT_RULE,
+        EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
+        EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE,
+        EnumerableRules.ENUMERABLE_VALUES_RULE,
+        EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
+        CoreRules.SORT_REMOVE));
+    final RelTraitSet targetTraits =
+        afterPass2.getTraitSet().replace(EnumerableConvention.INSTANCE);
+    return pass3.run(volcano, afterPass2, targetTraits,
+        ImmutableList.of(), ImmutableList.of());
   }
 
   /**

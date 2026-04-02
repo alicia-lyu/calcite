@@ -13,7 +13,7 @@
 | `core/.../adapter/enumerable/EnumerableRules.java` (constant)           | Done    |
 | `core/.../adapter/enumerable/EnumerableMergedIndexDeltaScan.java` (NEW) | Done ✓ (per-source with sourceIndex+scanGroup) |
 | `core/.../adapter/enumerable/DeltaToMergedIndexDeltaScanRule.java` (NEW)| Done ✓ (updated to pass through sourceIndex/scanGroup) |
-| `core/.../adapter/enumerable/LogicalPipelineOutputScan.java` (NEW)      | Done ✓ |
+| `core/.../rel/logical/LogicalPipelineOutputScan.java` (NEW)             | Done ✓ |
 | `core/.../adapter/enumerable/LogicalTableScanToMergedIndexRule.java` (NEW) | Done ✓ |
 | `core/.../adapter/enumerable/PipelineOutputScanRule.java` (NEW)         | Done ✓ |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
@@ -189,19 +189,20 @@ Inner pipelines (index creation plans, 5 levels):
 - **Physical maintenance plan**: `convertToPhysicalMaintenancePlan()` runs two HEP passes.
   Both full-scan and delta branches use pipeline output type. Source subtrees identified
   by pipeline boundary sorts, not join inputs.
-  - **Only leaf scans are physical**: `EnumerableMergedIndexScan` and
-    `EnumerableMergedIndexDeltaScan` are the only enumerable nodes; all other operators
-    (LogicalJoin, LogicalUnion, LogicalProject, LogicalFilter) remain logical.
+  - **Fully physical**: all operators are enumerable after three-pass conversion.
+    `EnumerableMergedIndexScan` / `EnumerableMergedIndexDeltaScan` at the leaves;
+    `EnumerableMergeJoin`, `EnumerableUnion`, `EnumerableProject`, `EnumerableFilter`,
+    etc. above them.
   - **Shared scan group**: all leaf scans (full and delta) within one pipeline's
     maintenance plan share the same `MergedIndexScanGroup` — a single MI stores all
     sources of that pipeline interleaved by the shared sort key.
   - Example physical maintenance plan for a 2-source pipeline (MI over ORDERS+LINEITEM):
     ```
-    LogicalUnion
-    ├─ LogicalJoin
+    EnumerableUnion
+    ├─ EnumerableMergeJoin
     │  ├─ EnumerableMergedIndexScan(MI, ORDERS, group=G)
     │  └─ EnumerableMergedIndexDeltaScan(MI, LINEITEM, group=G)
-    └─ LogicalJoin
+    └─ EnumerableMergeJoin
        ├─ EnumerableMergedIndexDeltaScan(MI, ORDERS, group=G)
        └─ EnumerableMergedIndexScan(MI, LINEITEM, group=G)
     ```
@@ -232,7 +233,7 @@ All code below is stable and tested. Per-commit details omitted; see git log.
   non-leaf children were scoped, leaving leaf pipelines' `logicalRoot` exposed and
   potentially allowing delta propagation to cross pipeline boundaries.
 - **Physical maintenance plan conversion (2026-04-01)**: Converts logical maintenance
-  plans to physical (enumerable) plans with MI-aware leaf scans.
+  plans to fully physical (enumerable) plans.
   - `LogicalPipelineOutputScan` (new logical node): placeholder for child pipeline output.
     Carries `Pipeline` reference. Used in `scopeLogicalRoot` for ALL source pipelines
     (leaf and non-leaf) — replaces old `LogicalValues.createEmpty` approach.
@@ -240,47 +241,48 @@ All code below is stable and tested. Per-commit details omitted; see git log.
     `scanGroup` fields, matching `EnumerableMergedIndexScan` design.
   - Conversion rules: `PipelineOutputScanRule` (new), `DeltaToMergedIndexDeltaScanRule`
     (updated to pass through sourceIndex/scanGroup), `LogicalTableScanToMergedIndexRule` (new).
-  - `convertToPhysicalMaintenancePlan()`: two HEP passes — (1) `PipelineOutputScanRule`
-    converts placeholders to `EnumerableMergedIndexScan`, (2) `DeltaToMergedIndexDeltaScanRule`
-    folds `LogicalDelta(scan)` to `EnumerableMergedIndexDeltaScan`.
+  - `convertToPhysicalMaintenancePlan()`: three passes — (1) HEP: `PipelineOutputScanRule`
+    converts placeholders to `EnumerableMergedIndexScan`, (2) HEP: `DeltaToMergedIndexDeltaScanRule`
+    folds `LogicalDelta(scan)` to `EnumerableMergedIndexDeltaScan`, (3) Volcano: standard
+    `ENUMERABLE_*` rules convert remaining LogicalJoin, LogicalUnion, LogicalProject,
+    LogicalFilter to enumerable counterparts. Volcano reuses the Phase 1 planner extracted
+    from `afterPass2.getCluster().getPlanner()` — HEP nodes share the original cluster.
   - Key insight: MI stores output of each source pipeline. Both full-scan and delta
     branches use pipeline output type; difference is which rows flow, not the type.
   - Delta and full scans share the same `MergedIndexScanGroup` within a pipeline —
     all sources in one pipeline are interleaved in a single MI, so one group covers all.
-  - Only leaf scans converted to physical; remaining operators (LogicalJoin, LogicalUnion,
-    LogicalProject, LogicalFilter) stay logical.
-  - Applied to Q12, Q3-OL, Q9 in `MergedIndexTpchPlanTest`.
+  - Applied to Q12, Q3-OL, Q9 in `MergedIndexTpchPlanTest`. All operators fully enumerable.
 - **Documentation**: stable reference content migrated to `CLAUDE.md`; cost model
   Javadoc expanded on `EnumerableMergedIndexScan` and `MergedIndexScanGroup`.
 
 ## Next Steps
 
-### Short-term (next session) 
-
-(Use numbering.)
+### Short-term (next session)
 
 1. ~~**Logical → Physical maintenance plan conversion (leaf scans)**~~ — **Done** ✓
    Leaf scans converted to `EnumerableMergedIndexScan` / `EnumerableMergedIndexDeltaScan`
    via two HEP passes in `convertToPhysicalMaintenancePlan()`. Applied to Q12, Q3-OL, Q9.
-   Delta and full scans share the same `MergedIndexScanGroup`; all other operators remain logical.
 
-2. **Convert remaining logical operators to enumerable** — run a full Volcano pass with
-   standard `ENUMERABLE_*` rules on the maintenance plan so that LogicalJoin, LogicalUnion,
-   LogicalProject, LogicalFilter above the leaf scans become their enumerable counterparts.
-   Target: `convertToPhysicalMaintenancePlan()` in `MergedIndexTpchPlanTest` or production code.
+2. ~~**Convert remaining logical operators to enumerable**~~ — **Done** ✓
+   Pass 3 Volcano in `convertToPhysicalMaintenancePlan()` converts LogicalJoin, LogicalUnion,
+   LogicalProject, LogicalFilter to `EnumerableMergeJoin`, `EnumerableUnion`, etc.
+   Uses Phase 1 VolcanoPlanner extracted from `afterPass2.getCluster().getPlanner()`.
+   All 3 tests pass; physical maintenance plans are now fully enumerable.
+
+3. **Move `convertToPhysicalMaintenancePlan` to production code** — currently lives in
+   `MergedIndexTpchPlanTest`. Move to `MergedIndex.java` or a new
+   `MergedIndexPhysicalConverter.java` under `materialize/` or `adapter/enumerable/`.
+   Signature: `public static RelNode convertToPhysical(RelNode logicalPlan)`.
+   Requires threading the Phase 1 `VolcanoPlanner` reference through to that method.
 
 ### Medium-term
-
-(Do not use numbering.)
 
 - ~~Maintenance-time assembly operator design (how the executor uses the physical plan)~~ (obsolete along with [option B](./TRASH-option-b.md))
 - Additional TPC-H queries (Q5, Q7, Q10) for more operator combinations
 
 ### Long-term
 
-(Do not use numbering.)
-
-5. Window functions, DISTINCT, set operators in sort-based pipelines
-6. End-to-end execution prototype
-7. Functional dependency-based index matching
+- Window functions, DISTINCT, set operators in sort-based pipelines
+- End-to-end execution prototype
+- Functional dependency-based index matching
 - ~~PATH B: native merged index support (tables report collation via `getStatistic()`)~~ (Not necessary for story telling in research paper.)
