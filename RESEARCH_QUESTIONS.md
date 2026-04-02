@@ -18,6 +18,58 @@ The questions below sharpen this claim into derivable or measurable statements.
 
 ---
 
+## Formal Execution Model
+
+Formally, one row of pipeline output is identified by a tuple of source record IDs
+`(r_id, s_id, t_id, ...)` — one ID per participating source table. A row is **pending
+propagation** if any of its source IDs corresponds to a record that has not yet been
+joined and written into the output. The maintenance task is simply: find all pending rows,
+compute the cartesian product of each key range they belong to, and mark them propagated.
+
+At execution time, this reduces to a **single key-range scan**: once the set of delta
+keys (keys of records that changed in any source) is known, the maintenance plan is a
+scan of the merged index over exactly those keys. At each key, all records — both new
+delta records and existing co-located records — are buffered. When the key changes, the
+buffered records form the complete local cartesian product; the output rows are emitted
+and the pending flags cleared. No other structure needs to be read.
+
+### B-tree Execution
+
+With a B-tree merged index, delta keys are maintained in a local in-memory cache as
+updates arrive. Maintenance is triggered explicitly for the cached keys, scanning the
+B-tree over that range. The cache is cleared once propagation for each key completes.
+This is a clean, on-demand model: maintenance cost is proportional to the number of
+distinct delta keys, not to total index size.
+
+### LSM-tree Execution
+
+With an LSM-tree merged index, the unpropagated records naturally reside at the top
+level (MemTable) because they are the most recently written. At compaction time, the
+merge process inherently executes the maintenance plan: the upper level (new/delta
+records) is merged with the lower level (existing records), which is precisely the
+key-range buffering and cartesian product computation described above. Compaction IS
+the maintenance plan.
+
+This works cleanly in a **two-level LSM** (one MemTable, one SSTable): all
+unpropagated records are in the MemTable; compaction propagates them all at once.
+
+For **multi-level LSM**, a more granular propagation tag is needed per record:
+- `0` — fully propagated (merged with all levels)
+- `1` — unpropagated at level 1 (present in MemTable, not yet merged to L1)
+- `2` — unpropagated at level 2 (merged to L1 but not yet to L2)
+- and so on, one value per level
+
+The tag is set to `0` once the record has been compacted through the last base-table
+level. However, this becomes intricate in a **tiered LSM**, where at any level some
+SSTables are fully compacted and others are not, making it hard to assign a single
+propagation level to a record. **Leveled LSM** avoids this: each level is always
+fully compacted, so at compaction of level `i` it suffices to distinguish only two
+cases — whether a record originated from the upper SSTable (newer, may be
+unpropagated) or the lower SSTable (older, already propagated). No multi-bit tag is
+needed; the merge step itself provides the necessary distinction.
+
+---
+
 ## Q1: Per-Update I/O Profile
 
 **Question**: How many B-tree pages does one base-table insert/delete touch in a merged
