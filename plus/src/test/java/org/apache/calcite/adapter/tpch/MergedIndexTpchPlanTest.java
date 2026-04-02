@@ -21,12 +21,12 @@ import org.apache.calcite.adapter.enumerable.EnumerableMergeJoin;
 import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexDeltaScan;
 import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan;
 import org.apache.calcite.adapter.enumerable.EnumerableRules;
+import org.apache.calcite.materialize.MaintenancePlanConverter;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.MergedIndexRegistry;
 import org.apache.calcite.materialize.Pipeline;
 import org.apache.calcite.materialize.TaggedRowSchema;
 import org.apache.calcite.plan.ConventionTraitDef;
-import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.hep.HepPlanner;
@@ -45,7 +45,6 @@ import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.logical.LogicalPipelineOutputScan;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.stream.LogicalDelta;
-import org.apache.calcite.rel.stream.StreamRules;
 
 import com.google.common.collect.ImmutableList;
 import org.apache.calcite.schema.SchemaPlus;
@@ -108,16 +107,6 @@ import static org.hamcrest.Matchers.nullValue;
 @Execution(ExecutionMode.SAME_THREAD)
 class MergedIndexTpchPlanTest {
 
-  /** StreamRules for IVM delta derivation.
-   *  Excludes DeltaTableScanRule (requires StreamableTable) and
-   *  DeltaTableScanToEmptyRule (would convert delta leaves to empty Values). */
-  private static final ImmutableList<RelOptRule> IVM_RULES = ImmutableList.of(
-      StreamRules.DeltaProjectTransposeRule.DeltaProjectTransposeRuleConfig.DEFAULT.toRule(),
-      StreamRules.DeltaFilterTransposeRule.DeltaFilterTransposeRuleConfig.DEFAULT.toRule(),
-      StreamRules.DeltaAggregateTransposeRule.DeltaAggregateTransposeRuleConfig.DEFAULT.toRule(),
-      StreamRules.DeltaSortTransposeRule.DeltaSortTransposeRuleConfig.DEFAULT.toRule(),
-      StreamRules.DeltaUnionTransposeRule.DeltaUnionTransposeRuleConfig.DEFAULT.toRule(),
-      StreamRules.DeltaJoinTransposeRule.DeltaJoinTransposeRuleConfig.DEFAULT.toRule());
 
   @AfterEach
   void clearRegistry() {
@@ -230,7 +219,7 @@ class MergedIndexTpchPlanTest {
     // Set maintenance plans for all pipelines with captured logical roots
     for (Pipeline p : pipelines) {
       if (p != rootPipeline && p.logicalRoot != null) {
-        p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p));
+        p.mergedIndex.setMaintenancePlan(MaintenancePlanConverter.deriveMaintenancePlan(p));
       }
     }
 
@@ -288,7 +277,7 @@ class MergedIndexTpchPlanTest {
 
     // ── Convert logical maintenance plan to physical ────────
     System.out.println("=== Q12 PHYSICAL MAINTENANCE PLAN ===");
-    final RelNode physicalMaintQ12 = convertToPhysicalMaintenancePlan(
+    final RelNode physicalMaintQ12 = MaintenancePlanConverter.convertToPhysical(
         joinPipeline.mergedIndex.getMaintenancePlan());
     System.out.println(dumpText(physicalMaintQ12));
     writeDotFile("q12/physical-maintenance", physicalMaintQ12);
@@ -496,7 +485,7 @@ class MergedIndexTpchPlanTest {
     // Set maintenance plans for all pipelines with captured logical roots
     for (Pipeline p : pipelines) {
       if (p != rootPipeline && p.logicalRoot != null) {
-        p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p));
+        p.mergedIndex.setMaintenancePlan(MaintenancePlanConverter.deriveMaintenancePlan(p));
       }
     }
 
@@ -572,7 +561,7 @@ class MergedIndexTpchPlanTest {
           ? pipelines.get(i).mergedIndex.getMaintenancePlan() : null;
       if (mp != null) {
         System.out.println("--- Pipeline " + i + " physical maintenance ---");
-        final RelNode physicalMaint = convertToPhysicalMaintenancePlan(mp);
+        final RelNode physicalMaint = MaintenancePlanConverter.convertToPhysical(mp);
         System.out.println(dumpText(physicalMaint));
         writeDotFile("q3ol/physical-maintenance-" + i, physicalMaint);
       }
@@ -819,7 +808,7 @@ class MergedIndexTpchPlanTest {
     // Set maintenance plans for all pipelines with captured logical roots
     for (Pipeline p : pipelines) {
       if (p != rootPipeline && p.logicalRoot != null) {
-        p.mergedIndex.setMaintenancePlan(deriveMaintenancePlan(p));
+        p.mergedIndex.setMaintenancePlan(MaintenancePlanConverter.deriveMaintenancePlan(p));
       }
     }
 
@@ -890,7 +879,7 @@ class MergedIndexTpchPlanTest {
       final RelNode mp = joinPipelinesQ9.get(i).mergedIndex.getMaintenancePlan();
       if (mp != null) {
         System.out.println("--- Pipeline " + i + " physical maintenance ---");
-        final RelNode physicalMaint = convertToPhysicalMaintenancePlan(mp);
+        final RelNode physicalMaint = MaintenancePlanConverter.convertToPhysical(mp);
         System.out.println(dumpText(physicalMaint));
         writeDotFile("q9/physical-maintenance-" + i, physicalMaint);
       }
@@ -1039,194 +1028,6 @@ class MergedIndexTpchPlanTest {
     return result;
   }
 
-  /**
-   * Derives the IVM maintenance plan for a pipeline.
-   *
-   * <p>Creates a scoped copy of the pipeline's logical subtree where non-leaf
-   * child pipeline subtrees are replaced with {@link LogicalValues#createEmpty}
-   * placeholders. This ensures Delta only propagates through THIS pipeline's
-   * operators, not child pipeline operators. The original {@code p.logicalRoot}
-   * stays immutable — just as the physical pipeline uses {@code s.root} for
-   * each {@code p.sources} to define scope without modifying the physical tree.
-   *
-   * <p>Wraps the scoped subtree in {@link LogicalDelta} and applies
-   * {@link StreamRules} via HEP to push Delta down through all operators:
-   * <pre>
-   *   Delta(A &#x22CA; B)          &#x2192; (A &#x22CA; Delta(B)) &#x222A; (Delta(A) &#x22CA; B)
-   *   Delta(Project(X))      &#x2192; Project(Delta(X))
-   *   Delta(Aggregate(X))    &#x2192; Aggregate(Delta(X))
-   *   Delta(Filter(X))       &#x2192; Filter(Delta(X))
-   *   Delta(Sort(X))         &#x2192; Sort(Delta(X))
-   * </pre>
-   *
-   * <p>{@code LogicalDelta(TableScan)} at leaves represents the change stream.
-   * DeltaTableScanRule and DeltaTableScanToEmptyRule are excluded so that
-   * Delta markers remain on leaf scans for consumer use.
-   *
-   * <h3>DAG shape</h3>
-   *
-   * <p>The returned plan may be a DAG (not a tree): {@code DeltaJoinTransposeRule}
-   * reuses the same {@link RelNode} references in both union branches, so base
-   * table scans can have multiple parents. This is standard Calcite behavior and
-   * is correct — use {@code writeDotFileTree} for guaranteed tree-shaped DOT
-   * output (per-visit IDs; no identity dedup).
-   *
-   * <h3>Batch-delta semantics</h3>
-   *
-   * <p>The IVM join formula {@code &#x394;(A &#x22CA; B) = (&#x394;A &#x22CA; B) &#x222A; (A &#x22CA; &#x394;B)} is exact
-   * for single-tuple deltas (one insert at a time) but double-counts
-   * {@code &#x394;A &#x22CA; &#x394;B} for simultaneous batch deltas to both sides. Production
-   * systems resolve this via ordered application: process &#x394;A against old B first,
-   * then &#x394;B against new A (= A &#x222A; &#x394;A). This ordering is an execution-tier concern
-   * outside Calcite's plan-generation scope; the plan structure is correct
-   * regardless.
-   *
-   * @param pipeline the pipeline whose maintenance plan to derive
-   */
-  private static RelNode deriveMaintenancePlan(Pipeline pipeline) {
-    final RelNode scoped = scopeLogicalRoot(pipeline);
-    final LogicalDelta delta = LogicalDelta.create(scoped);
-    final HepProgram hepProgram = HepProgram.builder()
-        .addRuleCollection(IVM_RULES)
-        .build();
-    final HepPlanner hep = new HepPlanner(hepProgram);
-    hep.setRoot(delta);
-    return hep.findBestExp();
-  }
-
-  /**
-   * Converts a logical maintenance plan to a fully physical (enumerable) plan.
-   *
-   * <p>Three passes:
-   * <ol>
-   *   <li>Pass 1 (HEP): convert {@code LogicalPipelineOutputScan} nodes to
-   *       {@link EnumerableMergedIndexScan} via
-   *       {@link EnumerableRules#PIPELINE_OUTPUT_SCAN_RULE}.
-   *   <li>Pass 2 (HEP): fold {@code LogicalDelta(EnumerableMergedIndexScan)} →
-   *       {@link EnumerableMergedIndexDeltaScan} via
-   *       {@link EnumerableRules#ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE}.
-   *   <li>Pass 3 (Volcano): convert remaining logical operators
-   *       (LogicalJoin, LogicalUnion, LogicalProject, LogicalFilter, etc.)
-   *       to their enumerable counterparts using standard
-   *       {@code ENUMERABLE_*} rules. A fresh {@link VolcanoPlanner} is used
-   *       so the already-enumerable leaf scans from passes 1–2 are accepted
-   *       as-is; only the non-enumerable nodes above them are converted.
-   * </ol>
-   */
-  private static RelNode convertToPhysicalMaintenancePlan(RelNode logicalPlan) {
-    // Pass 1: convert LogicalPipelineOutputScan → EnumerableMergedIndexScan
-    final HepProgram pass1 = HepProgram.builder()
-        .addRuleInstance(EnumerableRules.PIPELINE_OUTPUT_SCAN_RULE)
-        .build();
-    final HepPlanner hep1 = new HepPlanner(pass1);
-    hep1.setRoot(logicalPlan);
-    final RelNode afterPass1 = hep1.findBestExp();
-
-    // Pass 2: fold LogicalDelta(EnumerableMergedIndexScan) → EnumerableMergedIndexDeltaScan
-    final HepProgram pass2 = HepProgram.builder()
-        .addRuleInstance(
-            EnumerableRules.ENUMERABLE_DELTA_TO_MERGED_INDEX_DELTA_SCAN_RULE)
-        .build();
-    final HepPlanner hep2 = new HepPlanner(pass2);
-    hep2.setRoot(afterPass1);
-    final RelNode afterPass2 = hep2.findBestExp();
-
-    // Pass 3: Volcano — convert remaining logical operators to enumerable.
-    // The maintenance plan nodes share their cluster with the Phase 1
-    // VolcanoPlanner (HEP reuses the same cluster). We extract that planner
-    // so Volcano's registerImpl check passes. RuleSetProgram.run() calls
-    // planner.clear() first, which is safe since Phase 1 planning is done.
-    final VolcanoPlanner volcano =
-        (VolcanoPlanner) afterPass2.getCluster().getPlanner();
-    final Program pass3 = Programs.of(RuleSets.ofList(
-        EnumerableRules.ENUMERABLE_JOIN_RULE,
-        EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
-        EnumerableRules.ENUMERABLE_UNION_RULE,
-        EnumerableRules.ENUMERABLE_PROJECT_RULE,
-        EnumerableRules.ENUMERABLE_FILTER_RULE,
-        EnumerableRules.ENUMERABLE_SORT_RULE,
-        EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
-        EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE,
-        EnumerableRules.ENUMERABLE_VALUES_RULE,
-        EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
-        CoreRules.SORT_REMOVE));
-    final RelTraitSet targetTraits =
-        afterPass2.getTraitSet().replace(EnumerableConvention.INSTANCE);
-    return pass3.run(volcano, afterPass2, targetTraits,
-        ImmutableList.of(), ImmutableList.of());
-  }
-
-  /**
-   * Creates a scoped copy of a pipeline's logicalRoot, replacing ALL source
-   * pipeline boundaries (both leaf table scans and non-leaf MI views) with
-   * {@link LogicalPipelineOutputScan} placeholders before delta push-down.
-   *
-   * <p>Every child pipeline boundary sort whose {@code .getInput()} identity-
-   * matches a child's logicalRoot is replaced with a
-   * {@link LogicalPipelineOutputScan} carrying the child pipeline. This ensures
-   * that delta propagation stays within the current pipeline's scope: it stops
-   * at all child pipeline boundaries, whether those boundaries are base-table
-   * scans (leaf pipelines) or inner merged-index views (non-leaf pipelines).
-   *
-   * <p>Identification: a child's logicalRoot was set from a boundary sort's
-   * input in {@link Pipeline#captureLogicalRoots}. This method finds boundary
-   * sorts whose {@code .getInput()} identity-matches any child's logicalRoot
-   * and replaces them with {@link LogicalPipelineOutputScan} placeholders.
-   *
-   * @param pipeline the pipeline to scope
-   * @return scoped copy (or original if no children have a logicalRoot)
-   */
-  private static RelNode scopeLogicalRoot(Pipeline pipeline) {
-    if (pipeline.logicalRoot == null) {
-      throw new IllegalArgumentException("Pipeline has no logicalRoot");
-    }
-    if (pipeline.sources.isEmpty()) {
-      return pipeline.logicalRoot; // leaf pipeline, no scoping needed
-    }
-
-    // Collect logicalRoots of all children (both leaf table scans and MI views)
-    final Map<RelNode, Pipeline> childLogicalRoots = new IdentityHashMap<>();
-    for (Pipeline child : pipeline.sources) {
-      if (child.logicalRoot != null) {
-        childLogicalRoots.put(child.logicalRoot, child);
-      }
-    }
-
-    if (childLogicalRoots.isEmpty()) {
-      return pipeline.logicalRoot; // no children with logicalRoot
-    }
-
-    return replaceChildBoundaries(pipeline.logicalRoot, childLogicalRoots);
-  }
-
-  /**
-   * Walks a RelNode tree and replaces boundary sorts whose input
-   * identity-matches a child logicalRoot with a
-   * {@link LogicalPipelineOutputScan} placeholder carrying the child pipeline.
-   */
-  private static RelNode replaceChildBoundaries(RelNode node,
-      Map<RelNode, Pipeline> childLogicalRoots) {
-    if (Pipeline.isLogicalBoundarySort(node)) {
-      final Sort sort = (Sort) node;
-      final Pipeline childPipeline = childLogicalRoots.get(sort.getInput());
-      if (childPipeline != null) {
-        return LogicalPipelineOutputScan.create(
-            sort.getCluster(), childPipeline, sort.getRowType());
-      }
-    }
-    // Recurse into inputs
-    final List<RelNode> oldInputs = node.getInputs();
-    final List<RelNode> newInputs = new ArrayList<>(oldInputs.size());
-    boolean changed = false;
-    for (RelNode input : oldInputs) {
-      final RelNode newInput = replaceChildBoundaries(input, childLogicalRoots);
-      newInputs.add(newInput);
-      if (newInput != input) {
-        changed = true;
-      }
-    }
-    return changed ? node.copy(node.getTraitSet(), newInputs) : node;
-  }
 
   /** Prints maintenance plans for all pipelines to stdout. */
   private static void printMaintenancePlans(String label, List<Pipeline> pipelines) {
