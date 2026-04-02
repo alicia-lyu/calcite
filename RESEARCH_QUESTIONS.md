@@ -44,8 +44,7 @@ distinct delta keys, not to total index size.
 Crucially, the cache does not multiply by the equi-join fanout. It stores one entry per
 changed source record, so its size is `|δR| + |δS| + |δT| + ...` — a sum, not a product.
 The cache grows only with the number of ultimate sources (those that cross pipeline
-boundaries, i.e., base tables or materialized pipeline outputs) and the volume of their
-changes, not with the number of joins or the size of the output they produce.
+boundaries; they should all be base tables) and the volume of their changes, not with the number of joins or the size of the output they produce.
 
 ### LSM-tree Execution
 
@@ -60,16 +59,21 @@ This works cleanly in a **two-level LSM** (one MemTable, one SSTable): all
 unpropagated records are in the MemTable; compaction propagates them all at once.
 
 For **multi-level LSM**, a more granular propagation tag is needed per record:
+
 - `0` — fully propagated (merged with all levels)
 - `1` — unpropagated at level 1 (present in MemTable, not yet merged to L1)
 - `2` — unpropagated at level 2 (merged to L1 but not yet to L2)
 - and so on, one value per level
 
 The tag is set to `0` once the record has been compacted through the last base-table
-level. However, this becomes intricate in a **tiered LSM**, where at any level some
+level. 
+
+Note that this becomes intricate in a **tiered LSM**, where at any level some
 SSTables are fully compacted and others are not, making it hard to assign a single
 propagation level to a record. **Leveled LSM** avoids this: each level is always
-fully compacted, so at compaction of level `i` it suffices to distinguish only two
+fully compacted---
+
+At compaction of level `i`, it suffices to distinguish only two
 cases — whether a record originated from the upper SSTable (newer, may be
 unpropagated) or the lower SSTable (older, already propagated). No multi-bit tag is
 needed; the merge step itself provides the necessary distinction.
