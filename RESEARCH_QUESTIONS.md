@@ -63,28 +63,26 @@ records) is merged with the lower level (existing records), which is precisely t
 key-range buffering and cartesian product computation described above. Compaction IS
 the maintenance plan.
 
-This works cleanly in a **two-level LSM** (one MemTable, one SSTable): all
-unpropagated records are in the MemTable; compaction propagates them all at once. In this level, we may not need propagation tag at all, since all records in the MemTable are unpropagated (with tag 1), all records in the SSTable are propagated (with tag 0).
+This works cleanly in a **two-level LSM** (one MemTable, one SSTable): level
+membership itself encodes propagation status — MemTable records are by definition
+unpropagated; SSTable records are fully propagated. No explicit tag is needed.
 
-For **multi-level LSM**, a more granular propagation tag is needed per record:
+In a **multi-level leveled LSM** (e.g., L0, L1, L2, ...), level membership alone is
+no longer sufficient. After an L0→L1 compaction, L1 contains a mix of newly arrived
+records (propagated into L1 but not yet into L2) and pre-existing records (already
+propagated into L2). These are interleaved; without a tag, the next L1→L2 compaction
+cannot tell which records require maintenance. A **single propagation bit** per record
+suffices: set to `1` when a record enters a level from above, cleared to `0` after it
+has been compacted into the level below. We cannot avoid this bit, since partially
+propagated records mingle with fully propagated ones after the first compaction.
 
-- `0` — fully propagated (merged with all levels)
-- `1` — unpropagated at level 1 (present in MemTable, not yet merged to L1)
-- `2` — unpropagated at level 2 (merged to L1 but not yet to L2)
-- and so on, one value per level
-
-The tag is set to `0` once the record has been compacted through the last base-table
-level. 
-
-Note that this becomes intricate in a **tiered LSM**, where at any level some
-SSTables are fully compacted and others are not, making it hard to assign a single
-propagation level to a record. **Leveled LSM** avoids this: each level is always
-fully compacted---
-
-At compaction of level `i`, it suffices to distinguish only two
-cases — whether a record originated from the upper SSTable (newer, may be
-unpropagated) or the lower SSTable (older, already propagated). No multi-byte tag is
-needed; the merge step itself provides the necessary distinction. We cannot avoid the tag in this case, since partially propagated changes mingle with propagated changes after the first compaction.
+**Tiered LSM** is more intricate. Within a level, multiple SSTables of different ages
+coexist — some recently written (unpropagated), others older (already propagated at
+that level). A single bit is insufficient; a full **propagation level number** is
+needed, recording how many levels below the MemTable a record's maintenance has
+reached. This tag must be correctly updated when SSTables are merged within a tier —
+a considerably more complex bookkeeping requirement. Leveled LSM's invariant of full
+compaction per level avoids this, at the cost of higher write amplification.
 
 ### Compaction-as-Maintenance vs. On-Demand Scan
 
@@ -95,7 +93,7 @@ advantages are:
 
 **Amortized I/O.** On-demand scanning pays a random seek per delta key, even if many
 updates arrive in quick succession. Compaction folds all pending deltas accumulated in
-the MemTable into a single sequential pass over the affected key range. Propagation incurs cost negligibly more than normal compaction.
+the MemTable into a single sequential pass over the affected key range. Propagation incurs negligibly more cost than normal compaction.
 
 **No separate maintenance operation.** In the on-demand model, maintenance is an
 explicit step that must be triggered, tracked, and coordinated with writes. In the
@@ -106,10 +104,6 @@ anyway.
 accumulate in the MemTable. When compaction fires, all of them are processed in one
 ordered sequential scan — optimal I/O for the storage medium. On-demand scanning has no
 such batching unless explicitly implemented.
-
-**Bounded maintenance lag.** The compaction schedule determines when propagation
-happens. This makes maintenance latency predictable and tunable via compaction
-policy, rather than tied to individual update latency.
 
 The trade-off is **freshness**: the compaction model propagates in batches, so the
 merged index at any point may contain unpropagated records from the last compaction
