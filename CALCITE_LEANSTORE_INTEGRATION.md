@@ -85,9 +85,18 @@ Table (base)
 
 ### Key Challenge: Compile-Time vs Runtime
 LeanStore's merged index is **compile-time parameterized**: `PremergedJoin<Nation, Supplier, Orders, Lineitem>` is a distinct C++ type from `PremergedJoin<Orders, Lineitem>`. Calcite generates plans at **runtime**. The bridge must either:
-- (A) Pre-compile all possible template instantiations (combinatorial explosion)
+- (A) Pre-compile the optimizer-chosen template instantiations (not a combinatorial explosion — bounded by the number of pipeline configurations Calcite actually produces)
 - (B) Use a runtime-dispatched C++ execution engine that avoids templates
 - (C) Generate C++ source from the plan and compile on-the-fly (slow startup)
+
+Option (A) is feasible because the set of instantiations is determined by running Calcite over the query workload first, then compiling exactly those configurations. This is Approach A in the architecture below.
+
+### Template Classification
+LeanStore templates fall into exactly **two categories** relevant to the integration:
+
+**Category 1 — Query-plan-dependent (must pre-instantiate):** Templates whose type parameters are record schemas determined by the query plan. Includes `LeanStoreMergedAdapter<Records...>`, `LeanStoreMergedScanner<JK, JR, Records...>`, `PremergedJoin<...>`, `JoinState<...>`, `BinaryMergeJoin<...>`, `Heap<...>`. Pre-enumerating these classes automatically compiles all their member function templates (e.g., `insert<Record>()`, `seek<RecordType>()`, `get_next_all<Is...>()`) as part of the same instantiation — no separate enumeration needed for member templates or index-sequence metaprogramming helpers.
+
+**Category 2 — Plan-independent (stay as templates):** Generic utilities whose logic does not vary by record schema: `overloaded<Ts...>`, `for_each`, `toType<Records...>`, `key_traits<K>`, `MatchKeyEqual<SK>`, `struct_from_bytes<T>`. These are called at runtime with concrete types from Category 1 instances and require no additional enumeration.
 
 ## 5. Recommended Integration Architecture
 
@@ -136,9 +145,9 @@ LeanStore's merged index is **compile-time parameterized**: `PremergedJoin<Natio
 - **Incremental** — start with a few operators, add more as needed
 
 ### Template Pre-instantiation Strategy
-For TPC-H, the number of distinct merged index configurations is bounded by the number of pipelines the optimizer discovers. For Q9 (6 tables, 5 pipelines), there are 5 merged indexes. Pre-instantiate `PremergedJoin` and `LeanStoreMergedAdapter` for each. A registry maps plan-level MI IDs to pre-compiled C++ instances.
+Run Calcite over the target query workload first to collect the full set of pipeline configurations (each `MergedIndex` descriptor names its record types and key). Then generate a C++ registration file that instantiates exactly those `LeanStoreMergedAdapter<Rs...>` and `PremergedJoin<Rs...>` types and enters them into a runtime registry keyed by MI ID. All member templates and internal metaprogramming helpers are compiled automatically as part of these class instantiations.
 
-For JOB (113 queries, ~26 tables), the number of distinct join patterns is larger but still finite. A code generator can produce the instantiations from the set of plans Calcite generates.
+For TPC-H: Q9 produces 5 merged indexes → 5 instantiations. For JOB (113 queries, ~26 tables), the number of distinct pipeline configurations is larger but still a small fraction of all possible subsets, because Calcite's cost-based planner selects a bounded set of join orders. A code generator (Calcite → C++ header) automates this step.
 
 ## 6. Major Milestones
 
@@ -213,7 +222,7 @@ For JOB (113 queries, ~26 tables), the number of distinct join patterns is large
 ### Risks
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| Template explosion for JOB | Medium | Code generator for instantiations; limit to optimizer-chosen configurations |
+| Template count for JOB | Low | Not combinatorial — bounded by optimizer-chosen configurations; code generator automates instantiation from Calcite plan output |
 | Predicate/expression evaluation in C++ | Medium | Start with simple predicates (=, <, >, LIKE); extend as needed |
 | Type mapping edge cases (VARCHAR, DECIMAL) | Low | TPC-H/JOB use standard types; map Calcite SQL types to LeanStore Types.hpp |
 | Performance of JSON plan parsing | Low | One-time cost per query; negligible vs execution time |
