@@ -44,7 +44,15 @@ distinct delta keys, not to total index size.
 Crucially, the cache does not multiply by the equi-join fanout. It stores one entry per
 changed source record, so its size is `|δR| + |δS| + |δT| + ...` — a sum, not a product.
 The cache grows only with the number of ultimate sources (those that cross pipeline
-boundaries; they should all be base tables) and the volume of their changes, not with the number of joins or the size of the output they produce.
+boundaries; they should all be base tables) and the volume of their changes, not with
+the number of joins or the size of the output they produce.
+
+The distinction matters for nested pipelines. When an parent merged index stores the
+output of a child pipeline — which may itself be a join result — the records at each
+key in the parent index represent joined tuples, not raw base records. Scanning the parent
+index over a delta key range therefore reads a volume proportional to the child
+pipeline's output at that key, not just the raw source records. Join multiplicity enters
+through scan volume, not cache size.
 
 ### LSM-tree Execution
 
