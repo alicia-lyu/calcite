@@ -41,6 +41,12 @@ B-tree over that range. The cache is cleared once propagation for each key compl
 This is a clean, on-demand model: maintenance cost is proportional to the number of
 distinct delta keys, not to total index size.
 
+Crucially, the cache does not multiply by the equi-join fanout. It stores one entry per
+changed source record, so its size is `|δR| + |δS| + |δT| + ...` — a sum, not a product.
+The cache grows only with the number of ultimate sources (those that cross pipeline
+boundaries, i.e., base tables or materialized pipeline outputs) and the volume of their
+changes, not with the number of joins or the size of the output they produce.
+
 ### LSM-tree Execution
 
 With an LSM-tree merged index, the unpropagated records naturally reside at the top
