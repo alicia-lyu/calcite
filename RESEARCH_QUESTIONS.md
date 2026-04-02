@@ -91,6 +91,8 @@ storage: cache the delta keys in memory and scan the key ranges on demand, exact
 with a B-tree. The compaction-based model is an LSM-native alternative. Its preliminary
 advantages are:
 
+**No separate update copy.** The local cache of delta keys represents an additional copy of updates, despite that it does not grow with join multiplicity & keys only are sufficient.
+
 **Amortized I/O.** On-demand scanning pays a random seek per delta key, even if many
 updates arrive in quick succession. Compaction folds all pending deltas accumulated in
 the MemTable into a single sequential pass over the affected key range. Propagation incurs negligibly more cost than normal compaction.
@@ -107,8 +109,7 @@ such batching unless explicitly implemented.
 
 The trade-off is **freshness**: the compaction model propagates in batches, so the
 merged index at any point may contain unpropagated records from the last compaction
-interval. The on-demand model propagates immediately. Which matters depends on whether
-the workload requires read-your-own-writes consistency on the merged index output.
+interval. The on-demand model propagates immediately or per policy, giving the system more control.
 
 ---
 
