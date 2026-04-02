@@ -17,6 +17,7 @@
 | `core/.../adapter/enumerable/LogicalTableScanToMergedIndexRule.java` (NEW) | Done ✓ |
 | `core/.../adapter/enumerable/PipelineOutputScanRule.java` (NEW)         | Done ✓ |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
+| `core/.../materialize/MaintenancePlanConverter.java` (NEW)              | Done ✓  |
 | TPC-H Q3 (deleted — incorrect CUSTOMER+ORDERS example)                  | Removed |
 | TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓  |
 | TPC-H Q3-OL full 3-table substitution — `tpchQ3OrdersLineitem()`        | Done ✓  |
@@ -254,6 +255,10 @@ All code below is stable and tested. Per-commit details omitted; see git log.
   - Applied to Q12, Q3-OL, Q9 in `MergedIndexTpchPlanTest`. All operators fully enumerable.
 - **Documentation**: stable reference content migrated to `CLAUDE.md`; cost model
   Javadoc expanded on `EnumerableMergedIndexScan` and `MergedIndexScanGroup`.
+- **MaintenancePlanConverter** (2026-04-02): extracted `deriveMaintenancePlan`, `scopeLogicalRoot`,
+  `replaceChildBoundaries`, `convertToPhysical`, and `IVM_RULES` from test to
+  `core/src/main/java/org/apache/calcite/materialize/MaintenancePlanConverter.java`. Pure code
+  motion, no logic changes.
 
 ## Next Steps
 
@@ -269,11 +274,9 @@ All code below is stable and tested. Per-commit details omitted; see git log.
    Uses Phase 1 VolcanoPlanner extracted from `afterPass2.getCluster().getPlanner()`.
    All 3 tests pass; physical maintenance plans are now fully enumerable.
 
-3. **Move `convertToPhysicalMaintenancePlan` to production code** — currently lives in
-   `MergedIndexTpchPlanTest`. Move to `MergedIndex.java` or a new
-   `MergedIndexPhysicalConverter.java` under `materialize/` or `adapter/enumerable/`.
-   Signature: `public static RelNode convertToPhysical(RelNode logicalPlan)`.
-   Requires threading the Phase 1 `VolcanoPlanner` reference through to that method.
+3. ~~**Move `convertToPhysicalMaintenancePlan` to production code**~~ — **Done** ✓
+   Extracted to `core/materialize/MaintenancePlanConverter.java`. Contains `deriveMaintenancePlan`,
+   `scopeLogicalRoot`, `replaceChildBoundaries`, `convertToPhysical`, and `IVM_RULES`.
 
 ### Medium-term
 
