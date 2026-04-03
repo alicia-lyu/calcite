@@ -20,6 +20,7 @@ import org.apache.calcite.adapter.enumerable.EnumerableConvention;
 import org.apache.calcite.adapter.enumerable.EnumerableMergeJoin;
 import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexDeltaScan;
 import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan;
+import org.apache.calcite.adapter.enumerable.EnumerableProject;
 import org.apache.calcite.adapter.enumerable.EnumerableRules;
 import org.apache.calcite.materialize.MaintenancePlanConverter;
 import org.apache.calcite.materialize.MergedIndex;
@@ -1250,8 +1251,9 @@ class MergedIndexTpchPlanTest {
         + "];\n");
     final List<RelNode> inputs = node.getInputs();
     for (int i = 0; i < inputs.size(); i++) {
+      final RelNode child = skipTransparent(inputs.get(i));
       final int childId = collectNodesAndEdges(
-          inputs.get(i), ids, counter, nodeDefs, edgeDefs);
+          child, ids, counter, nodeDefs, edgeDefs);
       final String edgeLabel = inputs.size() > 1 ? (i == 0 ? "left" : "right") : "";
       final StringBuilder edge = new StringBuilder();
       edge.append("  n").append(childId).append(" -> n").append(id);
@@ -1262,6 +1264,19 @@ class MergedIndexTpchPlanTest {
       edgeDefs.add(edge.toString());
     }
     return id;
+  }
+
+  /**
+   * Drills through {@link EnumerableProject} nodes, returning the first
+   * non-Project input. Projects are "transparent" in the DOT visualization —
+   * they add no information about pipeline structure and are omitted to reduce
+   * visual clutter.
+   */
+  private static RelNode skipTransparent(RelNode node) {
+    while (node instanceof EnumerableProject) {
+      node = ((EnumerableProject) node).getInput();
+    }
+    return node;
   }
 
   /**
@@ -1551,7 +1566,8 @@ class MergedIndexTpchPlanTest {
         .append("];\n");
     final List<RelNode> inputs = node.getInputs();
     for (int i = 0; i < inputs.size(); i++) {
-      final int childId = dumpDotColorTreeNode(inputs.get(i), sb, counter);
+      final RelNode child = skipTransparent(inputs.get(i));
+      final int childId = dumpDotColorTreeNode(child, sb, counter);
       final String edgeLabel = inputs.size() > 1 ? (i == 0 ? "left" : "right") : "";
       sb.append("  n").append(childId).append(" -> n").append(id);
       if (!edgeLabel.isEmpty()) {
