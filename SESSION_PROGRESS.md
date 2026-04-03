@@ -236,9 +236,26 @@ full design. Key production classes:
 
 ### Short-term (next session)
 
-- **Additional TPC-H queries** (Q5, Q7, Q10): add to `MergedIndexTpchPlanTest`. Each
-  exercises different operator combinations (multi-way join, date range filter,
-  aggregation variants). Goal: confirm pipeline discovery generalizes beyond Q9.
+1. **Treat `LimitSort` as pipeline boundary**: Currently only `EnumerableSort` is
+   recognized as a pipeline boundary. `EnumerableLimitSort` (ORDER BY + LIMIT) should
+   also split pipelines — it imposes a sort order that a merged index can satisfy.
+   Affects `Pipeline.buildTree()` and `PipelineToMergedIndexScanRule`.
+
+2. **Omit projections in colored DOT output**: `EnumerableProject` nodes add visual
+   clutter without conveying pipeline structure. Amend the DOT generation method to
+   skip projection operators, connecting their inputs directly to their parents.
+
+3. **Hoist variable-predicate filters to root query plan**: Filters with variable
+   predicates (e.g., `l_shipdate < ?`, `c_mktsegment = 'BUILDING'`) should NOT be
+   absorbed into merged indexes — doing so makes the index unusable for other queries
+   with different predicate values. Move such filters above the pipeline boundary so
+   they appear only in the root query plan. Ensure the columns needed for predicate
+   evaluation are projected through (add projection operators if the pipeline output
+   would otherwise drop them).
+
+4. **Additional TPC-H queries** (Q5, Q7, Q10): add to `MergedIndexTpchPlanTest`. Each
+   exercises different operator combinations (multi-way join, date range filter,
+   aggregation variants). Goal: confirm pipeline discovery generalizes beyond Q9.
 
 ### Medium-term
 
