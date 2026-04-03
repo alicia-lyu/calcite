@@ -151,6 +151,24 @@ For TPC-H: Q9 produces 5 merged indexes → 5 instantiations. For JOB (113 queri
 
 ## 6. Major Milestones
 
+Milestones 1–2 (the Calcite→JSON serialization pipeline) and milestones 3–5 (C++
+execution operators) can proceed **in parallel**. For milestones 3–5, the plan for
+Q12 and Q3-OL is hard-coded directly in C++ as the initial test harness — no JSON
+parser is needed yet. The serialization layer (milestones 1–2) is developed
+concurrently and wired in once ready, replacing the hard-coded plans.
+
+```
+Week 1–2   ┌─ M1: Plan serialization (Calcite → JSON) ──────────────────┐
+           │                                                              │
+           └─ M3: MergedIndexScan operator (hard-coded Q12 plan)         │
+Week 2–3      M4: PremergedJoin integration (hard-coded Q3-OL plan)      │
+Week 3–4      M5: Non-leaf operators (Filter, Aggregate, Project)        │
+           ┌──────────────────────────────────────────────────────────   │
+Week 3–4   │  M2: C++ plan parser (JSON → PlanNode*)                  ←──┘
+           └──────────────────────────────────────────────────────────
+Week 4–5      M6: Wire together: JSON plan drives Q12 and Q3-OL execution
+```
+
 ### Milestone 1: Plan Serialization (Calcite side)
 **Goal**: Export optimized plan (after MI substitution) as JSON.
 - Serialize `RelNode` tree to JSON, including:
@@ -160,7 +178,8 @@ For TPC-H: Q9 produces 5 merged indexes → 5 instantiations. For JOB (113 queri
   - Aggregate functions and group keys
   - Projection expressions
 - Use Calcite's existing `RelJsonWriter` / `RelJson` infrastructure as starting point
-- **Output**: `calcite-plan.json` for each query
+- **Output**: `calcite-plan.json` for Q12 and Q3-OL
+- *Parallel with M3–M5*
 
 ### Milestone 2: C++ Plan Parser
 **Goal**: Read JSON plan in C++, build an operator tree.
@@ -168,35 +187,39 @@ For TPC-H: Q9 produces 5 merged indexes → 5 instantiations. For JOB (113 queri
 - Parse JSON (e.g., nlohmann/json or rapidjson)
 - Build operator tree from bottom up
 - **Output**: `PlanNode*` tree ready for execution
+- *Depends on M1 schema being stable; can start once M1 output format is sketched*
 
-### Milestone 3: Leaf Operator — MergedIndexScan
-**Goal**: Connect plan's `MergedIndexScan` node to `LeanStoreMergedScanner`.
-- Registry: map MI ID → `LeanStoreMergedAdapter<Rs...>` instance
+### Milestone 3: Leaf Operator — MergedIndexScan (hard-coded Q12)
+**Goal**: Connect a manually written plan for Q12 to `LeanStoreMergedScanner`.
+- Hard-code the Q12 plan in C++: one `MergedIndexScan` over ORDERS+LINEITEM MI
+- Registry: map MI ID → `LeanStoreMergedAdapter<Orders, Lineitem>` instance
 - Scanner creation: `adapter.getScanner<JK, JR>()`
-- Type conversion: plan's SQL types ↔ LeanStore's fold/unfold types
-- **Output**: leaf scans return rows from merged B-tree
+- Type conversion: row output as `Object[]`-equivalent C++ struct
+- **Output**: Q12 leaf scan returns rows from merged B-tree
+- *Parallel with M1*
 
-### Milestone 4: Join Assembly — PremergedJoin Integration
-**Goal**: Connect plan's absorbed join pipelines to `PremergedJoin`.
-- When plan has `MergedIndexScan` replacing an entire pipeline (sort + join + agg), dispatch to `PremergedJoin` with the right template parameters
-- Map plan's source list to `PremergedJoin<Records...>` instantiation
-- **Output**: multi-table join assembly from single merged index scan
+### Milestone 4: Join Assembly — PremergedJoin Integration (hard-coded Q3-OL)
+**Goal**: Extend hard-coded plan to Q3-OL's two-level nested MI structure.
+- Hard-code the Q3-OL plan: inner `PremergedJoin<Orders, Lineitem>` feeding outer join with CUSTOMER
+- Dispatch to pre-instantiated `PremergedJoin<...>` via MI registry
+- **Output**: Q3-OL join assembly produces correct rows from single merged index scan
+- *Parallel with M1; depends on M3*
 
 ### Milestone 5: Non-Leaf Operators (Filter, Aggregate, Project)
 **Goal**: Implement runtime operators for plan nodes not absorbed by MI.
-- **Filter**: runtime predicate evaluator (comparison, LIKE, arithmetic)
-- **SortedAggregate**: streaming aggregation on pre-sorted input (SUM, COUNT, AVG, etc.)
+- **Filter**: runtime predicate evaluator (comparison, LIKE, arithmetic) — needed for Q12's date range filter
+- **SortedAggregate**: streaming aggregation on pre-sorted input (SUM, COUNT, AVG) — needed for Q12's revenue grouping
 - **Project**: field selection and expression evaluation
-- **Sort**: should be rare (MI eliminates most sorts), but needed as fallback
-- **Output**: full operator pipeline execution
+- **Sort**: fallback only; MI eliminates most sorts
+- **Output**: Q12 and Q3-OL return correct final results
+- *Parallel with M1; depends on M3–M4*
 
-### Milestone 6: End-to-End TPC-H Validation
-**Goal**: Run TPC-H queries end-to-end: SQL → Calcite → JSON plan → C++ interpreter → LeanStore → results.
-- Start with Q12 (simplest: 2-table, 1 MI)
-- Then Q3-OL (3-table, 2 nested MIs)
-- Then Q9 (6-table, 5 nested MIs)
-- Validate result correctness against reference TPC-H answers
-- **Output**: working end-to-end pipeline for select TPC-H queries
+### Milestone 6: End-to-End Integration — Wire JSON Plans to Execution
+**Goal**: Replace hard-coded Q12 and Q3-OL plans with JSON-driven execution.
+- JSON plan from M1 drives the C++ operator tree from M2
+- Validate results match hard-coded baseline from M3–M5
+- **Output**: SQL → Calcite → JSON → C++ interpreter → LeanStore → correct results for Q12 and Q3-OL
+- *Depends on M1 + M2 + M5*
 
 ### Milestone 7: JOB Integration
 **Goal**: Extend to Join Order Benchmark queries.
