@@ -230,6 +230,16 @@ full design. Key production classes:
   cache, LSM compaction-as-maintenance, propagation tags), 6 analytically tractable
   efficiency questions (Q1–Q3 tractable from existing plans).
 
+### 2026-04-04
+
+- **DOT cleanup**: `skipTransparent()` omits `EnumerableProject` from colored DOT output.
+  Pure visualization change, all tests pass.
+- **LimitSort as pipeline boundary**: `Pipeline.isBoundarySort()` now accepts
+  `EnumerableLimitSort` (Sort with FETCH/OFFSET). `PipelineToMergedIndexScanRule` operand
+  widened to `Sort.class`; `onMatch` preserves LIMIT by wrapping MIScan in
+  `EnumerableLimitSort`. Q3-OL plan now shows `EnumerableLimitSort(fetch=[10])` over
+  assembled join — physical sort eliminated, LIMIT preserved.
+
 ---
 
 ## Next Steps
