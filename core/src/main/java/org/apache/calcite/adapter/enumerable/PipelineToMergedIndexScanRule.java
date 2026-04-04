@@ -19,12 +19,14 @@ package org.apache.calcite.adapter.enumerable;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.MergedIndexRegistry;
 import org.apache.calcite.materialize.MergedIndexScanGroup;
+import org.apache.calcite.materialize.Pipeline;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelRule;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepRelVertex;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.rules.TransformationRule;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
@@ -33,9 +35,15 @@ import org.immutables.value.Value;
 import java.util.Optional;
 
 /**
- * Planner rule that replaces an {@link EnumerableSort} boundary node with a
+ * Planner rule that replaces an enumerable Sort boundary node with a
  * per-source {@link EnumerableMergedIndexScan} when a matching
  * {@link MergedIndex} is registered in {@link MergedIndexRegistry}.
+ *
+ * <p>Matches both {@link EnumerableSort} (pure ordering) and
+ * {@link EnumerableLimitSort} (ORDER BY … LIMIT). For LimitSort, the
+ * replacement wraps the scan in a new {@link EnumerableLimitSort} to
+ * preserve the FETCH/OFFSET row-count constraint while eliminating the
+ * physical sort (the merged index is pre-sorted).
  *
  * <p>Under the "Transparent Per-Source MI Scans" architecture, each boundary
  * Sort in a pipeline is replaced <b>independently</b> by a per-source MI scan
@@ -76,17 +84,8 @@ public class PipelineToMergedIndexScanRule
         : node;
   }
 
-  /**
-   * Returns {@code true} if the Sort is a pipeline boundary: non-empty
-   * collation and no FETCH/OFFSET (LimitSort is not a boundary).
-   */
-  private static boolean isBoundarySort(EnumerableSort sort) {
-    return sort.fetch == null && sort.offset == null
-        && !sort.getCollation().getFieldCollations().isEmpty();
-  }
-
   @Override public void onMatch(RelOptRuleCall call) {
-    final EnumerableSort sort = call.rel(0);
+    final Sort sort = call.rel(0);
     final RelCollation collation = sort.getCollation();
     final RelNode sortInput = unwrap(sort.getInput());
 
@@ -108,8 +107,18 @@ public class PipelineToMergedIndexScanRule
       scanGroup = new MergedIndexScanGroup(mi);
     }
 
-    call.transformTo(EnumerableMergedIndexScan.create(
-        sort.getCluster(), mi, match.sourceIndex, scanGroup));
+    final EnumerableMergedIndexScan miScan =
+        EnumerableMergedIndexScan.create(sort.getCluster(), mi, match.sourceIndex, scanGroup);
+
+    // If the matched Sort carried FETCH/OFFSET (EnumerableLimitSort), preserve
+    // the row-count constraint by wrapping the scan. The physical sort is
+    // eliminated because the merged index is pre-sorted.
+    if (sort.fetch != null || sort.offset != null) {
+      call.transformTo(EnumerableLimitSort.create(
+          miScan, sort.getCollation(), sort.offset, sort.fetch));
+    } else {
+      call.transformTo(miScan);
+    }
   }
 
   /**
@@ -151,8 +160,8 @@ public class PipelineToMergedIndexScanRule
     Config DEFAULT =
         ImmutablePipelineToMergedIndexScanRule.Config.of()
             .withOperandSupplier(b0 ->
-                b0.operand(EnumerableSort.class)
-                    .predicate(PipelineToMergedIndexScanRule::isBoundarySort)
+                b0.operand(Sort.class)
+                    .predicate(Pipeline::isBoundarySort)
                     .anyInputs());
 
     @Override default PipelineToMergedIndexScanRule toRule() {

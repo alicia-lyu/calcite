@@ -16,6 +16,7 @@
  */
 package org.apache.calcite.materialize;
 
+import org.apache.calcite.adapter.enumerable.EnumerableConvention;
 import org.apache.calcite.adapter.enumerable.EnumerableSort;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelCollationTraitDef;
@@ -110,21 +111,24 @@ public class Pipeline {
   /**
    * Returns {@code true} if {@code node} is a pipeline-separating Sort boundary.
    *
-   * <p>A boundary Sort must have a non-empty collation and no FETCH/OFFSET.
-   * {@code EnumerableLimitSort} (Sort with FETCH or OFFSET) is explicitly
-   * excluded because it carries row-count semantics, not just ordering.
+   * <p>A boundary Sort must be an enumerable-convention {@link Sort} subclass
+   * (either {@code EnumerableSort} or {@code EnumerableLimitSort}) with a
+   * non-empty collation.
    *
-   * <p><b>Future work:</b> {@code EnumerableLimitSort} could be treated as a
-   * pipeline boundary when its sort key matches the pipeline's shared collation.
-   * This would allow ORDER BY … LIMIT queries to fully collapse into a single
-   * indexed-view scan. Excluded for now to keep pipeline semantics clean.
+   * <p>{@code EnumerableLimitSort} (ORDER BY … LIMIT) is accepted as a boundary:
+   * the LIMIT/OFFSET is a query-time row-count constraint, not an obstacle to
+   * pre-sorting. The replacement scan in
+   * {@link org.apache.calcite.adapter.enumerable.PipelineToMergedIndexScanRule}
+   * wraps the scan in a new {@code EnumerableLimitSort} to preserve the
+   * LIMIT/OFFSET semantics.
    */
   public static boolean isBoundarySort(RelNode node) {
-    if (!(node instanceof EnumerableSort)) {
+    if (!(node instanceof Sort)) {
       return false;
     }
-    final EnumerableSort sort = (EnumerableSort) node;
-    if (sort.fetch != null || sort.offset != null) {
+    final Sort sort = (Sort) node;
+    // Must be enumerable convention (not LogicalSort)
+    if (!(sort.getConvention() instanceof EnumerableConvention)) {
       return false;
     }
     return !sort.getCollation().getFieldCollations().isEmpty();
@@ -411,7 +415,7 @@ public class Pipeline {
       List<Pipeline> result) {
     for (RelNode input : node.getInputs()) {
       if (isBoundarySort(input)) {
-        final EnumerableSort sort = (EnumerableSort) input;
+        final Sort sort = (Sort) input;
         final RelNode below = sort.getInput();
         final Pipeline child = buildPipeline(below);
         result.add(new Pipeline(below, child.sources,
