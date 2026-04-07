@@ -17,6 +17,8 @@
 package org.apache.calcite.test;
 
 import org.apache.calcite.adapter.enumerable.EnumerableFilter;
+import org.apache.calcite.adapter.enumerable.EnumerableLimit;
+import org.apache.calcite.adapter.enumerable.EnumerableLimitSort;
 import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan;
 import org.apache.calcite.adapter.enumerable.EnumerableSort;
 import org.apache.calcite.materialize.MergedIndex;
@@ -236,6 +238,39 @@ public final class MergedIndexTestUtil {
       result = EnumerableFilter.create(result, conditions.get(i));
     }
     return result;
+  }
+
+  // ── LimitSort splitting ──────────────────────────────────────────────────
+
+  /**
+   * Recursively rewrites every {@code EnumerableLimitSort} in the tree as
+   * {@code EnumerableLimit(EnumerableSort(...))}. After this pass, boundary
+   * sorts are plain {@code EnumerableSort} nodes; LIMIT/OFFSET lives in a
+   * separate operator above the sort, forming its own tiny top pipeline.
+   */
+  public static RelNode splitLimitSorts(RelNode node) {
+    // Recurse into children first (post-order).
+    final List<RelNode> newInputs = new ArrayList<>();
+    boolean changed = false;
+    for (RelNode child : node.getInputs()) {
+      RelNode newChild = splitLimitSorts(child);
+      if (newChild != child) {
+        changed = true;
+      }
+      newInputs.add(newChild);
+    }
+    RelNode current = changed ? node.copy(node.getTraitSet(), newInputs) : node;
+
+    if (current instanceof EnumerableLimitSort) {
+      EnumerableLimitSort ls = (EnumerableLimitSort) current;
+      RelNode input = ls.getInput();
+      // Build plain EnumerableSort (no fetch/offset)
+      EnumerableSort sort =
+          EnumerableSort.create(input, ls.getCollation(), null, null);
+      // Wrap in EnumerableLimit carrying the fetch/offset
+      return EnumerableLimit.create(sort, ls.offset, ls.fetch);
+    }
+    return current;
   }
 
   // ── Tree search helpers ─────────────────────────────────────────────────

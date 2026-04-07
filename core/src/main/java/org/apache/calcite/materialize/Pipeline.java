@@ -301,7 +301,21 @@ public class Pipeline {
     // the plan root down to its own boundary Sorts. Setting logicalRoot to the
     // plan root (or its single input if it is a LimitSort) allows callers to
     // derive a maintenance plan for the root pipeline's assembly subtree too.
-    pipelineTree.logicalRoot = stripTopLevelLimitSort(logicalPlan);
+    final RelNode strippedRoot = stripTopLevelLimitSort(logicalPlan);
+    pipelineTree.logicalRoot = strippedRoot;
+
+    // When splitLimitSorts() introduces an extra physical Sort boundary above a
+    // LimitSort (EnumerableLimit + EnumerableSort instead of EnumerableLimitSort),
+    // the physical pipeline tree gains one more non-root level than the logical
+    // plan has boundary Sorts (because the logical LimitSort is not a boundary).
+    // The last unmatched non-root pipeline corresponds to the old root pipeline
+    // (what would have been rootPipeline before the extra boundary was added).
+    // Assign strippedRoot as its logicalRoot so maintenance plans can be derived.
+    if (nonRootPipelines.size() > logicalSubtrees.size()) {
+      for (int i = logicalSubtrees.size(); i < nonRootPipelines.size(); i++) {
+        nonRootPipelines.get(i).logicalRoot = strippedRoot;
+      }
+    }
   }
 
   /**

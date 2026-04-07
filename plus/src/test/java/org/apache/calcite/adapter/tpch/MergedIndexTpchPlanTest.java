@@ -182,8 +182,9 @@ class MergedIndexTpchPlanTest {
 
     // ── Phase 1: logical → physical pipeline ──────────────────────────────
     final RelNode phase1Plan =
-        MergedIndexTestUtil.hoistFiltersAboveBoundaries(
-            planner.transform(0, desiredTraits, logicalWithSorts));
+        MergedIndexTestUtil.splitLimitSorts(
+            MergedIndexTestUtil.hoistFiltersAboveBoundaries(
+                planner.transform(0, desiredTraits, logicalWithSorts)));
 
     // ── Discover pipelines (before writing DOT so clusters can be annotated) ─
     final Pipeline rootPipeline = Pipeline.buildTree(phase1Plan);
@@ -432,8 +433,9 @@ class MergedIndexTpchPlanTest {
 
     // ── Phase 1: logical → physical pipeline ──────────────────────────────
     final RelNode phase1Plan =
-        MergedIndexTestUtil.hoistFiltersAboveBoundaries(
-            planner.transform(0, desiredTraits, logicalWithSorts));
+        MergedIndexTestUtil.splitLimitSorts(
+            MergedIndexTestUtil.hoistFiltersAboveBoundaries(
+                planner.transform(0, desiredTraits, logicalWithSorts)));
 
     // ── Discover all interesting-ordering pipelines (bottom-up) ──────────
     // buildPipelineTree walks top-down, cutting at Sort boundaries.
@@ -450,8 +452,11 @@ class MergedIndexTpchPlanTest {
     // Capture logical subtrees for IVM — logical nodes have SQL row types
     // compatible with StreamRules; physical EnumerableMergeJoin uses JavaType.
     Pipeline.captureLogicalRoots(rootPipeline, logicalWithSorts);
-    assertThat("Expected 2 pipelines (inner orderkey + outer custkey)",
-        pipelines.size(), is(2));
+    // After splitLimitSorts, the top-level EnumerableLimitSort becomes
+    // EnumerableLimit(EnumerableSort(revenue DESC, orderdate ASC)), so the
+    // plain Sort is a third pipeline boundary on top of the outer custkey pipeline.
+    assertThat("Expected 3 pipelines (inner orderkey + outer custkey + top ORDER BY sort)",
+        pipelines.size(), is(3));
 
     // ── Verify assembly subtrees ──────────────────────────────────────────
     // Inner pipeline (orderkey): MergeJoin with SortedAggregate on one side
@@ -577,13 +582,18 @@ class MergedIndexTpchPlanTest {
     assertThat(afterStr, containsString("EnumerableMergedIndexScan"));
     // No EnumerableMergedIndexJoin (obsolete under per-source architecture)
     assertThat(afterStr, not(containsString("EnumerableMergedIndexJoin")));
-    // MergeJoins stay in the plan (outer custkey join + inner orderkey join)
-    assertThat(afterStr, containsString("EnumerableMergeJoin"));
-    // Exactly 2 MIScans in the final plan: one per source in the outer pipeline
-    // (inner_view + CUSTOMER). The inner pipeline's MIScans are absorbed into the
-    // outer MIScan's view([0]) reference — not visible as separate nodes in the root plan.
-    assertThat("Q3-OL should have exactly 2 MIScans in the final plan",
-        MergedIndexTestUtil.countOccurrences(afterStr, "EnumerableMergedIndexScan"), is(2));
+    // After splitLimitSorts, the top-level EnumerableLimitSort becomes
+    // EnumerableLimit(EnumerableSort(...)), and that Sort is now a third pipeline
+    // boundary. All three pipelines collapse to MIScans, so the final plan has:
+    //   EnumerableLimit → EnumerableMergedIndexScan(top ORDER BY pipeline, 1 source)
+    // The MergeJoins are all absorbed into nested MI views, leaving no join in the plan.
+    assertThat(afterStr, not(containsString("EnumerableMergeJoin")));
+    // EnumerableLimit stays at the top (FETCH=10 is preserved)
+    assertThat(afterStr, containsString("EnumerableLimit"));
+    // Exactly 1 MIScan in the final plan: the top ORDER BY pipeline has one source
+    // (the outer custkey view), which itself references the inner orderkey view.
+    assertThat("Q3-OL should have exactly 1 MIScan in the final plan after full 3-level collapse",
+        MergedIndexTestUtil.countOccurrences(afterStr, "EnumerableMergedIndexScan"), is(1));
     // No base TableScans remain (all absorbed into MI scans)
     assertThat(afterStr, not(containsString("EnumerableTableScan")));
     // Only non-root pipelines have maintenance plans.
@@ -759,8 +769,9 @@ class MergedIndexTpchPlanTest {
 
     // ── Phase 1: logical → physical pipeline ──────────────────────────────
     final RelNode phase1Plan =
-        MergedIndexTestUtil.hoistFiltersAboveBoundaries(
-            planner.transform(0, desiredTraits, logicalWithSorts));
+        MergedIndexTestUtil.splitLimitSorts(
+            MergedIndexTestUtil.hoistFiltersAboveBoundaries(
+                planner.transform(0, desiredTraits, logicalWithSorts)));
 
     // Discover all 5 join pipelines bottom-up (inner first) and register nested MergedIndexes.
     final Pipeline rootPipeline = Pipeline.buildTree(phase1Plan);

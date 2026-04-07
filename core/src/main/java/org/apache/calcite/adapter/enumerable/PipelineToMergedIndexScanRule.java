@@ -39,11 +39,12 @@ import java.util.Optional;
  * per-source {@link EnumerableMergedIndexScan} when a matching
  * {@link MergedIndex} is registered in {@link MergedIndexRegistry}.
  *
- * <p>Matches both {@link EnumerableSort} (pure ordering) and
- * {@link EnumerableLimitSort} (ORDER BY … LIMIT). For LimitSort, the
- * replacement wraps the scan in a new {@link EnumerableLimitSort} to
- * preserve the FETCH/OFFSET row-count constraint while eliminating the
- * physical sort (the merged index is pre-sorted).
+ * <p>Matches {@link EnumerableSort} (pure ordering) only. Callers should
+ * split any {@link EnumerableLimitSort} into
+ * {@code EnumerableLimit(EnumerableSort(...))} via
+ * {@code MergedIndexTestUtil.splitLimitSorts()} before running this rule,
+ * so the plain {@link EnumerableSort} becomes the pipeline boundary and the
+ * {@link EnumerableLimit} sits above it as a distinct operator.
  *
  * <p>Under the "Transparent Per-Source MI Scans" architecture, each boundary
  * Sort in a pipeline is replaced <b>independently</b> by a per-source MI scan
@@ -110,15 +111,7 @@ public class PipelineToMergedIndexScanRule
     final EnumerableMergedIndexScan miScan =
         EnumerableMergedIndexScan.create(sort.getCluster(), mi, match.sourceIndex, scanGroup);
 
-    // If the matched Sort carried FETCH/OFFSET (EnumerableLimitSort), preserve
-    // the row-count constraint by wrapping the scan. The physical sort is
-    // eliminated because the merged index is pre-sorted.
-    if (sort.fetch != null || sort.offset != null) {
-      call.transformTo(EnumerableLimitSort.create(
-          miScan, sort.getCollation(), sort.offset, sort.fetch));
-    } else {
-      call.transformTo(miScan);
-    }
+    call.transformTo(miScan);
   }
 
   /**
