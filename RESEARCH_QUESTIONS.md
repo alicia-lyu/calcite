@@ -27,7 +27,7 @@ joined and written into the output. The maintenance task is simply: find all pen
 compute the cartesian product of each key range they belong to, and mark them propagated.
 
 At execution time, this reduces to a **single key-range scan**: once the set of delta
-keys (keys of records that changed in any source) is known, the maintenance plan is a
+keys (keys of records that changed in any source) is known (either by caching them in memory or because this is part of the update transaction), the maintenance plan is a
 scan of the merged index over exactly those keys. At each key, all records — both new
 delta records and existing co-located records — are buffered. When the key changes, the
 buffered records form the complete local cartesian product; the output rows are emitted
@@ -35,11 +35,17 @@ and the pending flags cleared. No other structure needs to be read.
 
 ### B-tree Execution
 
-With a B-tree merged index, delta keys are maintained in a local in-memory cache as
+One advantage of merged indexes regardless of storage format is that it undergoes one fewer join, thus one join fanout, than full materialized view, assuming that there is a join in the final pipeline. But it's unclear whether an additional join increases intermediate data size.
+
+#### Eager maintenance
+
+Each update TX involves all relevant index maintenance. We know the delta key(s) as a local variable of this TX.
+
+#### Deferred maintenance (doc only, no impl plan)
+
+Delta keys are maintained in a local in-memory cache as
 updates arrive. Maintenance is triggered explicitly for the cached keys, scanning the
 B-tree over that range. The cache is cleared once propagation for each key completes.
-This is a clean, on-demand model: maintenance cost is proportional to the number of
-distinct delta keys, not to total index size.
 
 Crucially, the cache does not multiply by the equi-join fanout. It stores one entry per
 changed source record, so its size is `|δR| + |δS| + |δT| + ...` — a sum, not a product.
@@ -56,60 +62,41 @@ through scan volume, not cache size.
 
 ### LSM-tree Execution
 
-With an LSM-tree merged index, the unpropagated records naturally reside at the top
-level (MemTable) because they are the most recently written. At compaction time, the
-merge process inherently executes the maintenance plan: the upper level (new/delta
-records) is merged with the lower level (existing records), which is precisely the
-key-range buffering and cartesian product computation described above. Compaction IS
-the maintenance plan.
+We used a [tiered](https://github.com/facebook/rocksdb/wiki/Compaction) model for cleaner merge logic and smaller write amplification:
 
-This works cleanly in a **two-level LSM** (one MemTable, one SSTable): level
-membership itself encodes propagation status — MemTable records are by definition
-unpropagated; SSTable records are fully propagated. No explicit tag is needed.
+Let N be the fanout factor.
 
-In a **multi-level leveled LSM** (e.g., L0, L1, L2, ...), level membership alone is
-no longer sufficient. After an L0→L1 compaction, L1 contains a mix of newly arrived
-records (propagated into L1 but not yet into L2) and pre-existing records (already
-propagated into L2). These are interleaved; without a tag, the next L1→L2 compaction
-cannot tell which records require maintenance. A **single propagation bit** per record
-suffices: set to `1` when a record enters a level from above, cleared to `0` after it
-has been compacted into the level below. We cannot avoid this bit, since partially
-propagated records mingle with fully propagated ones after the first compaction.
+MemTable (size M)
+L0: M-sized runs (run = SSTable)
+L1: N*M-sized runs
+...
+Li: N^i*M-sized runs
 
-**Tiered LSM** is more intricate. Within a level, multiple SSTables of different ages
-coexist — some recently written (unpropagated), others older (already propagated at
-that level). A single bit is insufficient; a full **propagation level number** is
-needed, recording how many levels below the MemTable a record's maintenance has
-reached. This tag must be correctly updated when SSTables are merged within a tier —
-a considerably more complex bookkeeping requirement. Leveled LSM's invariant of full
-compaction per level avoids this, at the cost of higher write amplification.
+Since only similarly-sized runs are merged, this is fairly efficient.
 
-### Compaction-as-Maintenance vs. On-Demand Scan
+#### Update propagation
 
-The B-tree model described above also applies to LSM when treated as ordinary ordered
-storage: cache the delta keys in memory and scan the key ranges on demand, exactly as
-with a B-tree. The compaction-based model is an LSM-native alternative. Its preliminary
-advantages are:
+Whether two records have met and produced the joined result === whether they are in the same run
+--- No false positives or false negatives!
 
-**No separate update copy.** The local cache of delta keys represents an additional copy of updates, despite that it does not grow with join multiplicity & keys only are sufficient.
+|  | R0 | R1 | R2 | sum |
+|--|----|----|----|-----|
+|S | 1  | 0 | 2 | 3 |
+|T | 1  | 3 | 3 | 7 |
+|joined & propagated|1| 0| 6 | 7 |
 
-**Amortized I/O.** On-demand scanning pays a random seek per delta key, even if many
-updates arrive in quick succession. Compaction folds all pending deltas accumulated in
-the MemTable into a single sequential pass over the affected key range. Propagation incurs negligibly more cost than normal compaction.
+Joined records pending propagation: 3 * 7 - 7 = 14. They will be produced during this three-way merge.
 
-**No separate maintenance operation.** In the on-demand model, maintenance is an
-explicit step that must be triggered, tracked, and coordinated with writes. In the
-compaction model, maintenance is a side effect of the compaction that would happen
-anyway.
+#### Read-induced compaction
 
-**Natural temporal batching.** Updates that arrive close in time but at different keys
-accumulate in the MemTable. When compaction fires, all of them are processed in one
-ordered sequential scan — optimal I/O for the storage medium. On-demand scanning has no
-such batching unless explicitly implemented.
+When a read requested the joined records between S and T, the propagation cannot be deferred anymore. A perfect compaction is required for the read range. If the deepest level where the requested records reside is Li, all of this range will end up in Li+1. At each level, at lease 1 run is read, and the merge happens across levels, and this is not an efficient merge algorithm.
 
-The trade-off is **freshness**: the compaction model propagates in batches, so the
-merged index at any point may contain unpropagated records from the last compaction
-interval. The on-demand model propagates immediately or per policy, giving the system more control.
+When to choose LSM:
+
+- Frequency of updates >> queries
+- Queries include sort-key-based filters---this may vary per pipeline. A filter on column A may filter the scan range well on the merged index sorted on column A, but for a merged index sorted on column B, e.g., in a deeper pipeline, we may have to scan all of it. So, even for the same query, we may choose B-trees for some pipelines and LSM for others.
+
+Technical difficulty: Does RocksDB perform compaction at reads, or does it only read from different levels and return results without merging the retrieved runs? If it's the latter, how can we force a compaction of the retrieved range?
 
 ---
 
