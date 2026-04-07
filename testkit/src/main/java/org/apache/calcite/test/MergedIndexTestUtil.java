@@ -24,9 +24,6 @@ import org.apache.calcite.adapter.enumerable.EnumerableSort;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.Pipeline;
 import org.apache.calcite.plan.RelOptUtil;
-import org.apache.calcite.rex.RexNode;
-
-import org.checkerframework.checker.nullness.qual.Nullable;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelCollations;
@@ -34,13 +31,21 @@ import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Join;
+import org.apache.calcite.rel.core.SetOp;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.logical.LogicalSort;
+import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rex.RexInputRef;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexShuttle;
+
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
@@ -174,70 +179,221 @@ public final class MergedIndexTestUtil {
   // ── Filter hoisting ─────────────────────────────────────────────────────
 
   /**
-   * Moves {@link EnumerableFilter} nodes that are the <em>direct input</em>
-   * of a boundary Sort to just above that boundary Sort.
+   * Commutes {@link EnumerableFilter} nodes upward past operators that
+   * preserve the filter's semantic validity.
+   *
+   * <p>This is a general-purpose upward commutation pass, not limited to
+   * boundary Sorts. It walks the plan in post-order (children first), then
+   * for each node tries to peel {@link EnumerableFilter} chains from the top
+   * of each child and commute them past the current node.
+   *
+   * <h3>Commutation rules</h3>
+   * <ul>
+   *   <li><b>{@link Sort}</b>: always safe — Sort passes all columns through
+   *       unchanged, so the filter's {@link RexInputRef} indices are valid
+   *       above the Sort without rewriting.</li>
+   *   <li><b>{@link Project}</b>: safe only if every {@link RexInputRef} in
+   *       the filter condition maps to a <em>bare</em> {@link RexInputRef}
+   *       in the Project's output list (no computed expressions, functions,
+   *       or literals). When safe, each input ref is rewritten to the
+   *       Project-output index that carries that field.</li>
+   *   <li><b>{@link Join}</b>: not commuted for now. Joins change field
+   *       counts and require careful left/right offset arithmetic; skipping
+   *       avoids correctness risks at the cost of missing some opportunities.
+   *       (Future work: commute single-side filters through Join.)</li>
+   *   <li><b>{@link Aggregate}, {@link SetOp}</b>: never commuted — these
+   *       operators collapse or reorder rows, making filter ref indices
+   *       invalid above them.</li>
+   *   <li>Everything else: default to NOT commuting (safe fallback).</li>
+   * </ul>
    *
    * <p>Merged indexes store unfiltered data so they can be shared across
-   * queries with different predicates. A filter directly below a boundary
-   * Sort references columns from that same row type (the Sort passes all
-   * columns through unchanged), so moving it above the Sort is always valid.
-   *
-   * <p>Only direct-input filters are hoisted. Filters nested deeper (e.g.,
-   * below a Project or Aggregate inside the pipeline) cannot be safely
-   * hoisted because intermediate operators narrow the row type, making the
-   * filter's {@link org.apache.calcite.rex.RexInputRef} indices invalid at
-   * the Sort's output level.
-   *
-   * <p>Multiple chained filters directly below the Sort are all hoisted
-   * (innermost condition becomes outermost after hoisting, preserving
-   * short-circuit semantics).
+   * queries with different predicates. Hoisting filters above boundary Sorts
+   * lets the boundary Sort (and everything below it) be replaced by a merged
+   * index scan without carrying the filter into the index.
    *
    * @param plan the Phase 1 physical plan (Volcano output, no HepRelVertex)
-   * @return a new plan tree with direct-input boundary filters hoisted
+   * @return a new plan tree with filters commuted as high as possible
    */
   public static RelNode hoistFiltersAboveBoundaries(RelNode plan) {
     return hoistFiltersImpl(plan);
   }
 
+  /**
+   * Recursive post-order implementation of the upward commutation pass.
+   *
+   * <p>For each node:
+   * <ol>
+   *   <li>Recursively process all children (post-order).</li>
+   *   <li>For each processed child, try to peel {@link EnumerableFilter}
+   *       nodes from the top and rewrite their conditions to be valid above
+   *       the current node.</li>
+   *   <li>If any liftable conditions are found, rebuild the current node
+   *       with the stripped children and stack the filters above it.</li>
+   * </ol>
+   */
   private static RelNode hoistFiltersImpl(RelNode node) {
-    // First recurse into children so inner boundaries are processed first.
-    final List<RelNode> newInputs = node.getInputs().stream()
-        .map(MergedIndexTestUtil::hoistFiltersImpl)
-        .collect(Collectors.toList());
-    final RelNode rebuilt = node.copy(node.getTraitSet(), newInputs);
-
-    if (!Pipeline.isBoundarySort(rebuilt)) {
-      return rebuilt;
+    // Step 1: recurse into children first (post-order).
+    final List<RelNode> processedInputs = new ArrayList<>();
+    for (RelNode child : node.getInputs()) {
+      processedInputs.add(hoistFiltersImpl(child));
     }
 
-    // This is a boundary Sort: peel off any EnumerableFilter nodes that
-    // are the direct (possibly chained) input of this Sort.  These filters
-    // reference the Sort's own input row type, so hoisting them above the
-    // Sort is safe — the Sort passes all columns through unchanged.
-    final Sort sort = (Sort) rebuilt;
-    final List<RexNode> conditions = new ArrayList<>();
-    RelNode current = sort.getInput(0);
+    // Rebuild node with processed children (may be same objects if unchanged).
+    final RelNode current;
+    if (processedInputs.equals(node.getInputs())) {
+      current = node;
+    } else {
+      current = node.copy(node.getTraitSet(), processedInputs);
+    }
+
+    // Step 2: for each input, try to peel and commute filters upward.
+    final List<RexNode> liftedConditions = new ArrayList<>();
+    final List<RelNode> strippedInputs = new ArrayList<>();
+    boolean anyLifted = false;
+
+    for (int i = 0; i < current.getInputs().size(); i++) {
+      final RelNode child = current.getInputs().get(i);
+      final List<RexNode> peeled = new ArrayList<>();
+      final RelNode stripped = peelFilters(child, peeled);
+
+      if (peeled.isEmpty()) {
+        // No filters to lift from this child.
+        strippedInputs.add(child);
+        continue;
+      }
+
+      // Try to rewrite each peeled condition to be valid above `current`.
+      final List<RexNode> rewritten = new ArrayList<>();
+      boolean allRewritten = true;
+      for (RexNode cond : peeled) {
+        final Optional<RexNode> rw = rewriteForParent(cond, current, i);
+        if (rw.isPresent()) {
+          rewritten.add(rw.get());
+        } else {
+          allRewritten = false;
+          break;
+        }
+      }
+
+      if (allRewritten) {
+        strippedInputs.add(stripped);
+        liftedConditions.addAll(rewritten);
+        anyLifted = true;
+      } else {
+        // Cannot commute — keep child with its filters.
+        strippedInputs.add(child);
+      }
+    }
+
+    if (!anyLifted) {
+      return current;
+    }
+
+    // Step 3: rebuild current with stripped children, stack filters above.
+    final RelNode rebuilt = current.copy(current.getTraitSet(), strippedInputs);
+    RelNode result = rebuilt;
+    // Stack outermost-first: last lifted condition becomes the outermost filter.
+    for (int i = liftedConditions.size() - 1; i >= 0; i--) {
+      result = EnumerableFilter.create(result, liftedConditions.get(i));
+    }
+    return result;
+  }
+
+  /**
+   * Peels a chain of {@link EnumerableFilter} nodes from the top of
+   * {@code node}. Returns the innermost non-filter node (the stripped
+   * subtree) and appends the filter conditions (outermost first) to
+   * {@code conditions}.
+   */
+  private static RelNode peelFilters(RelNode node, List<RexNode> conditions) {
+    RelNode current = node;
     while (current instanceof EnumerableFilter) {
       final EnumerableFilter filter = (EnumerableFilter) current;
       conditions.add(filter.getCondition());
       current = filter.getInput();
     }
+    return current;
+  }
 
-    if (conditions.isEmpty()) {
-      return rebuilt;
+  /**
+   * Tries to rewrite {@code condition} (currently valid above {@code parent}'s
+   * {@code inputIdx}-th input, after filter-peeling) so that it is valid
+   * above {@code parent} itself.
+   *
+   * <p>Returns {@link Optional#empty()} if commutation is not safe.
+   *
+   * <h3>Commutation rules</h3>
+   * <ul>
+   *   <li>{@link Sort}: indices unchanged — Sort passes all columns through.</li>
+   *   <li>{@link Project}: rewrite each {@link RexInputRef} via the project
+   *       list; abort if any ref points to a non-bare-ref projection.</li>
+   *   <li>{@link Join}: not commuted (safe fallback). See class Javadoc.</li>
+   *   <li>{@link Aggregate}, {@link SetOp}: never commuted.</li>
+   *   <li>Everything else: not commuted.</li>
+   * </ul>
+   */
+  private static Optional<RexNode> rewriteForParent(
+      RexNode condition, RelNode parent, int inputIdx) {
+
+    if (parent instanceof Sort) {
+      // Sort passes all columns through — no index rewriting needed.
+      return Optional.of(condition);
     }
 
-    // Rebuild Sort directly over the filter-free input.
-    final RelNode newSort = sort.copy(sort.getTraitSet(), List.of(current));
+    if (parent instanceof Project) {
+      // Rewrite filter refs through the project's output list.
+      // Only safe if every referenced input field is a bare RexInputRef
+      // in the project's output list.
+      final Project project = (Project) parent;
+      final List<RexNode> projects = project.getProjects();
 
-    // Stack the hoisted filters above the Sort.
-    // conditions[0] was the outermost filter (closest to Sort); restore
-    // that order so the first collected condition wraps the Sort first.
-    RelNode result = newSort;
-    for (int i = conditions.size() - 1; i >= 0; i--) {
-      result = EnumerableFilter.create(result, conditions.get(i));
+      // Build a mapping from project-output-index → input-ref-index
+      // (only for bare-RexInputRef outputs).
+      // We need the reverse: for each input ref `oldIdx` in the filter,
+      // find a project output that is RexInputRef(oldIdx).
+      // Build: inputRefIndex → projectOutputIndex
+      final int[] inputToOutput = new int[project.getInput().getRowType().getFieldCount()];
+      java.util.Arrays.fill(inputToOutput, -1);
+      for (int j = 0; j < projects.size(); j++) {
+        final RexNode proj = projects.get(j);
+        if (proj instanceof RexInputRef) {
+          final int inputIdx2 = ((RexInputRef) proj).getIndex();
+          if (inputToOutput[inputIdx2] == -1) {
+            inputToOutput[inputIdx2] = j;
+          }
+        }
+      }
+
+      // Check that all RexInputRefs in the condition are remappable.
+      final boolean[] feasible = {true};
+      condition.accept(new RexShuttle() {
+        @Override public RexNode visitInputRef(RexInputRef ref) {
+          final int idx = ref.getIndex();
+          if (idx >= inputToOutput.length || inputToOutput[idx] == -1) {
+            feasible[0] = false;
+          }
+          return ref;
+        }
+      });
+      if (!feasible[0]) {
+        return Optional.empty();
+      }
+
+      // Rewrite: replace each RexInputRef(oldIdx) → RexInputRef(newIdx).
+      final RexNode rewritten = condition.accept(new RexShuttle() {
+        @Override public RexNode visitInputRef(RexInputRef ref) {
+          final int newIdx = inputToOutput[ref.getIndex()];
+          return new RexInputRef(newIdx, ref.getType());
+        }
+      });
+      return Optional.of(rewritten);
     }
-    return result;
+
+    // Join, Aggregate, SetOp, and everything else: do not commute.
+    // Join commutation requires careful left/right offset tracking;
+    // Aggregate and SetOp change column structure entirely.
+    return Optional.empty();
   }
 
   // ── LimitSort splitting ──────────────────────────────────────────────────
