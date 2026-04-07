@@ -662,23 +662,24 @@ class MergedIndexTpchPlanTest {
    * {@code EnumerableFilter(p_name LIKE '%green%')} remains in the query-time plan
    * because the PART filter cannot be pushed below the assembled join result.
    *
-   * <h3>Expected BEFORE structure (after sort-direction fix)</h3>
+   * <h3>Expected BEFORE structure (after sort-direction fix and widen-then-narrow)</h3>
    * <pre>
    *   EnumerableAggregate(n_name, o_year)
-   *     EnumerableSort(n_name ASC, o_year DESC)   ← GROUP BY boundary sort
-   *       EnumerableProject(NATION=[$47], O_YEAR=[EXTRACT(...)], ...)
-   *         EnumerableFilter(condition=[LIKE($26, '%green%')])  ← stays here
+   *     EnumerableFilter(condition=[LIKE($3, '%green%')])  ← hoisted above Sort
+   *       EnumerableSort(n_name ASC, o_year DESC)   ← GROUP BY boundary sort
+   *         EnumerableProject(NATION=[$47], O_YEAR=[EXTRACT(...)], $f2=[...], $f3=[$26])
    *           EnumerableMergeJoin(s_nationkey = n_nationkey)
    *             EnumerableSort(s_nationkey) → ... 4 nested MergeJoins ...
    *             EnumerableSort(s_nationkey) → Scan(NATION)
    * </pre>
    *
-   * <p>The filter {@code LIKE($26, '%green%')} references field 26 of the
-   * wide join output (l_partkey/p_name area). The Project narrows to 3 outputs
-   * ({@code NATION=[$47]}, {@code O_YEAR=[EXTRACT(...,$4)]}, {@code $f2=[...]}),
-   * none of which is a bare {@code RexInputRef($26)}. Therefore
-   * {@code hoistFiltersAboveBoundaries} correctly leaves the filter below the
-   * Project — commutation through Project is blocked by the non-bare-ref check.
+   * <p>The widen pre-pass in {@code hoistFiltersAboveBoundaries} appends
+   * {@code $f3=[$26]} (p_name, field 26 of the wide join output) as a trailing
+   * column to the {@code EnumerableProject}. This makes the Project commutable:
+   * the filter condition {@code LIKE($26, '%green%')} is rewritten to
+   * {@code LIKE($3, '%green%')} (output index of the appended column) and
+   * hoisted above the Sort. A narrowing {@code EnumerableProject} at the root
+   * restores the original 3-column row type.
    *
    * <p>The ORDER BY Sort is dropped by {@code propagateOrderByDirection} because
    * after propagating {@code o_year DESC} to the GROUP BY sort, the ORDER BY

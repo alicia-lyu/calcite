@@ -20,6 +20,7 @@ import org.apache.calcite.adapter.enumerable.EnumerableFilter;
 import org.apache.calcite.adapter.enumerable.EnumerableLimit;
 import org.apache.calcite.adapter.enumerable.EnumerableLimitSort;
 import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan;
+import org.apache.calcite.adapter.enumerable.EnumerableProject;
 import org.apache.calcite.adapter.enumerable.EnumerableSort;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.Pipeline;
@@ -35,6 +36,9 @@ import org.apache.calcite.rel.core.SetOp;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexShuttle;
@@ -43,9 +47,13 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -178,6 +186,214 @@ public final class MergedIndexTestUtil {
 
   // ── Filter hoisting ─────────────────────────────────────────────────────
 
+  // ── Widen-then-narrow helpers ──────────────────────────────────────────
+
+  /**
+   * Collects every {@link RexInputRef} index referenced by {@code cond}.
+   */
+  private static Set<Integer> collectInputRefIndices(RexNode cond) {
+    final Set<Integer> refs = new HashSet<>();
+    cond.accept(new RexShuttle() {
+      @Override public RexNode visitInputRef(RexInputRef ref) {
+        refs.add(ref.getIndex());
+        return ref;
+      }
+    });
+    return refs;
+  }
+
+  /**
+   * Returns {@code cond} with every {@link RexInputRef} whose index is
+   * {@code >= oldLeftCount} bumped by {@code +shift}.
+   *
+   * <p>Used when the left side of a {@link Join} has been widened so that
+   * right-side field indices must be shifted accordingly.
+   */
+  private static RexNode shiftRightSideRefs(
+      RexNode cond, int oldLeftCount, int shift) {
+    if (shift == 0) {
+      return cond;
+    }
+    return cond.accept(new RexShuttle() {
+      @Override public RexNode visitInputRef(RexInputRef ref) {
+        return ref.getIndex() >= oldLeftCount
+            ? new RexInputRef(ref.getIndex() + shift, ref.getType())
+            : ref;
+      }
+    });
+  }
+
+  /** Carrier for the result of {@link #widenProjectsForFilters}. */
+  private static final class WidenResult {
+    final RelNode node;
+    final Set<Integer> needed;
+
+    WidenResult(RelNode node, Set<Integer> needed) {
+      this.node = node;
+      this.needed = needed;
+    }
+  }
+
+  /**
+   * Post-order recursive pass that widens every {@link Project} on a filter's
+   * ancestor path to append the filter's referenced columns as trailing
+   * {@link RexInputRef} projections.
+   *
+   * <p>After widening, {@link #hoistFiltersImpl} can commute filters upward
+   * through Projects that previously blocked commutation because they dropped
+   * the filter's referenced columns.
+   *
+   * <p>A narrowing {@link EnumerableProject} is added at the root by
+   * {@link #hoistFiltersAboveBoundaries} if the row type changed.
+   *
+   * @param node the (sub)plan to widen
+   * @return a {@link WidenResult} carrying the rewritten node and the set of
+   *         input-ref indices needed by filters above this node
+   */
+  private static WidenResult widenProjectsForFilters(RelNode node) {
+
+    // ── Filter ────────────────────────────────────────────────────────────
+    if (node instanceof EnumerableFilter || (node instanceof org.apache.calcite.rel.core.Filter
+        && !(node instanceof EnumerableFilter))) {
+      final org.apache.calcite.rel.core.Filter filter =
+          (org.apache.calcite.rel.core.Filter) node;
+      final WidenResult inner = widenProjectsForFilters(filter.getInput());
+      // Widening only appends at the tail, so condition indices remain valid.
+      final RelNode newFilter = filter.copy(filter.getTraitSet(),
+          List.of(inner.node));
+      final Set<Integer> needed = new HashSet<>(inner.needed);
+      needed.addAll(collectInputRefIndices(filter.getCondition()));
+      return new WidenResult(newFilter, needed);
+    }
+
+    // ── Project ───────────────────────────────────────────────────────────
+    if (node instanceof Project) {
+      final Project project = (Project) node;
+      final WidenResult inner = widenProjectsForFilters(project.getInput());
+      final RelNode newIn = inner.node;
+      final Set<Integer> neededBelow = inner.needed;
+
+      final List<RexNode> newProjs = new ArrayList<>(project.getProjects());
+      // Build mapping: input-ref-index → project output index (first bare ref wins)
+      final Map<Integer, Integer> mapping = new HashMap<>();
+      for (int out = 0; out < newProjs.size(); out++) {
+        final RexNode p = newProjs.get(out);
+        if (p instanceof RexInputRef) {
+          mapping.putIfAbsent(((RexInputRef) p).getIndex(), out);
+        }
+      }
+
+      final Set<Integer> neededAbove = new HashSet<>();
+      for (int inputIdx : neededBelow) {
+        if (mapping.containsKey(inputIdx)) {
+          neededAbove.add(mapping.get(inputIdx));
+        } else {
+          // Append a new bare ref for this input field
+          final RelDataType type =
+              newIn.getRowType().getFieldList().get(inputIdx).getType();
+          final int newOutIdx = newProjs.size();
+          newProjs.add(new RexInputRef(inputIdx, type));
+          mapping.put(inputIdx, newOutIdx);
+          neededAbove.add(newOutIdx);
+        }
+      }
+
+      if (newProjs.size() == project.getProjects().size()) {
+        // No widening; rebuild with potentially-updated input only.
+        final RelNode newProject = project.copy(project.getTraitSet(),
+            List.of(newIn));
+        return new WidenResult(newProject, neededAbove);
+      }
+
+      // Build widened row type by appending new field descriptors.
+      final RelDataTypeFactory.Builder b =
+          project.getCluster().getTypeFactory().builder();
+      for (RelDataTypeField f : project.getRowType().getFieldList()) {
+        b.add(f);
+      }
+      for (int i = project.getRowType().getFieldCount(); i < newProjs.size(); i++) {
+        final RexInputRef appended = (RexInputRef) newProjs.get(i);
+        b.add("$f" + i, appended.getType());
+      }
+      final RelDataType newRowType = b.build();
+      final RelNode newProject = EnumerableProject.create(newIn, newProjs, newRowType);
+      return new WidenResult(newProject, neededAbove);
+    }
+
+    // ── Join ──────────────────────────────────────────────────────────────
+    if (node instanceof Join) {
+      final Join join = (Join) node;
+      final WidenResult leftResult = widenProjectsForFilters(join.getLeft());
+      final WidenResult rightResult = widenProjectsForFilters(join.getRight());
+
+      final int oldLeftCount = join.getLeft().getRowType().getFieldCount();
+      final int newLeftCount = leftResult.node.getRowType().getFieldCount();
+      final int shift = newLeftCount - oldLeftCount;
+
+      final RexNode newCond = shiftRightSideRefs(join.getCondition(),
+          oldLeftCount, shift);
+      final RelNode newJoin = join.copy(join.getTraitSet(), newCond,
+          leftResult.node, rightResult.node,
+          join.getJoinType(), join.isSemiJoinDone());
+
+      // Merge needed sets: right-side indices must be offset by new left width.
+      final Set<Integer> neededAbove = new HashSet<>(leftResult.needed);
+      for (int i : rightResult.needed) {
+        neededAbove.add(i + newLeftCount);
+      }
+      return new WidenResult(newJoin, neededAbove);
+    }
+
+    // ── EnumerableLimit (passthrough) ─────────────────────────────────────
+    if (node instanceof EnumerableLimit) {
+      final WidenResult inner = widenProjectsForFilters(
+          node.getInputs().get(0));
+      final RelNode rebuilt = node.copy(node.getTraitSet(),
+          List.of(inner.node));
+      return new WidenResult(rebuilt, inner.needed);
+    }
+
+    // ── Sort (covers EnumerableSort) — passthrough ────────────────────────
+    if (node instanceof Sort) {
+      final Sort sort = (Sort) node;
+      final WidenResult inner = widenProjectsForFilters(sort.getInput());
+      final RelNode rebuilt = sort.copy(sort.getTraitSet(),
+          List.of(inner.node));
+      return new WidenResult(rebuilt, inner.needed);
+    }
+
+    // ── Aggregate ─────────────────────────────────────────────────────────
+    if (node instanceof Aggregate) {
+      final Aggregate agg = (Aggregate) node;
+      final WidenResult inner = widenProjectsForFilters(agg.getInput());
+      final RelNode rebuilt = agg.copy(agg.getTraitSet(),
+          List.of(inner.node));
+      // Aggregates produce new output columns; no filter refs pass through.
+      return new WidenResult(rebuilt, Collections.emptySet());
+    }
+
+    // ── SetOp ─────────────────────────────────────────────────────────────
+    if (node instanceof SetOp) {
+      final List<RelNode> newInputs = new ArrayList<>();
+      for (RelNode child : node.getInputs()) {
+        newInputs.add(widenProjectsForFilters(child).node);
+      }
+      final RelNode rebuilt = node.copy(node.getTraitSet(), newInputs);
+      return new WidenResult(rebuilt, Collections.emptySet());
+    }
+
+    // ── Default: recurse into children, discard needed sets ───────────────
+    if (node.getInputs().isEmpty()) {
+      return new WidenResult(node, Collections.emptySet());
+    }
+    final List<RelNode> newInputs = new ArrayList<>();
+    for (RelNode child : node.getInputs()) {
+      newInputs.add(widenProjectsForFilters(child).node);
+    }
+    final RelNode rebuilt = node.copy(node.getTraitSet(), newInputs);
+    return new WidenResult(rebuilt, Collections.emptySet());
+  }
+
   /**
    * Commutes {@link EnumerableFilter} nodes upward past operators that
    * preserve the filter's semantic validity.
@@ -216,7 +432,20 @@ public final class MergedIndexTestUtil {
    * @return a new plan tree with filters commuted as high as possible
    */
   public static RelNode hoistFiltersAboveBoundaries(RelNode plan) {
-    return hoistFiltersImpl(plan);
+    final RelDataType originalRowType = plan.getRowType();
+    final WidenResult widened = widenProjectsForFilters(plan);
+    final RelNode hoisted = hoistFiltersImpl(widened.node);
+    if (!hoisted.getRowType().equals(originalRowType)) {
+      // The widen pass added trailing columns that are not part of the query
+      // result; add a narrowing Project to restore the original row type.
+      final List<RexNode> narrowProjs = new ArrayList<>();
+      for (int i = 0; i < originalRowType.getFieldCount(); i++) {
+        narrowProjs.add(
+            new RexInputRef(i, originalRowType.getFieldList().get(i).getType()));
+      }
+      return EnumerableProject.create(hoisted, narrowProjs, originalRowType);
+    }
+    return hoisted;
   }
 
   /**
