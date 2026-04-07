@@ -182,7 +182,8 @@ class MergedIndexTpchPlanTest {
 
     // ── Phase 1: logical → physical pipeline ──────────────────────────────
     final RelNode phase1Plan =
-        planner.transform(0, desiredTraits, logicalWithSorts);
+        MergedIndexTestUtil.hoistFiltersAboveBoundaries(
+            planner.transform(0, desiredTraits, logicalWithSorts));
 
     // ── Discover pipelines (before writing DOT so clusters can be annotated) ─
     final Pipeline rootPipeline = Pipeline.buildTree(phase1Plan);
@@ -431,7 +432,8 @@ class MergedIndexTpchPlanTest {
 
     // ── Phase 1: logical → physical pipeline ──────────────────────────────
     final RelNode phase1Plan =
-        planner.transform(0, desiredTraits, logicalWithSorts);
+        MergedIndexTestUtil.hoistFiltersAboveBoundaries(
+            planner.transform(0, desiredTraits, logicalWithSorts));
 
     // ── Discover all interesting-ordering pipelines (bottom-up) ──────────
     // buildPipelineTree walks top-down, cutting at Sort boundaries.
@@ -757,7 +759,8 @@ class MergedIndexTpchPlanTest {
 
     // ── Phase 1: logical → physical pipeline ──────────────────────────────
     final RelNode phase1Plan =
-        planner.transform(0, desiredTraits, logicalWithSorts);
+        MergedIndexTestUtil.hoistFiltersAboveBoundaries(
+            planner.transform(0, desiredTraits, logicalWithSorts));
 
     // Discover all 5 join pipelines bottom-up (inner first) and register nested MergedIndexes.
     final Pipeline rootPipeline = Pipeline.buildTree(phase1Plan);

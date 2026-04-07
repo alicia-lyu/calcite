@@ -16,11 +16,13 @@
  */
 package org.apache.calcite.test;
 
+import org.apache.calcite.adapter.enumerable.EnumerableFilter;
 import org.apache.calcite.adapter.enumerable.EnumerableMergedIndexScan;
 import org.apache.calcite.adapter.enumerable.EnumerableSort;
 import org.apache.calcite.materialize.MergedIndex;
 import org.apache.calcite.materialize.Pipeline;
 import org.apache.calcite.plan.RelOptUtil;
+import org.apache.calcite.rex.RexNode;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.apache.calcite.rel.RelCollation;
@@ -165,6 +167,75 @@ public final class MergedIndexTestUtil {
       }
     }
     return true;
+  }
+
+  // ── Filter hoisting ─────────────────────────────────────────────────────
+
+  /**
+   * Moves {@link EnumerableFilter} nodes that are the <em>direct input</em>
+   * of a boundary Sort to just above that boundary Sort.
+   *
+   * <p>Merged indexes store unfiltered data so they can be shared across
+   * queries with different predicates. A filter directly below a boundary
+   * Sort references columns from that same row type (the Sort passes all
+   * columns through unchanged), so moving it above the Sort is always valid.
+   *
+   * <p>Only direct-input filters are hoisted. Filters nested deeper (e.g.,
+   * below a Project or Aggregate inside the pipeline) cannot be safely
+   * hoisted because intermediate operators narrow the row type, making the
+   * filter's {@link org.apache.calcite.rex.RexInputRef} indices invalid at
+   * the Sort's output level.
+   *
+   * <p>Multiple chained filters directly below the Sort are all hoisted
+   * (innermost condition becomes outermost after hoisting, preserving
+   * short-circuit semantics).
+   *
+   * @param plan the Phase 1 physical plan (Volcano output, no HepRelVertex)
+   * @return a new plan tree with direct-input boundary filters hoisted
+   */
+  public static RelNode hoistFiltersAboveBoundaries(RelNode plan) {
+    return hoistFiltersImpl(plan);
+  }
+
+  private static RelNode hoistFiltersImpl(RelNode node) {
+    // First recurse into children so inner boundaries are processed first.
+    final List<RelNode> newInputs = node.getInputs().stream()
+        .map(MergedIndexTestUtil::hoistFiltersImpl)
+        .collect(Collectors.toList());
+    final RelNode rebuilt = node.copy(node.getTraitSet(), newInputs);
+
+    if (!Pipeline.isBoundarySort(rebuilt)) {
+      return rebuilt;
+    }
+
+    // This is a boundary Sort: peel off any EnumerableFilter nodes that
+    // are the direct (possibly chained) input of this Sort.  These filters
+    // reference the Sort's own input row type, so hoisting them above the
+    // Sort is safe — the Sort passes all columns through unchanged.
+    final Sort sort = (Sort) rebuilt;
+    final List<RexNode> conditions = new ArrayList<>();
+    RelNode current = sort.getInput(0);
+    while (current instanceof EnumerableFilter) {
+      final EnumerableFilter filter = (EnumerableFilter) current;
+      conditions.add(filter.getCondition());
+      current = filter.getInput();
+    }
+
+    if (conditions.isEmpty()) {
+      return rebuilt;
+    }
+
+    // Rebuild Sort directly over the filter-free input.
+    final RelNode newSort = sort.copy(sort.getTraitSet(), List.of(current));
+
+    // Stack the hoisted filters above the Sort.
+    // conditions[0] was the outermost filter (closest to Sort); restore
+    // that order so the first collected condition wraps the Sort first.
+    RelNode result = newSort;
+    for (int i = conditions.size() - 1; i >= 0; i--) {
+      result = EnumerableFilter.create(result, conditions.get(i));
+    }
+    return result;
   }
 
   // ── Tree search helpers ─────────────────────────────────────────────────
