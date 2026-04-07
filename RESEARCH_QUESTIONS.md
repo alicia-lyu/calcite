@@ -133,88 +133,99 @@ pages_per_update = ceil(Σ_i avg_records_per_key(table_i) × record_size_i / pag
 
 **Status**: Analytically tractable from TPC-H statistics. No implementation needed.
 LSM has no analogous "per-update I/O" because update cost is amortized through
-compaction; see Q6.
+compaction; see Q4.
 
 ---
 
-## Q2: Join Fanout per Update
+## Q2: Update Cost Across the Cascade
 
-**Question**: When inserting one base record into Ti at key `k0`, how many output rows
-does the maintenance plan produce? This is the join fanout the maintenance step pays.
+A single question that subsumes single-pipeline join fanout, nested-pipeline
+composition, and the comparison against fully-materialized IVM. All three are slices of
+the same per-update cost-counting exercise.
 
-**Formula**: For a pipeline joining tables T1, ..., Tk on key `k`:
+### Part 1 — Single-pipeline join fanout
+
+For a pipeline joining tables T1, ..., Tk on key `k`, inserting one row into Ti at key
+`k0` produces:
 ```
 output_delta_size = Π_{j ≠ i} count(Tj WHERE key = k0)
 ```
 
-**FK→PK case**: For LINEITEM.orderkey → ORDERS.orderkey, the PK side always has exactly
-1 matching row → **fanout = 1**. Each base insert produces exactly one merged-index row
+**FK→PK case**: For LINEITEM.orderkey → ORDERS.orderkey, the PK side has exactly 1
+matching row → **fanout = 1**. Each base insert produces exactly one merged-index row
 update.
 
-**When fanout > 1**: Many-to-many joins where neither side is the PK of the join (e.g.,
-PARTSUPP joined on `partkey` alone, ignoring suppkey). In well-designed schemas, the
-join is on the full PK of one side, restoring fanout = 1.
+**When fanout > 1**: many-to-many joins where neither side is the PK of the join. In
+well-designed schemas the join is on the full PK of one side, restoring fanout = 1.
 
-**Connection to "one fewer join"**: the merged index pays this fanout at maintenance
-time. A traditional materialized view pays the same fanout at maintenance time AND an
-additional fanout at the next-higher level. The merged index saves exactly one such
-fanout cost per nesting level eliminated.
+For Q9's compound join (LINEITEM ⋈ PARTSUPP on `(partkey, suppkey)`): fanout = 1
+because PARTSUPP's PK is `(partkey, suppkey)`.
 
-**To work out**:
-- For Q9's compound join (LINEITEM ⋈ PARTSUPP on `(partkey, suppkey)`): fanout = 1
-  because PARTSUPP's PK is `(partkey, suppkey)`.
-- For JOB queries (IMDB schema): identify which joins are many-to-many and bound their
-  fanout factors from schema statistics.
+### Part 2 — Nested composition and intermediate-data growth
 
-**Status**: Analytically tractable from PK/FK declarations + TPC-H/IMDB statistics.
+**Open question (from framing § B-tree)**: an extra join level costs one fewer join
+fanout per update than the equivalent materialized view, but does the intermediate data
+the parent index stores grow with the extra level?
 
----
-
-## Q3: Nested Pipeline Cascade — Does Intermediate Data Grow?
-
-**Open question (from framing § B-tree)**: An extra join level in a nested merged index
-costs one fewer join fanout per update than the equivalent materialized view, but it is
-unclear whether the intermediate data the parent index stores is larger than the
-materialized-view alternative would be. This question quantifies that.
-
-**Setup — Q3-OL** (one LINEITEM insert at orderkey `k`, custkey `c`):
+**Trace — Q3-OL** (one LINEITEM insert at orderkey `k`, custkey `c`):
 1. Inner MI maintenance: scan key `k`, find 1 ORDERS + existing LINEITEM at `k` →
    1 inner-pipeline output row changes. Write: 1 update to inner MI. Fanout = 1.
-2. Outer MI maintenance: the inner-MI delta at custkey `c` triggers a scan of the outer
-   MI at key `c`, finding 1 CUSTOMER record + all inner-view rows for customer `c`
-   (~10–15 orders per customer at TPC-H SF=1).
+2. Outer MI maintenance: the inner-MI delta at custkey `c` triggers a scan of the
+   outer MI at key `c`, finding 1 CUSTOMER + all inner-view rows for customer `c`
+   (~10–15 orders/customer at TPC-H SF=1).
    - Aggregating outer pipeline: 1 group state update. Fanout = 1.
-   - Non-aggregating outer pipeline: ~10–15 outer rows. Fanout = O(orders per customer).
+   - Non-aggregating outer pipeline: ~10–15 outer rows. Fanout = O(orders/customer).
 
-**Key physical property**: the outer MI scan reads from the same B-tree as the inner MI
-output — no separate I/O into a stored "inner view." The inner-pipeline output records
-are interleaved with the outer-pipeline records in the outer MI, sorted by custkey.
-Step 2 is again O(records at key `c`).
+**Total writes per update** = sum of fanouts across all levels. For Q3-OL with FK→PK
+chain: 2 writes (1 inner + 1 outer). For Q9 with 5 nested pipelines: 5 writes.
 
-**The intermediate-data-size question**: at each level the parent index stores tuples
-that are themselves joined results. Under FK→PK chains the row count at the parent does
-not multiply (each child row joins with exactly one row at the parent's other source),
-so the parent index's storage is bounded by `|inner pipeline output| + |new base table|`
-— additive, not multiplicative. The "extra join" therefore does not balloon
-intermediate storage when the join is FK→PK.
+**Key physical property**: each level's scan reads from the same B-tree as the level
+below — no separate I/O into a stored "inner view." Records of the inner pipeline are
+interleaved with records of the outer pipeline in the outer MI by the outer key.
 
-For non-FK joins or aggregation-free chains, this property may not hold and storage can
-grow multiplicatively. Q3-OL (FK chain) and Q9 (FK chain + compound PK) both fall in
-the additive regime.
+**Intermediate data size**: at each level the parent index stores tuples that are
+themselves joined results. Under FK→PK chains the row count at the parent does not
+multiply (each child row joins with exactly one row at the parent's other source), so
+the parent index's storage is bounded by `|inner pipeline output| + |new base table|`
+— **additive, not multiplicative**. The "extra join" therefore does not balloon
+intermediate storage when joins are FK→PK. Q3-OL and Q9 both fall in this regime.
 
-**Contrast with 2-level traditional IVM**:
-- Level 1: δLINEITEM → δinner_view (random read from ORDERS materialized view + write
-  to δinner_view table)
-- Level 2: δinner_view → δfinal_view (random read from CUSTOMER materialized view +
-  write to δfinal_view table)
-Total: 4 random I/Os + 2 writes vs. 2 sequential range scans + 2 writes.
+For non-FK joins or aggregation-free chains, this property may not hold; storage can
+grow multiplicatively. Worth checking on JOB.
 
-**Status**: Analytically tractable. Trace explicitly for Q3-OL and Q9 with TPC-H SF=1
-statistics.
+### Part 3 — Comparison vs traditional IVM
+
+The same cascade trace but with the final view materialized:
+
+**Write amplification** for one LINEITEM insert under Q3-OL:
+| Approach | Writes |
+|----------|--------|
+| Traditional IVM (fully materialized) | δLINEITEM + δinner_view + δfinal_view = 3 writes |
+| Merged index (one fewer join) | 1 inner MI + 1 outer MI = 2 writes |
+| Traditional index (no materialization) | 0 maintenance writes, but full query recomputation each time |
+
+The merged index sits between the two extremes. The "one-order-less" reduction is
+exactly **one fewer cascade level on the critical write path per update**, regardless of
+nesting depth — the saving is constant, not multiplicative.
+
+**Q9 generalization**: a fully materialized version writes to 6 stores (5 intermediate
++ 1 final view); the merged-index version writes to 5 (no final view). Savings = 1
+write per update.
+
+**Read I/O contrast**: traditional IVM cascade requires 4 random I/Os (2 reads + 2
+writes into separate stores) at each level transition for Q3-OL; the merged-index
+cascade requires 2 sequential range scans + 2 writes total. The savings come from
+co-location, not just from having fewer levels.
+
+### Status
+
+Analytically tractable from PK/FK declarations + TPC-H/IMDB statistics. No
+implementation needed. Trace explicitly for Q3-OL and Q9; spot-check JOB for any
+non-FK chains that violate the additive-storage property.
 
 ---
 
-## Q4: Aggregation Re-Scan Trade-off (Storage-Agnostic)
+## Q3: Aggregation Re-Scan Trade-off (Storage-Agnostic)
 
 **Question**: For pipelines with `SortedAggregate` (e.g., Q12's shipmode grouping), is it
 cheaper to re-scan the affected key range or to maintain auxiliary `(sum, count)` state?
@@ -250,43 +261,11 @@ maintenance-time operation.
 **Status**: Storage-agnostic — the trade-off is the same under eager B-tree, deferred
 B-tree, and LSM. Key question: what exactly is stored in each MI vs. computed at query
 time? The boundary is the pipeline structure (and is decided independently from the
-storage choice — see Q6).
+storage choice — see Q4).
 
 ---
 
-## Q5: "No Final View" Savings Quantified
-
-**Question**: How much write amplification does eliminating the final-view maintenance
-save? This is the "one fewer join" claim measured in writes-per-update.
-
-**For Q3-OL** at SF=1:
-- Final query result: ~1000 rows (top revenue groups by custkey).
-- If the final view were materialized: every LINEITEM insert would cascade to a final
-  view update. Even when the final pipeline is aggregating (so each insert touches O(1)
-  groups), the cost is still one extra random write per update on the critical path.
-- With a merged index: no write to the final view. The query at runtime scans the
-  outer MI and applies the final aggregation in pass.
-
-**Write amplification** for one LINEITEM insert:
-| Approach | Writes |
-|----------|--------|
-| Traditional IVM (fully materialized) | δLINEITEM + δinner_view + δfinal_view = 3 writes |
-| Merged index (one fewer join) | 1 inner MI + 1 outer MI = 2 writes |
-| Traditional index (no materialization) | 0 maintenance writes, but full query recomputation each time |
-
-The merged index sits between the two extremes. The "one-order-less" reduction is
-exactly one fewer cascade level on the critical write path per update.
-
-**Q9 generalization**: Q9 has 5 pipeline levels. A fully materialized version would
-write to 6 stores (5 intermediate + 1 final view); the merged-index version writes to 5
-(no final view). Savings = 1 write per update regardless of nesting depth — the saving
-is constant, not multiplicative.
-
-**Status**: Easily quantified analytically. Direct paper table.
-
----
-
-## Q6: LSM Tiered Storage and Read-Induced Compaction
+## Q4: LSM Tiered Storage and Read-Induced Compaction
 
 **Question**: When does LSM beat eager B-tree as the storage backend for a merged
 index, and what is the cost model?
@@ -339,13 +318,12 @@ new territory and a worthwhile design contribution in its own right.
 | Question | Method | Priority |
 |----------|--------|----------|
 | Q1: Per-update page count (eager B-tree) | Formula from TPC-H stats | High — core claim |
-| Q2: Join fanout per update | Schema analysis (PK/FK) | High — quantifies "one fewer join" |
-| Q3: Nested cascade & intermediate-data growth | Trace Q3-OL, Q9 with SF=1 stats | High — addresses open intermediate-size question |
-| Q4: Aggregation re-scan trade-off | Formalize boundary condition | Medium — storage-agnostic |
-| Q5: No-final-view savings (writes per update) | Count writes per level | Medium — direct paper table |
-| Q6: LSM tiered + read-induced compaction | Cost model + RocksDB investigation | Medium-High — per-pipeline storage is novel |
+| Q2: Update cost across the cascade (fanout, nested composition, IVM diff) | Schema analysis + Q3-OL/Q9 trace | High — main efficiency argument |
+| Q3: Aggregation re-scan trade-off | Formalize boundary condition | Medium — storage-agnostic |
+| Q4: LSM tiered + read-induced compaction | Cost model + RocksDB investigation | Medium-High — per-pipeline storage is novel |
 
-Q1–Q3 form the core efficiency argument: per-update I/O is O(1), join fanout = 1 under
-FK→PK, and intermediate data size remains additive in nested chains. Q4–Q5 quantify the
-constant-factor wins. Q6 positions the work in storage-engine literature and introduces
-the per-pipeline storage choice as a design point.
+Q1–Q2 form the core efficiency argument: per-update I/O is O(1), join fanout = 1 under
+FK→PK, nested cascades stay additive in storage, and merged indexes save exactly one
+write per update vs fully-materialized IVM. Q3 quantifies the aggregation trade-off.
+Q4 positions the work in storage-engine literature and introduces the per-pipeline
+storage choice as a design point.
