@@ -248,27 +248,31 @@ full design. Key production classes:
   narrower Sort output — only direct-input filters are safe to hoist. Applied to Q12,
   Q3-OL, Q9. All 7 tests pass.
 
+### 2026-04-07
+
+- **LimitSort split refactor**: `MergedIndexTestUtil.splitLimitSorts()` rewrites every
+  `EnumerableLimitSort` in Phase 1 plan as `EnumerableLimit(EnumerableSort(...))` before
+  pipeline discovery. Simplifies `PipelineToMergedIndexScanRule.onMatch()` to bare
+  `call.transformTo(miScan)` with no fetch/offset wrapping.
+- **Q3-OL full collapse**: now has 3 pipelines (inner orderkey + outer custkey + top
+  ORDER BY sort). After all three pipeline boundaries are replaced, plan collapses to
+  `EnumerableLimit → EnumerableMergedIndexScan` with no joins or base scans remaining.
+- **Pipeline.captureLogicalRoots() fix**: when splitLimitSorts adds an extra physical
+  boundary not in the logical plan, unmatched non-root pipelines fall back to stripped
+  logical root (LimitSort unwrapped) for IVM maintenance plan derivation.
+
 ---
 
 ## Next Steps
 
 ### Short-term (next session)
 
-1. ✓ **Treat `LimitSort` as pipeline boundary** — DONE (2026-04-04).
-   `Pipeline.isBoundarySort()` and `PipelineToMergedIndexScanRule` operand accept
-   `EnumerableLimitSort`. LIMIT is preserved in root query plan.
+**Additional TPC-H queries** (Q5, Q7, Q10) — add to `MergedIndexTpchPlanTest`:
+- `tpchQ5()`: multi-way join, GROUP BY multiple columns, HAVING predicate.
+- `tpchQ7()`: two independent join chains merged at final aggregation.
+- `tpchQ10()`: nested aggregations, ORDER BY after GROUP BY.
 
-2. ✓ **Omit projections in colored DOT output** — DONE (2026-04-04).
-   `skipTransparent()` removes `EnumerableProject` clutter from visualizations.
-
-3. ✓ **Hoist variable-predicate filters to root query plan** — DONE (2026-04-04).
-   `hoistFiltersAboveBoundaries()` removes direct-input filters from merged indexes to
-   ensure reusability across queries with different predicates. Limitation: nested filters
-   (below Project / SortedAggregate) cannot be hoisted (invalid `RexInputRef` indices).
-
-4. **Additional TPC-H queries** (Q5, Q7, Q10): add to `MergedIndexTpchPlanTest`. Each
-   exercises different operator combinations (multi-way join, date range filter,
-   aggregation variants). Goal: confirm pipeline discovery generalizes beyond Q9.
+Each confirms pipeline discovery generalizes beyond Q9 (6-table, 5 nested joins).
 
 ### Medium-term
 
