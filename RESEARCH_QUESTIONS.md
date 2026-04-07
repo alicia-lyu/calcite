@@ -100,93 +100,121 @@ Technical difficulty: Does RocksDB perform compaction at reads, or does it only 
 
 ---
 
-## Q1: Per-Update I/O Profile
+## Q1: Per-Update I/O Profile (Eager B-tree)
 
-**Question**: How many B-tree pages does one base-table insert/delete touch in a merged
-index maintenance step?
+**Question**: Under eager B-tree maintenance, how many pages does one base-table
+insert/delete touch in a merged index maintenance step?
 
-**Setup**: For the ORDERS+LINEITEM pipeline (key = `orderkey`), insert one LINEITEM row at
-key `k`.
+**Setup**: For the ORDERS+LINEITEM pipeline (key = `orderkey`), insert one LINEITEM row
+at key `k`. The update transaction holds `k` as a local variable, so no separate delta
+cache is needed.
 
 - Range scan: read all records at key `k` — one seek + forward pass until key changes.
   Page count ≈ `ceil(avg_records_per_key × avg_record_size / page_size)`.
-  For TPC-H at SF=1: ~1 ORDERS + ~4 LINEITEM per orderkey, all fitting in 1–2 pages.
-- Assembly: run `PremergedJoin` logic on the retrieved records.
-- Write: insert/update the affected entry in the outer MI (or the pipeline output index).
+  At TPC-H SF=1: ~1 ORDERS + ~4 LINEITEM per orderkey, fitting in 1–2 pages.
+- Assembly: merged-scan logic produces the joined pipeline output rows in-pass.
+- Write: insert/update the affected entry in the merged index.
 
-**Contrast with traditional IVM**: requires two separate lookups (one into a stored LINEITEM
-delta table, one into a stored ORDERS materialized view) plus a write to a separate delta
-result table. Typically 3–5 random I/Os instead of 1 sequential range scan.
+**One fewer join**: the same range scan that fetches the delta key's records also
+performs the pipeline's join in memory. There is no second pass and no separate
+materialized join output to write. This is the concrete payoff of the "one fewer join"
+claim from the framing section.
 
-**Expected answer**: For equi-join pipelines with selective keys (PK/FK), per-update page
-access is O(1), independent of total index size. Formalize as:
+**Contrast with traditional IVM**: requires two separate lookups (one into a stored
+LINEITEM delta table, one into a stored ORDERS materialized view) plus a write to a
+separate delta result table. Typically 3–5 random I/Os instead of 1 sequential range
+scan.
+
+**Expected answer**: For equi-join pipelines with selective keys (PK/FK), per-update
+page access is O(1), independent of total index size:
 ```
 pages_per_update = ceil(Σ_i avg_records_per_key(table_i) × record_size_i / page_size)
 ```
 
 **Status**: Analytically tractable from TPC-H statistics. No implementation needed.
+LSM has no analogous "per-update I/O" because update cost is amortized through
+compaction; see Q6.
 
 ---
 
-## Q2: Delta Amplification Factor
+## Q2: Join Fanout per Update
 
-**Question**: When inserting one base record, how many output rows does the maintenance
-plan produce (the "fanout")?
+**Question**: When inserting one base record into Ti at key `k0`, how many output rows
+does the maintenance plan produce? This is the join fanout the maintenance step pays.
 
-**Setup**: For a pipeline joining tables T1, ..., Tk on key `k`, inserting one row into Ti
-at key `k0` produces:
+**Formula**: For a pipeline joining tables T1, ..., Tk on key `k`:
 ```
 output_delta_size = Π_{j ≠ i} count(Tj WHERE key = k0)
 ```
 
-For FK→PK joins (e.g., LINEITEM.orderkey → ORDERS.orderkey), the PK side always has exactly
-1 matching row → **amplification factor = 1**. The 1-to-1 update cost property holds.
+**FK→PK case**: For LINEITEM.orderkey → ORDERS.orderkey, the PK side always has exactly
+1 matching row → **fanout = 1**. Each base insert produces exactly one merged-index row
+update.
 
-**When it breaks**: Many-to-many joins (e.g., PARTSUPP: both partkey and suppkey are FKs,
-neither side is a PK of the join). Amplification factor > 1 in general.
+**When fanout > 1**: Many-to-many joins where neither side is the PK of the join (e.g.,
+PARTSUPP joined on `partkey` alone, ignoring suppkey). In well-designed schemas, the
+join is on the full PK of one side, restoring fanout = 1.
+
+**Connection to "one fewer join"**: the merged index pays this fanout at maintenance
+time. A traditional materialized view pays the same fanout at maintenance time AND an
+additional fanout at the next-higher level. The merged index saves exactly one such
+fanout cost per nesting level eliminated.
 
 **To work out**:
-- State the precise condition under which factor = 1 (one PK side per join).
-- For Q9's compound join (LINEITEM ⋈ PARTSUPP on (partkey, suppkey)): what is the
-  average factor? PARTSUPP has one row per (partkey, suppkey) pair → factor = 1 again
-  if the join is on the PK of PARTSUPP.
+- For Q9's compound join (LINEITEM ⋈ PARTSUPP on `(partkey, suppkey)`): fanout = 1
+  because PARTSUPP's PK is `(partkey, suppkey)`.
 - For JOB queries (IMDB schema): identify which joins are many-to-many and bound their
-  amplification factors from schema statistics.
+  fanout factors from schema statistics.
 
-**Status**: Analytically tractable from schema constraints (PK/FK declarations) + TPC-H
-and IMDB statistics.
+**Status**: Analytically tractable from PK/FK declarations + TPC-H/IMDB statistics.
 
 ---
 
-## Q3: Nested Pipeline Cascade (Does 1-to-1 Hold End-to-End?)
+## Q3: Nested Pipeline Cascade — Does Intermediate Data Grow?
 
-**Question**: For nested MIs (e.g., Q3-OL: inner = ORDERS+LINEITEM by orderkey, outer =
-inner_view+CUSTOMER by custkey), how many total index writes does one base-table insert
-trigger across all levels?
+**Open question (from framing § B-tree)**: An extra join level in a nested merged index
+costs one fewer join fanout per update than the equivalent materialized view, but it is
+unclear whether the intermediate data the parent index stores is larger than the
+materialized-view alternative would be. This question quantifies that.
 
-**Trace for Q3-OL** (one LINEITEM insert at orderkey `k`, custkey `c`):
-1. Inner MI maintenance: scan key `k`, find 1 ORDERS + existing LINEITEM → 1 inner view
-   row changes. Write: 1 update to inner MI. (Factor = 1, FK→PK.)
-2. Outer MI maintenance: inner view row at custkey `c` changed → scan key `c` of outer MI,
-   find 1 CUSTOMER + all inner_view rows for customer `c`. Each customer has ~10–15 orders
-   at TPC-H SF=1.
-   - If outer pipeline is aggregating: 1 aggregate group update. Factor = 1.
-   - If outer pipeline is non-aggregating: ~10–15 outer output rows change. Factor = O(orders_per_customer).
+**Setup — Q3-OL** (one LINEITEM insert at orderkey `k`, custkey `c`):
+1. Inner MI maintenance: scan key `k`, find 1 ORDERS + existing LINEITEM at `k` →
+   1 inner-pipeline output row changes. Write: 1 update to inner MI. Fanout = 1.
+2. Outer MI maintenance: the inner-MI delta at custkey `c` triggers a scan of the outer
+   MI at key `c`, finding 1 CUSTOMER record + all inner-view rows for customer `c`
+   (~10–15 orders per customer at TPC-H SF=1).
+   - Aggregating outer pipeline: 1 group state update. Fanout = 1.
+   - Non-aggregating outer pipeline: ~10–15 outer rows. Fanout = O(orders per customer).
 
-**Key point**: The outer MI scan reads from the same B-tree as the inner MI — no separate
-read from a "stored inner view" file. The inner view records are interleaved with the outer
-records in the outer MI by custkey. Step 2's range scan is again O(records at key `c`).
+**Key physical property**: the outer MI scan reads from the same B-tree as the inner MI
+output — no separate I/O into a stored "inner view." The inner-pipeline output records
+are interleaved with the outer-pipeline records in the outer MI, sorted by custkey.
+Step 2 is again O(records at key `c`).
+
+**The intermediate-data-size question**: at each level the parent index stores tuples
+that are themselves joined results. Under FK→PK chains the row count at the parent does
+not multiply (each child row joins with exactly one row at the parent's other source),
+so the parent index's storage is bounded by `|inner pipeline output| + |new base table|`
+— additive, not multiplicative. The "extra join" therefore does not balloon
+intermediate storage when the join is FK→PK.
+
+For non-FK joins or aggregation-free chains, this property may not hold and storage can
+grow multiplicatively. Q3-OL (FK chain) and Q9 (FK chain + compound PK) both fall in
+the additive regime.
 
 **Contrast with 2-level traditional IVM**:
-- Level 1: δLINEITEM → δinner_view (random read from ORDERS materialized view + write to δinner_view table)
-- Level 2: δinner_view → δfinal_view (random read from CUSTOMER materialized view + write to δfinal_view table)
+- Level 1: δLINEITEM → δinner_view (random read from ORDERS materialized view + write
+  to δinner_view table)
+- Level 2: δinner_view → δfinal_view (random read from CUSTOMER materialized view +
+  write to δfinal_view table)
 Total: 4 random I/Os + 2 writes vs. 2 sequential range scans + 2 writes.
 
-**Status**: Analytically tractable. Trace explicitly for Q3-OL and Q9.
+**Status**: Analytically tractable. Trace explicitly for Q3-OL and Q9 with TPC-H SF=1
+statistics.
 
 ---
 
-## Q4: Aggregation Re-Scan Trade-off
+## Q4: Aggregation Re-Scan Trade-off (Storage-Agnostic)
 
 **Question**: For pipelines with `SortedAggregate` (e.g., Q12's shipmode grouping), is it
 cheaper to re-scan the affected key range or to maintain auxiliary `(sum, count)` state?
@@ -219,70 +247,105 @@ aggregate state per group key. It stores the per-orderkey pipeline output. The s
 aggregation that appears in Q12's final result is a **query-time** operation, not a
 maintenance-time operation.
 
-**Status**: Needs careful formalization. Key question: what exactly is stored in each MI
-vs. computed at query time? The boundary is the pipeline structure.
+**Status**: Storage-agnostic — the trade-off is the same under eager B-tree, deferred
+B-tree, and LSM. Key question: what exactly is stored in each MI vs. computed at query
+time? The boundary is the pipeline structure (and is decided independently from the
+storage choice — see Q6).
 
 ---
 
 ## Q5: "No Final View" Savings Quantified
 
-**Question**: How much write amplification does eliminating the final view maintenance save?
+**Question**: How much write amplification does eliminating the final-view maintenance
+save? This is the "one fewer join" claim measured in writes-per-update.
 
 **For Q3-OL** at SF=1:
-- Final query result: ~1000 rows (top revenue groups by custkey)
-- If final view were maintained: every LINEITEM insert would trigger a cascade that eventually
-  writes to the final view → O(1) final view update per insert (if aggregated) or more
-- With merged index: no write to final view. Query scans the outer MI at query time.
+- Final query result: ~1000 rows (top revenue groups by custkey).
+- If the final view were materialized: every LINEITEM insert would cascade to a final
+  view update. Even when the final pipeline is aggregating (so each insert touches O(1)
+  groups), the cost is still one extra random write per update on the critical path.
+- With a merged index: no write to the final view. The query at runtime scans the
+  outer MI and applies the final aggregation in pass.
 
-**Write amplification comparison** for one LINEITEM insert:
+**Write amplification** for one LINEITEM insert:
 | Approach | Writes |
 |----------|--------|
-| Traditional IVM (fully materialized) | δLINEITEM table + δinner_view table + δfinal_view table = 3 writes |
-| Merged index (no final view) | 1 write to inner MI + 1 write to outer MI = 2 writes |
+| Traditional IVM (fully materialized) | δLINEITEM + δinner_view + δfinal_view = 3 writes |
+| Merged index (one fewer join) | 1 inner MI + 1 outer MI = 2 writes |
 | Traditional index (no materialization) | 0 maintenance writes, but full query recomputation each time |
 
-The merged index sits between the two extremes. The "one-order less" reduction is concrete:
-exactly one fewer cascade level = one fewer write per update on the critical path.
+The merged index sits between the two extremes. The "one-order-less" reduction is
+exactly one fewer cascade level on the critical write path per update.
 
-**Status**: Easily quantified analytically. Good paper table.
+**Q9 generalization**: Q9 has 5 pipeline levels. A fully materialized version would
+write to 6 stores (5 intermediate + 1 final view); the merged-index version writes to 5
+(no final view). Savings = 1 write per update regardless of nesting depth — the saving
+is constant, not multiplicative.
 
----
-
-## Q6: Batch Update and LSM-Tree Connection
-
-**Question**: For bulk inserts/deletes (batch updates), does the merged index's sequential
-access pattern provide additional advantage?
-
-**Claim**: If `m` delta rows arrive at keys `k1 < k2 < ... < km` (sorted), the maintenance
-plan becomes one sequential scan over the merged index covering the range `[k1, km]`,
-interleaved with the delta rows. All `m` updates are handled in one pass.
-
-Traditional IVM with hash-based intermediate views requires `m` random lookups (one per
-delta row into each materialized view), regardless of whether the deltas are sorted.
-
-**LSM-tree connection**: LSM compaction is structurally equivalent to batch merged index
-maintenance. When the LSM tree merges a sorted delta run (L0) into the main sorted store
-(L1), it is executing exactly the maintenance plan: for each new record, scan the key range
-in L1, assemble with matching records, write the merged result. The LSM compaction
-algorithm IS the batch maintenance algorithm.
-
-This means the merged index's maintenance cost model aligns with LSM compaction cost models
-from the storage engine literature — a well-studied area with known I/O bounds.
-
-**Status**: Conceptual connection, worth a paragraph in the paper. Does not require
-implementation to make the point.
+**Status**: Easily quantified analytically. Direct paper table.
 
 ---
 
-## Summary: What's Analytically Tractable vs. Needs Benchmarking
+## Q6: LSM Tiered Storage and Read-Induced Compaction
+
+**Question**: When does LSM beat eager B-tree as the storage backend for a merged
+index, and what is the cost model?
+
+**LSM run-based propagation** (from framing § LSM-tree Execution): records that have
+not yet been joined sit in a run that does not include their would-be join partners.
+Whether two records have "met" is exactly whether they are in the same run. There is no
+explicit propagation tag — run identity carries the information.
+
+**Compaction is the maintenance step**: when runs at level Li are compacted into Li+1,
+the merge process produces the joined pipeline output for any unjoined records that now
+land in the same destination run. Compaction cost is the standard tiered LSM cost
+(sequential scan over both inputs), and merged-index maintenance is a free side effect
+of that compaction.
+
+**Read-induced compaction** is the bottleneck. When a query needs the joined records
+over a key range and those records currently reside at different levels, the system
+must compact that range across all levels down to the deepest one before answering the
+query. This is *not* a normal LSM compaction (it is range-bounded, cross-level, and
+read-triggered), and it touches at least one run per level — an inefficient pattern
+relative to background compaction.
+
+**LSM vs B-tree per-pipeline choice**: the framing section already states that storage
+can be picked independently per pipeline. The crossover is roughly:
+
+- **LSM wins** when (a) updates dominate queries, so most propagation happens at cheap
+  background compaction time, and (b) the query's filter aligns with the merged
+  index's sort key, bounding read-induced compaction to a small range.
+- **B-tree wins** when queries are frequent or the filter does not bound the scan
+  range — read-induced compaction across the full key space dominates.
+
+In the same query plan, an outer pipeline may use B-tree (because the final filter
+narrows the key range) while a deeper pipeline uses LSM (because the inner key has no
+useful query-time filter and updates dominate).
+
+**Open technical question** (from framing): does RocksDB compact at read time, or does
+it only read from different levels and return uncompacted results? If the latter, the
+system needs an explicit mechanism to force a range-bounded compaction at query time —
+this is non-trivial to implement on top of stock RocksDB and may require a custom
+compaction interface.
+
+**Status**: The cost model is sketchable from standard LSM literature; the open
+RocksDB question requires hands-on investigation. The per-pipeline storage choice is
+new territory and a worthwhile design contribution in its own right.
+
+---
+
+## Summary: What's Analytically Tractable vs. Needs Investigation
 
 | Question | Method | Priority |
 |----------|--------|----------|
-| Q1: Per-update page count | Formula from TPC-H stats | High — core claim |
-| Q2: Delta amplification factor | Schema analysis (PK/FK) | High — 1-to-1 claim |
-| Q3: Nested cascade cost | Explicit trace for Q3-OL, Q9 | High — novelty of nested MIs |
-| Q4: Aggregation trade-off | Formalize boundary condition | Medium — nuanced |
-| Q5: No-final-view savings | Count writes per level | Medium — easy table |
-| Q6: LSM connection | Conceptual argument | Medium — positions work in literature |
+| Q1: Per-update page count (eager B-tree) | Formula from TPC-H stats | High — core claim |
+| Q2: Join fanout per update | Schema analysis (PK/FK) | High — quantifies "one fewer join" |
+| Q3: Nested cascade & intermediate-data growth | Trace Q3-OL, Q9 with SF=1 stats | High — addresses open intermediate-size question |
+| Q4: Aggregation re-scan trade-off | Formalize boundary condition | Medium — storage-agnostic |
+| Q5: No-final-view savings (writes per update) | Count writes per level | Medium — direct paper table |
+| Q6: LSM tiered + read-induced compaction | Cost model + RocksDB investigation | Medium-High — per-pipeline storage is novel |
 
-Q1–Q3 are sufficient to make the efficiency argument for the paper. Q4–Q6 add depth.
+Q1–Q3 form the core efficiency argument: per-update I/O is O(1), join fanout = 1 under
+FK→PK, and intermediate data size remains additive in nested chains. Q4–Q5 quantify the
+constant-factor wins. Q6 positions the work in storage-engine literature and introduces
+the per-pipeline storage choice as a design point.
