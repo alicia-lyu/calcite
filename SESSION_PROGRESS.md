@@ -239,6 +239,14 @@ full design. Key production classes:
   widened to `Sort.class`; `onMatch` preserves LIMIT by wrapping MIScan in
   `EnumerableLimitSort`. Q3-OL plan now shows `EnumerableLimitSort(fetch=[10])` over
   assembled join — physical sort eliminated, LIMIT preserved.
+- **Filter hoisting above boundary sorts**: `hoistFiltersAboveBoundaries()` in
+  `MergedIndexTestUtil` walks the plan tree and peels off `EnumerableFilter` nodes that
+  are the direct (possibly chained) input of a boundary Sort, stacking them above the
+  Sort. Ensures merged indexes store unfiltered data and remain reusable across queries
+  with different predicates. **Limitation**: filters nested deeper (below Project /
+  SortedAggregate) reference wide-row `RexInputRef` indices that become invalid above the
+  narrower Sort output — only direct-input filters are safe to hoist. Applied to Q12,
+  Q3-OL, Q9. All 7 tests pass.
 
 ---
 
@@ -246,22 +254,17 @@ full design. Key production classes:
 
 ### Short-term (next session)
 
-1. **Treat `LimitSort` as pipeline boundary**: Currently only `EnumerableSort` is
-   recognized as a pipeline boundary. `EnumerableLimitSort` (ORDER BY + LIMIT) should
-   also split pipelines — it imposes a sort order that a merged index can satisfy.
-   Affects `Pipeline.buildTree()` and `PipelineToMergedIndexScanRule`.
+1. ✓ **Treat `LimitSort` as pipeline boundary** — DONE (2026-04-04).
+   `Pipeline.isBoundarySort()` and `PipelineToMergedIndexScanRule` operand accept
+   `EnumerableLimitSort`. LIMIT is preserved in root query plan.
 
-2. **Omit projections in colored DOT output**: `EnumerableProject` nodes add visual
-   clutter without conveying pipeline structure. Amend the DOT generation method to
-   skip projection operators, connecting their inputs directly to their parents.
+2. ✓ **Omit projections in colored DOT output** — DONE (2026-04-04).
+   `skipTransparent()` removes `EnumerableProject` clutter from visualizations.
 
-3. **Hoist variable-predicate filters to root query plan**: Filters with variable
-   predicates (e.g., `l_shipdate < ?`, `c_mktsegment = 'BUILDING'`) should NOT be
-   absorbed into merged indexes — doing so makes the index unusable for other queries
-   with different predicate values. Move such filters above the pipeline boundary so
-   they appear only in the root query plan. Ensure the columns needed for predicate
-   evaluation are projected through (add projection operators if the pipeline output
-   would otherwise drop them).
+3. ✓ **Hoist variable-predicate filters to root query plan** — DONE (2026-04-04).
+   `hoistFiltersAboveBoundaries()` removes direct-input filters from merged indexes to
+   ensure reusability across queries with different predicates. Limitation: nested filters
+   (below Project / SortedAggregate) cannot be hoisted (invalid `RexInputRef` indices).
 
 4. **Additional TPC-H queries** (Q5, Q7, Q10): add to `MergedIndexTpchPlanTest`. Each
    exercises different operator combinations (multi-way join, date range filter,
