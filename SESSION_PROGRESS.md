@@ -243,12 +243,26 @@ full design. Key production classes:
   `MergedIndexTestUtil` walks the plan tree and peels off `EnumerableFilter` nodes that
   are the direct (possibly chained) input of a boundary Sort, stacking them above the
   Sort. Ensures merged indexes store unfiltered data and remain reusable across queries
-  with different predicates. **Limitation**: filters nested deeper (below Project /
-  SortedAggregate) reference wide-row `RexInputRef` indices that become invalid above the
-  narrower Sort output — only direct-input filters are safe to hoist. Applied to Q12,
-  Q3-OL, Q9. All 7 tests pass.
+  with different predicates. Applied to Q12, Q3-OL, Q9. All 7 tests pass.
 
 ### 2026-04-07
+
+- **Widen-then-narrow filter hoisting pre-pass**: `hoistFiltersAboveBoundaries()` now
+  handles filters nested below Project/Aggregate by a two-stage approach:
+  - **Widen pass**: `widenProjectsForFilters()` walks post-order; for each Project on a
+    filter's ancestor path, appends `RexInputRef` projections for filter columns the
+    Project would otherwise drop, preserving field indices.
+  - **Commute**: filters propagate upward through widened Projects/Aggregates.
+  - **Narrow** (optional): if root node's row type changed due to widening, narrow back to
+    original type using a final `Project`.
+  New helpers: `collectInputRefIndices`, `shiftRightSideRefs`, `WidenResult`.
+- **Join handling**: when widening a Project above a filter with right-side refs, shift
+  indices by the delta (widened-left count minus original-left count).
+- **Aggregate/SetOp**: don't propagate `needed` upward — widening stops at these operators.
+- **Q9 outcome**: `p_name LIKE '%green%'` filter now sits directly between Aggregate and
+  top boundary Sort. P5 indexed view is filter-free, predicate-agnostic, reusable across
+  LIKE variants.
+- **Pipeline counts unchanged**: Q12 and Q3-OL unaffected by widen-then-narrow logic.
 
 - **LimitSort split refactor**: `MergedIndexTestUtil.splitLimitSorts()` rewrites every
   `EnumerableLimitSort` in Phase 1 plan as `EnumerableLimit(EnumerableSort(...))` before
@@ -288,3 +302,5 @@ Each confirms pipeline discovery generalizes beyond Q9 (6-table, 5 nested joins)
 - Window functions, DISTINCT, set operators in sort-based pipelines.
 - Functional dependency-based index matching (FD: `o_orderkey → o_custkey` enabling
   3-table merged index without manual key chain).
+- Sort direction alignment: injected sorts always use ASC; use query ORDER BY/GROUP BY to
+  determine preferred direction upfront to avoid re-sorts.

@@ -459,6 +459,38 @@ WHERE) so that `splitJoinCondition` can extract equi-join keys from each join no
 applying `PipelineToMergedIndexScanRule` to an already-physical plan. Volcano cannot
 build a complete optimal plan from a single transformation rule.
 
+### Filter Hoisting: Widen-Then-Narrow Technique
+
+Predicates nested below Projects or SortedAggregates reference wide row types (all upstream
+output columns). Direct hoisting above the boundary Sort invalidates these references.
+**Solution**: a pre-pass that widens intermediate Projects to preserve filter field indices,
+then hoists the filter, then optionally narrows the root if the row type changed.
+
+**Three-stage algorithm** (`hoistFiltersAboveBoundaries` in `MergedIndexTestUtil`):
+
+1. **Widen pass** (`widenProjectsForFilters`):
+   - Post-order walk: for each Project on an ancestor path of a filter, collect field indices
+     that the filter references but the Project would drop.
+   - Append `RexInputRef` projections for those indices, preserving field positions.
+   - **Join handling**: if a Project feeds a filter with right-side refs, shift indices by
+     `(widened_left_count - original_left_count)`.
+   - **Aggregate/SetOp**: do NOT propagate `needed` upward — widening stops at these operators
+     (their output cardinality / structure differs from input).
+
+2. **Commute**: `Filter.passThroughTraits()` and project/aggregate rewrite rules allow filters
+   to bubble upward through widened operators.
+
+3. **Narrow** (optional): if the root node's row type changed (widening added columns), wrap
+   in a final `Project` that selects only the original columns, restoring the output type.
+
+**Outcome for Q9**: `p_name LIKE '%green%'` filter sits directly between SortedAggregate and
+the top boundary Sort. The P5 indexed view is filter-free and reusable across queries with
+different PART predicates (e.g., `LIKE '%red%'`).
+
+**Pipeline discovery**: filter hoisting does NOT change pipeline boundaries. Boundary Sorts are
+defined structurally by their position in the plan tree. Filters moved above a boundary Sort
+are orthogonal to pipeline source matching.
+
 ### Future work: Sort-based operator enhancements
 
 Current `injectSortsBeforeSortBasedOps` always creates ASC sorts. Future improvements:
