@@ -1589,7 +1589,7 @@ class MergedIndexTpchPlanTest {
     final String label = nodeLabel(node, firstLine);
     final String color = nodeColor(node);
     sb.append("  n").append(id)
-        .append(" [label=\"").append(label).append("\\n#").append(id).append("\"")
+        .append(" [label=\"").append(label).append("\"")
         .append(", style=filled, fillcolor=\"").append(color).append("\"")
         .append("];\n");
     final List<RelNode> inputs = node.getInputs();
