@@ -16,6 +16,7 @@
  */
 package org.apache.calcite.test;
 
+import org.apache.calcite.adapter.enumerable.EnumerableConvention;
 import org.apache.calcite.adapter.enumerable.EnumerableFilter;
 import org.apache.calcite.adapter.enumerable.EnumerableLimit;
 import org.apache.calcite.adapter.enumerable.EnumerableLimitSort;
@@ -31,17 +32,23 @@ import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Aggregate;
+import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Join;
+import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.core.SetOp;
 import org.apache.calcite.rel.core.Sort;
+import org.apache.calcite.rel.logical.LogicalFilter;
+import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.logical.LogicalSort;
-import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexShuttle;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 
@@ -253,10 +260,8 @@ public final class MergedIndexTestUtil {
   private static WidenResult widenProjectsForFilters(RelNode node) {
 
     // ── Filter ────────────────────────────────────────────────────────────
-    if (node instanceof EnumerableFilter || (node instanceof org.apache.calcite.rel.core.Filter
-        && !(node instanceof EnumerableFilter))) {
-      final org.apache.calcite.rel.core.Filter filter =
-          (org.apache.calcite.rel.core.Filter) node;
+    if (node instanceof Filter) {
+      final Filter filter = (Filter) node;
       final WidenResult inner = widenProjectsForFilters(filter.getInput());
       // Widening only appends at the tail, so condition indices remain valid.
       final RelNode newFilter = filter.copy(filter.getTraitSet(),
@@ -316,7 +321,7 @@ public final class MergedIndexTestUtil {
         b.add("$f" + i, appended.getType());
       }
       final RelDataType newRowType = b.build();
-      final RelNode newProject = EnumerableProject.create(newIn, newProjs, newRowType);
+      final RelNode newProject = createProject(newIn, newProjs, newRowType);
       return new WidenResult(newProject, neededAbove);
     }
 
@@ -443,7 +448,7 @@ public final class MergedIndexTestUtil {
         narrowProjs.add(
             new RexInputRef(i, originalRowType.getFieldList().get(i).getType()));
       }
-      return EnumerableProject.create(hoisted, narrowProjs, originalRowType);
+      return createProject(hoisted, narrowProjs, originalRowType);
     }
     return hoisted;
   }
@@ -524,7 +529,7 @@ public final class MergedIndexTestUtil {
     RelNode result = rebuilt;
     // Stack outermost-first: last lifted condition becomes the outermost filter.
     for (int i = liftedConditions.size() - 1; i >= 0; i--) {
-      result = EnumerableFilter.create(result, liftedConditions.get(i));
+      result = createFilter(result, liftedConditions.get(i));
     }
     return result;
   }
@@ -537,8 +542,8 @@ public final class MergedIndexTestUtil {
    */
   private static RelNode peelFilters(RelNode node, List<RexNode> conditions) {
     RelNode current = node;
-    while (current instanceof EnumerableFilter) {
-      final EnumerableFilter filter = (EnumerableFilter) current;
+    while (current instanceof Filter) {
+      final Filter filter = (Filter) current;
       conditions.add(filter.getCondition());
       current = filter.getInput();
     }
@@ -623,6 +628,32 @@ public final class MergedIndexTestUtil {
     // Join commutation requires careful left/right offset tracking;
     // Aggregate and SetOp change column structure entirely.
     return Optional.empty();
+  }
+
+  // ── Convention-aware node factories ─────────────────────────────────────
+
+  /**
+   * Creates a Filter node using the appropriate convention:
+   * {@link EnumerableFilter} for physical plans, {@link LogicalFilter} for logical.
+   */
+  private static RelNode createFilter(RelNode input, RexNode condition) {
+    if (input.getConvention() instanceof EnumerableConvention) {
+      return EnumerableFilter.create(input, condition);
+    }
+    return LogicalFilter.create(input, condition);
+  }
+
+  /**
+   * Creates a Project node using the appropriate convention:
+   * {@link EnumerableProject} for physical plans, {@link LogicalProject} for logical.
+   */
+  private static RelNode createProject(RelNode input, List<RexNode> projects,
+      RelDataType rowType) {
+    if (input.getConvention() instanceof EnumerableConvention) {
+      return EnumerableProject.create(input, projects, rowType);
+    }
+    return LogicalProject.create(input, ImmutableList.of(), projects, rowType,
+        ImmutableSet.of());
   }
 
   // ── LimitSort splitting ──────────────────────────────────────────────────

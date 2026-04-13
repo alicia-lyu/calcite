@@ -174,8 +174,11 @@ class MergedIndexTpchPlanTest {
     final SqlNode validated = planner.validate(parsed);
     final RelRoot root = planner.rel(validated);
 
-    final RelNode logicalWithSorts =
+    final RelNode injected =
         MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
+    // Hoist filters on the logical plan so maintenance plans are filter-free.
+    final RelNode logicalWithSorts =
+        MergedIndexTestUtil.hoistFiltersAboveBoundaries(injected);
 
     final RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
@@ -183,8 +186,7 @@ class MergedIndexTpchPlanTest {
     // ── Phase 1: logical → physical pipeline ──────────────────────────────
     final RelNode phase1Plan =
         MergedIndexTestUtil.splitLimitSorts(
-            MergedIndexTestUtil.hoistFiltersAboveBoundaries(
-                planner.transform(0, desiredTraits, logicalWithSorts)));
+            planner.transform(0, desiredTraits, logicalWithSorts));
 
     // ── Discover pipelines (before writing DOT so clusters can be annotated) ─
     final Pipeline rootPipeline = Pipeline.buildTree(phase1Plan);
@@ -425,8 +427,11 @@ class MergedIndexTpchPlanTest {
     final SqlNode validated = planner.validate(parsed);
     final RelRoot root = planner.rel(validated);
 
-    final RelNode logicalWithSorts =
+    final RelNode injected =
         MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
+    // Hoist filters on the logical plan so maintenance plans are filter-free.
+    final RelNode logicalWithSorts =
+        MergedIndexTestUtil.hoistFiltersAboveBoundaries(injected);
 
     final RelTraitSet desiredTraits =
         root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
@@ -434,8 +439,7 @@ class MergedIndexTpchPlanTest {
     // ── Phase 1: logical → physical pipeline ──────────────────────────────
     final RelNode phase1Plan =
         MergedIndexTestUtil.splitLimitSorts(
-            MergedIndexTestUtil.hoistFiltersAboveBoundaries(
-                planner.transform(0, desiredTraits, logicalWithSorts)));
+            planner.transform(0, desiredTraits, logicalWithSorts));
 
     // ── Discover all interesting-ordering pipelines (bottom-up) ──────────
     // buildPipelineTree walks top-down, cutting at Sort boundaries.
@@ -765,7 +769,10 @@ class MergedIndexTpchPlanTest {
     // Propagate ORDER BY (n_name ASC, o_year DESC) direction to the
     // pre-aggregate GROUP BY sort (n_name ASC, o_year ASC → DESC),
     // then drop the now-redundant ORDER BY sort.
-    final RelNode logicalWithSorts = propagateOrderByDirection(injected);
+    // Hoist filters on the logical plan so maintenance plans are filter-free.
+    final RelNode logicalWithSorts =
+        MergedIndexTestUtil.hoistFiltersAboveBoundaries(
+            propagateOrderByDirection(injected));
 
     // Strip the ORDER BY collation from desired traits: propagateOrderByDirection
     // already removed the ORDER BY Sort node, so Volcano should not require that
@@ -778,8 +785,7 @@ class MergedIndexTpchPlanTest {
     // ── Phase 1: logical → physical pipeline ──────────────────────────────
     final RelNode phase1Plan =
         MergedIndexTestUtil.splitLimitSorts(
-            MergedIndexTestUtil.hoistFiltersAboveBoundaries(
-                planner.transform(0, desiredTraits, logicalWithSorts)));
+            planner.transform(0, desiredTraits, logicalWithSorts));
 
     // Discover all 5 join pipelines bottom-up (inner first) and register nested MergedIndexes.
     final Pipeline rootPipeline = Pipeline.buildTree(phase1Plan);
