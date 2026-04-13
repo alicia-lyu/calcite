@@ -275,6 +275,19 @@ full design. Key production classes:
   boundary not in the logical plan, unmatched non-root pipelines fall back to stripped
   logical root (LimitSort unwrapped) for IVM maintenance plan derivation.
 
+### 2026-04-13
+
+- **Filter hoisting moved to logical plan (pre-Volcano)**: `hoistFiltersAboveBoundaries()`
+  now applied before `planner.transform()` in all TPC-H tests (Q12, Q3-OL, Q9).
+  Filters lifted to root pipeline level via widen-then-narrow pass before phase 1.
+- **Convention-agnostic helpers**: `MergedIndexTestUtil` refactored to use abstract
+  `Filter`/`Project` instead of enumerable variants. Factory methods `createFilter()` and
+  `createProject()` create logical-plan versions.
+- **Maintenance plan auto-optimization**: filters now end up in root pipeline (no
+  maintenance plan). Child pipelines' index creation plans are filter-free and
+  predicate-reusable (Q9: P5 indexed view on n_name, o_year without PART filter).
+- **All TPC-H tests pass**: Q12, Q3-OL, Q9 fully verified.
+
 ---
 
 ## Next Steps
