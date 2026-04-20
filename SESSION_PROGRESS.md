@@ -18,6 +18,7 @@
 | `core/.../adapter/enumerable/PipelineOutputScanRule.java` (NEW)         | Done ✓ |
 | `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
 | `core/.../materialize/MaintenancePlanConverter.java` (NEW)              | Done ✓  |
+| `testkit/.../test/SingleMIPipelineIdentifier.java` (NEW, Step A done)    | Done ✓  |
 | TPC-H Q3 (deleted — incorrect CUSTOMER+ORDERS example)                  | Removed |
 | TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓  |
 | TPC-H Q3-OL full 3-table substitution — `tpchQ3OrdersLineitem()`        | Done ✓  |
@@ -204,6 +205,45 @@ full design. Key production classes:
 
 ---
 
+## SingleMIPipelineIdentifier — Multi-Query Equivalence Detection (Step A: Complete)
+
+**File**: `testkit/src/main/java/org/apache/calcite/test/SingleMIPipelineIdentifier.java`
+**Commit**: `65d7dce00`
+
+### Algorithm Overview (5-stage pipeline)
+
+1. **`enumerateRequirements()`**: Scans all registered MergedIndexes and their logical maintenance roots to collect all `EnumerableSort` and `EnumerableSortedAggregate` operators with their sort keys. Tracks `(operator, collation)` pairs.
+
+2. **`buildEquivalenceClasses()`**: Groups sort-key columns across different operators using union-find. Two columns are equivalent if they appear in the same position across multiple pipelines (e.g., `orderkey` in pipeline 1 and `orderkey` in pipeline 2). Outputs equivalence class IDs and field mappings per operator.
+
+3. **`consolidate()`**: Checks that all operators using the same equivalence class agree on column count and direction. Detects conflicts (e.g., operator A uses `ASC`, operator B uses `DESC` for the same logical key) and throws `IllegalStateException`.
+
+4. **`findConsistentSubsets()`**: Enumerates all prefixes of each operator's equivalence class sequence and collects them in a subset graph. A subset is valid (add to graph) if all operators sharing that subset agree on its prefix. Ensures prefix-chain integrity for compound-key matching.
+
+5. **`rankByFrequency()`**: Scores each discovered subset by operator count (frequency) and global consistency score (how many operators agree on a full prefix chain). Higher scores indicate wider applicability across pipelines.
+
+### Design Principles
+
+- **Uniform treatment of all sort-based operators**: No special case for `EnumerableMergeJoin`; joins are recognized by their `passThroughTraits()` collation output, not by operator type.
+- **Column equivalence via union-find**: Named columns with identical names in different pipelines are automatically equivalent; structural position is a secondary tie-breaker.
+- **Prefix-chain consistency check**: Candidate subsets are only valid if they form a contiguous prefix sequence that all operators agree on. Prevents false matches for compound keys with misaligned column order.
+- **Compound-key reordering support**: Detects when `(A, B)` and `(B, A)` collations exist; marks them as distinct equivalence classes if they are not semantically equivalent (direction or position matters).
+
+### Output
+
+Returns a ranked list of `MIPipelineCandidate` objects, each describing:
+- `logicalColumns`: the logical column equivalence class IDs (e.g., `[C1, C2]`)
+- `operators`: the set of `EnumerableSortedAggregate` and `EnumerableMergeJoin` nodes that agree on this key
+- `frequency`: count of operators sharing this key
+- `score`: consistency score (higher = better for multi-operator reuse)
+
+### Integration
+
+- Used by test infrastructure to validate that `SingleMIPipeline` candidates are correctly identified.
+- Can be extended to drive automated multi-query optimization (materialization of frequently co-occurring sort keys).
+
+---
+
 ## What Was Done
 
 ### 2026-03-10 to 2026-03-25
@@ -292,28 +332,35 @@ full design. Key production classes:
 
 ## Next Steps
 
-### Short-term (next session)
+### Short-term (next session) — Step B: Test Coverage
 
-**Additional TPC-H queries** (Q5, Q7, Q10) — add to `MergedIndexTpchPlanTest`:
-- `tpchQ5()`: multi-way join, GROUP BY multiple columns, HAVING predicate.
-- `tpchQ7()`: two independent join chains merged at final aggregation.
-- `tpchQ10()`: nested aggregations, ORDER BY after GROUP BY.
+**[CURRENT]** `SingleMIPipelineIdentifier` test suite in `testkit/.../SingleMIPipelineIdentifierTest.java`:
+- `testEnumerateRequirements()`: verify operator/collation collection for 2-query scenarios.
+- `testBuildEquivalenceClasses()`: confirm union-find merges columns correctly (same name, same position).
+- `testConsolidateDetectsConflict()`: ASC vs. DESC mismatch raises `IllegalStateException`.
+- `testFindConsistentSubsets()`: enumerate all valid prefix chains, validate prefix integrity.
+- `testRankByFrequency()`: score candidates, verify high-frequency keys rank first.
+- **Integration**: apply to Q12 + Q3-OL (shared orderkey), Q9 + Q5 (shared nationkey), confirm candidate discovery.
 
-Each confirms pipeline discovery generalizes beyond Q9 (6-table, 5 nested joins).
+**Concrete goal**: Verify that `SingleMIPipelineIdentifier` correctly identifies mergeable sort keys across registered MergedIndexes without false positives.
 
 ### Medium-term
 
-- **End-to-end execution prototype with LeanStore**: see `CALCITE_LEANSTORE_INTEGRATION.md`
-  for full 8-milestone plan. M1–M2 (Calcite plan serialization to JSON/protobuf) and
-  M3–M5 (hard-coded Q12/Q3-OL execution in C++) can proceed in parallel.
-- **Maintenance efficiency analysis**: see `RESEARCH_QUESTIONS.md`. Q1–Q3 (1-to-1 update
-  cost, cascade depth, space overhead) are analytically tractable from existing plans
-  without new implementation.
+**Multi-query merged index materialization** — extend `PipelineToMergedIndexScanRule`:
+- Accept `SingleMIPipelineCandidate` from identifier.
+- Create shared merged index storing (A, B, C) interleaved by common key (instead of separate indexes).
+- Update both Q12 and Q3-OL to use the shared index where applicable.
+- Measure space savings and plan simplification.
+
+**Execution & integration** — see `CALCITE_LEANSTORE_INTEGRATION.md` (M1–M5):
+- Plan serialization (JSON/protobuf) for LeanStore export.
+- Hard-coded Q12/Q3-OL execution prototype in C++.
+
+**Maintenance efficiency analysis** — see `RESEARCH_QUESTIONS.md`:
+- Q1–Q3 (1-to-1 update cost, cascade depth, space overhead) analytically tractable.
 
 ### Long-term
 
 - Window functions, DISTINCT, set operators in sort-based pipelines.
-- Functional dependency-based index matching (FD: `o_orderkey → o_custkey` enabling
-  3-table merged index without manual key chain).
-- Sort direction alignment: injected sorts always use ASC; use query ORDER BY/GROUP BY to
-  determine preferred direction upfront to avoid re-sorts.
+- Functional dependency-based index matching (FD: `o_orderkey → o_custkey`).
+- Sort direction alignment: use query ORDER BY/GROUP BY to determine preferred direction at planning time.
