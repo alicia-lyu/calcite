@@ -288,15 +288,20 @@ public final class SingleMIPipelineIdentifier {
             break outer;
           }
           // If longer is reorderable, try reordering it so shorter is a prefix.
+          // Keep the original longer collation as a separate option — it may
+          // enable different cross-table candidates than the reordered version.
           if (longer.reorderable) {
             final List<Integer> reordered =
                 tryReorderAsPrefixed(shorter.fieldIndices(),
                     longer.fieldIndices());
             if (reordered != null) {
-              working.set(j, new SortRequirement(
+              // Add the reordered version as a new option.
+              working.add(new SortRequirement(
                   longer.table, collationOf(reordered),
                   longer.operator, longer.reorderable));
+              // Remove the shorter (subsumed by the reordered version).
               working.remove(i);
+              // The original longer stays in the list.
               changed = true;
               break outer;
             }
