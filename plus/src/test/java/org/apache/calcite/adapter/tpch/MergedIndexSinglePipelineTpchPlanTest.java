@@ -234,24 +234,27 @@ public class MergedIndexSinglePipelineTpchPlanTest {
   /**
    * TPC-H Q9: six-table join with five distinct equi-join conditions.
    *
-   * <p>Actual candidates produced by the identifier (verified by running):
+   * <p>Full candidate list produced by the identifier (verified by running):
    * <ul>
-   *   <li>{@code ORDERS([0]) + LINEITEM([0])} — orderkey</li>
-   *   <li>{@code PART([0]) + PARTSUPP([0],[1])} — partkey as prefix of
-   *       PARTSUPP's compound key (partkey,suppkey); LINEITEM is the
-   *       intermediary but PART shares the {@code partkey} equivalence class
-   *       with LINEITEM, so PART is the direct join partner of PARTSUPP here</li>
-   *   <li>{@code LINEITEM([2],[1]) + SUPPLIER([0])} — (suppkey, ...) prefix</li>
-   *   <li>{@code SUPPLIER([3]) + NATION([0])} — nationkey</li>
+   *   <li>3-table: {@code LINEITEM([1],[2]) + PART([0]) + PARTSUPP([0],[1])}
+   *       — PART's partkey ([0]) is a prefix of both LINEITEM's reordered
+   *       (partkey,suppkey) and PARTSUPP's compound key (partkey,suppkey).</li>
+   *   <li>2-table: {@code ORDERS([0]) + LINEITEM([0])} — orderkey</li>
+   *   <li>2-table: {@code LINEITEM([1],[2]) + PART([0])} — partkey prefix</li>
+   *   <li>2-table: {@code LINEITEM([1],[2]) + PARTSUPP([0],[1])}
+   *       — (partkey,suppkey) match</li>
+   *   <li>2-table: {@code PART([0]) + PARTSUPP([0],[1])}
+   *       — partkey prefix of compound key</li>
+   *   <li>2-table: {@code LINEITEM([2],[1]) + SUPPLIER([0])}
+   *       — suppkey prefix of LINEITEM's (suppkey,partkey)</li>
+   *   <li>2-table: {@code SUPPLIER([3]) + NATION([0])} — nationkey</li>
    * </ul>
    *
-   * <p>Note: the identifier does NOT produce a LINEITEM+PARTSUPP candidate
-   * because the join condition {@code ps_partkey=l_partkey AND ps_suppkey=l_suppkey}
-   * makes LINEITEM's compound key ([2],[1]) = (partkey,suppkey), but when
-   * searching for prefix chains, PART+PARTSUPP is found first since PART's
-   * single-column partkey key is a strict prefix of PARTSUPP's (partkey,suppkey).
-   * LINEITEM has its own (partkey,suppkey) collation requirement but that
-   * forms a separate candidate with SUPPLIER via the suppkey prefix.
+   * <p>The top-ranked candidate is the 3-table {LINEITEM, PART, PARTSUPP}
+   * because PART's single-column partkey is a prefix of PARTSUPP's compound
+   * key (partkey, suppkey), and LINEITEM is reordered to (partkey, suppkey)
+   * to match. LINEITEM's original (suppkey, partkey) requirement also forms
+   * separate 2-table candidates with SUPPLIER.
    */
   @Test void testIdentifyQ9() throws Exception {
     final String sql = "SELECT n.n_name,"
@@ -278,10 +281,24 @@ public class MergedIndexSinglePipelineTpchPlanTest {
     assertThat("Q9 must produce at least one candidate",
         candidates.size(), greaterThanOrEqualTo(1));
 
+    // Top candidate must be the 3-table {LINEITEM, PART, PARTSUPP}.
+    assertThat("Q9 top candidate must cover 3 tables (LINEITEM+PART+PARTSUPP)",
+        candidates.get(0).tableCount(), is(3));
+
+    final boolean topHasLps = candidates.get(0).requirements.stream()
+        .anyMatch(r -> r.table.getQualifiedName().toString().contains("LINEITEM"))
+        && candidates.get(0).requirements.stream()
+            .anyMatch(r -> r.table.getQualifiedName().toString().contains("PART"))
+        && candidates.get(0).requirements.stream()
+            .anyMatch(r -> r.table.getQualifiedName().toString().contains("PARTSUPP"));
+    assertThat("Q9 top candidate must be LINEITEM+PART+PARTSUPP",
+        topHasLps, is(true));
+
     final List<Candidate> multiTable = candidates.stream()
         .filter(c -> c.tableCount() >= 2)
         .collect(Collectors.toList());
-    assertThat("Q9 must have at least 4 multi-table candidates",
+    assertThat("Q9 must have at least 4 multi-table candidates"
+        + " ({L,P,PS}, {L,O}, {L,S}, {S,N})",
         multiTable.size(), greaterThanOrEqualTo(4));
 
     // ORDERS + LINEITEM by orderkey.
@@ -293,17 +310,20 @@ public class MergedIndexSinglePipelineTpchPlanTest {
     assertThat("Q9 must have ORDERS+LINEITEM candidate",
         hasOrdersLineitem, is(true));
 
-    // PART + PARTSUPP by (partkey, suppkey): PART's partkey is a prefix of
-    // PARTSUPP's compound key (partkey, suppkey).
-    final boolean hasPartPartsupp = multiTable.stream().anyMatch(c ->
-        c.requirements.stream().anyMatch(r ->
+    // 3-table LINEITEM + PART + PARTSUPP: PART's partkey ([0]) is a prefix of
+    // PARTSUPP's compound (partkey, suppkey); LINEITEM is reordered to match.
+    final boolean hasLineitemPartPartsupp = multiTable.stream().anyMatch(c ->
+        c.tableCount() >= 3
+        && c.requirements.stream().anyMatch(r ->
+            r.table.getQualifiedName().toString().contains("LINEITEM"))
+        && c.requirements.stream().anyMatch(r ->
             r.table.getQualifiedName().toString().contains("PART"))
         && c.requirements.stream().anyMatch(r ->
             r.table.getQualifiedName().toString().contains("PARTSUPP")));
-    assertThat("Q9 must have PART+PARTSUPP candidate",
-        hasPartPartsupp, is(true));
+    assertThat("Q9 must have LINEITEM+PART+PARTSUPP as a 3-table candidate",
+        hasLineitemPartPartsupp, is(true));
 
-    // LINEITEM + SUPPLIER by suppkey prefix of LINEITEM's (partkey,suppkey).
+    // LINEITEM + SUPPLIER by suppkey prefix of LINEITEM's (suppkey,partkey).
     final boolean hasLineitemSupplier = multiTable.stream().anyMatch(c ->
         c.requirements.stream().anyMatch(r ->
             r.table.getQualifiedName().toString().contains("LINEITEM"))
