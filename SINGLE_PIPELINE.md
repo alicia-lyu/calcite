@@ -2,178 +2,161 @@
 
 ## Overview
 
-The VLDB revision experiments compare four storage structures on TPC-H:
+The VLDB experiments compare four storage structures on TPC-H:
 
 1. Traditional single-table indexes (B-trees, one per table)
 2. Materialized views (pre-computed join results)
 3. **Single merged index** — one MI covering the most I/O-dominant pipeline
 4. Clustered + hash index combination
 
-The existing Calcite tests demonstrate **multi-MI cascade**: every pipeline in the
-query gets its own merged index, collapsing the entire plan into a single
-`EnumerableMergedIndexScan`. That is the subject of the next paper.
+The existing Calcite tests in `MergedIndexTpchPlanTest` demonstrate **multi-MI
+cascade**: every pipeline in the query gets its own merged index, collapsing the
+entire plan into a single `EnumerableMergedIndexScan`. That is the subject of the
+next paper.
 
-The **single-MI** approach is the focus of the current paper (matching the geo
-benchmark): pick exactly ONE pipeline, build ONE merged index for it, and leave all
-remaining joins as regular query-time operators. This document analyzes which
-pipeline to pick for each TPC-H query and what the resulting plan looks like.
+The **single-MI** approach is the focus of the current paper: pick exactly ONE
+pipeline, build ONE merged index for it, and leave all remaining joins as regular
+query-time operators.
 
-**Selection criterion**: maximize I/O reduction with one MI. For TPC-H, LINEITEM is
-the largest table (SF×6M rows) and the ORDERS ⋈ LINEITEM join on `o_orderkey =
-l_orderkey` dominates I/O in every query that touches both tables. This makes
-`MI(ORDERS, LINEITEM)` by `orderkey` the obvious single-MI choice for all Tier 1
-queries.
+### Key framing: candidates are conceptual
+
+MI candidates are defined by **tables and sort key**, not by plan shape. Any set
+of tables whose join/aggregation operations require compatible sort orders can be
+stored in one merged index. This is independent of how many pipelines the current
+Volcano plan happens to produce. Two candidates may overlap (share tables). The
+experimental evaluation determines which candidate yields the best trade-off.
+
+The test file `MergedIndexSinglePipelineTpchPlanTest` selects a pipeline by
+matching the set of leaf table qualified names — NOT by pipeline index — making
+the selection robust to planner changes.
 
 ---
 
-## Per-Query Analysis
+## Candidate MIs per Query
 
-### Q12 — Shipping Mode / Order Priority (2 tables)
+### Q12 — Shipping Mode / Order Priority (ORDERS, LINEITEM)
 
 | Field | Content |
 |-------|---------|
-| Selected pipeline | ORDERS ⋈ LINEITEM on `o_orderkey = l_orderkey` |
-| MI composition | `MergedIndex(ORDERS, LINEITEM)` by `orderkey` |
-| What MI absorbs | The join itself; both table scans; pre-sorting on orderkey |
+| Candidate | MI(ORDERS, LINEITEM) by `o_orderkey` |
+| What MI absorbs | O-L join; both table scans; pre-sort on orderkey |
 | What remains at query time | `EnumerableFilter` (shipmode + date), `EnumerableSortedAggregate` (GROUP BY shipmode) |
-| Why this pipeline | Q12 has only two tables — this is the only pipeline |
-| Calcite evidence | `tpchQ12`, single HEP pass (multi-MI = single-MI for 2-table query) |
-| Status | Plan produced; DOT files in `plus/test-dot-output/q12/` |
-
-**Query-time plan** (from `root-pipeline-query-plan.dot`):
-
-```
-EnumerableSortedAggregate(group=[shipmode], HIGH_LINE_COUNT, LOW_LINE_COUNT)
-  EnumerableFilter(shipmode IN ('MAIL','SHIP') AND date conditions)
-    EnumerableMergedIndexScan(MI[0], source=view([0]))
-```
-
-**Maintenance plan** (from `maintenance.dot`): `LogicalJoin(o_orderkey = l_orderkey)`
-over `LogicalPipelineOutputScan(ORDERS)` and `LogicalDelta(LINEITEM)` (plus symmetric
-delta), wrapped in `LogicalProject` for the pre-computed row shape.
-
-**Note**: For Q12, single-MI and multi-MI outputs are identical. No additional test
-variant is needed; `tpchQ12` already produces the target plan.
+| Re-sort needed | No — no further join after the MI |
+| Note | Q12 has only two tables; single-MI and multi-MI outputs are identical |
+| Calcite status | `tpchQ12` already produces this plan; no new test variant needed |
 
 ---
 
-### Q3 — Shipping Priority (3 tables: CUSTOMER, ORDERS, LINEITEM)
+### Q3 — Shipping Priority (CUSTOMER, ORDERS, LINEITEM)
+
+#### Candidate A: MI(ORDERS, LINEITEM) by `o_orderkey`
 
 | Field | Content |
 |-------|---------|
-| Selected pipeline | ORDERS ⋈ LINEITEM on `o_orderkey = l_orderkey` (inner/leaf pipeline) |
-| MI composition | `MergedIndex(ORDERS, LINEITEM)` by `orderkey` |
-| What MI absorbs | Inner join + both table scans + pre-sort on orderkey |
-| What remains at query time | Merge join with CUSTOMER on `o_custkey = c_custkey` (needs sort on custkey or hash join), `EnumerableSortedAggregate`, `ORDER BY revenue DESC LIMIT 10` |
-| Why this pipeline | LINEITEM+ORDERS dominate I/O; CUSTOMER is small (SF×150K rows) |
-| Calcite evidence | `tpchQ3OrdersLineitem`, after HEP pass 1 only (stop before pass 2) |
-| Status | Plan produced (pass 1 output); variant test not yet written |
+| What MI absorbs | Inner O-L join + both table scans + pre-sort on orderkey |
+| What remains at query time | Merge-join with CUSTOMER on `o_custkey = c_custkey`; SortedAggregate; ORDER BY revenue DESC LIMIT 10 |
+| Re-sort needed | Yes — MI output is ordered by orderkey; CUSTOMER join needs custkey order |
+| Re-sort alternative | Hash join for CUSTOMER avoids the re-sort if CUSTOMER fits in memory |
+| Calcite test | `tpchQ3OrdersLineitem` pass-1-only output; `tpchQ3OlMI` (placeholder) |
 
-**Single-MI query-time plan** (after pass 1 only):
+#### Candidate B: MI(CUSTOMER, ORDERS) by `o_custkey`
 
-```
-EnumerableLimit(10)
-  EnumerableSort(revenue DESC)
-    EnumerableSortedAggregate(group=[o_orderkey, o_custkey, o_shippriority], revenue)
-      EnumerableMergeJoin(o_custkey = c_custkey)
-        EnumerableMergedIndexScan(MI[0], source=ORDERS)   ← leaf MI scan
-        EnumerableMergedIndexScan(MI[0], source=LINEITEM)  ← leaf MI scan
-        [right] EnumerableSort(custkey)
-          EnumerableTableScan(CUSTOMER)
-```
+| Field | Content |
+|-------|---------|
+| What MI absorbs | C-O join + both table scans + pre-sort on custkey |
+| What remains at query time | Merge-join with LINEITEM on `o_orderkey = l_orderkey`; SortedAggregate; ORDER BY revenue DESC LIMIT 10 |
+| Re-sort needed | Yes — MI output is ordered by custkey; LINEITEM join needs orderkey order |
+| Calcite test | `tpchQ3CoMI` (placeholder) |
 
-**Re-sort question**: The MI output is ordered by `orderkey`. The CUSTOMER join needs
-`custkey` order. Options: (a) sort the MI output by custkey before the join — adds
-one sort at query time; (b) use hash join for CUSTOMER — avoids the sort but loses
-merge-join streaming. Document in per-query README.
-
-**Maintenance plan**: same as `maintenance-0.dot` from `tpchQ3OrdersLineitem` —
-`LogicalJoin(o_orderkey=l_orderkey)` with delta semantics, plus pre-aggregation on
-`orderkey` for the `L_REVENUE` sum.
+Note: a three-table MI(CUSTOMER, ORDERS, LINEITEM) requires a hierarchical key
+structure (`o_orderkey` structured as `(custkey, local_id)`) that TPC-H surrogate
+keys do not provide. Two separate two-table MIs are the correct model here.
 
 ---
 
-### Q9 — Product Type / Profit (6 tables: ORDERS, LINEITEM, PART, PARTSUPP, SUPPLIER, NATION)
+### Q9 — Product Type / Profit (ORDERS, LINEITEM, PART, PARTSUPP, SUPPLIER, NATION)
+
+#### Candidate A: MI(ORDERS, LINEITEM) by `o_orderkey`
 
 | Field | Content |
 |-------|---------|
-| Selected pipeline | ORDERS ⋈ LINEITEM on `o_orderkey = l_orderkey` (leaf/deepest pipeline) |
-| MI composition | `MergedIndex(ORDERS, LINEITEM)` by `orderkey` |
-| What MI absorbs | Leaf join + both table scans + pre-sort on orderkey |
-| What remains at query time | 4 additional joins: PART (partkey), PARTSUPP (partkey, suppkey), SUPPLIER (suppkey), NATION (nationkey); filter `p_name LIKE '%green%'`; aggregate; `ORDER BY n_name, o_year DESC` |
-| Why this pipeline | LINEITEM+ORDERS dominate I/O; remaining tables are much smaller |
-| Calcite evidence | `tpchQ9`, after HEP pass 1 only (leaf-5 pipeline; stop before passes 2–5) |
-| Status | Plan produced (pass 1 output); variant test not yet written |
+| What MI absorbs | O-L leaf join + both table scans; highest I/O savings (LINEITEM = SF×6M rows) |
+| What remains at query time | 4 joins: PART (partkey), PARTSUPP (partkey, suppkey), SUPPLIER (suppkey), NATION (nationkey) |
+| Re-sort needed | Yes — MI output ordered by orderkey; next join (PART) needs partkey order |
+| Re-sort alternative | Hash-join PART first using `p_name LIKE '%green%'` filter, then probe PARTSUPP hash table |
+| Calcite test | `tpchQ9` pass-1-only output; `tpchQ9OlMI` (placeholder) |
 
-**Single-MI query-time plan** (after pass 1 only, schematic):
+#### Candidate B: MI(LINEITEM, PARTSUPP) by `(l_partkey, l_suppkey)`
 
-```
-EnumerableAggregate(group=[n_name, o_year], SUM_PROFIT)
-  EnumerableFilter(p_name LIKE '%green%')
-    EnumerableMergeJoin(s_nationkey = n_nationkey)
-      EnumerableMergeJoin(l_suppkey = s_suppkey)
-        EnumerableMergeJoin(ps_partkey=l_partkey AND ps_suppkey=l_suppkey)
-          EnumerableMergeJoin(l_partkey = p_partkey)
-            EnumerableMergedIndexScan(MI[0], source=ORDERS)   ← MI scan
-            EnumerableMergedIndexScan(MI[0], source=LINEITEM)  ← MI scan
-            [right] EnumerableSort(partkey)
-              EnumerableTableScan(PART)
-          [right] EnumerableSort(partkey, suppkey)
-            EnumerableTableScan(PARTSUPP)
-        [right] EnumerableSort(suppkey)
-          EnumerableTableScan(SUPPLIER)
-      [right] EnumerableSort(nationkey)
-        EnumerableTableScan(NATION)
-```
+| Field | Content |
+|-------|---------|
+| What MI absorbs | L-PS compound-key join + both table scans; pre-sort on (partkey, suppkey) |
+| What remains at query time | Joins: ORDERS (orderkey), PART (partkey), SUPPLIER (suppkey), NATION (nationkey) |
+| Re-sort needed | Depends on join order; orderkey join likely needs a re-sort |
+| SQL rewrite | LINEITEM ⋈ PARTSUPP as inner join with `ps_partkey = l_partkey AND ps_suppkey = l_suppkey` (partkey first to match PARTSUPP PK order) |
+| Calcite test | `tpchQ9LpsMI` (placeholder) |
 
-**Re-sort question**: MI output is ordered by `orderkey`. The next join (PART) needs
-`partkey` order. A sort on `partkey` is unavoidable at query time — the MI does not
-eliminate this sort. Single-MI benefit is confined to the O-L join; the rest of the
-plan is unchanged from the no-MI baseline.
+#### Candidate C: MI(LINEITEM, PART) by `l_partkey`
 
-**Maintenance plan**: same as `leaf-5-index-creation-plan.dot` from `tpchQ9` —
-`LogicalMergeJoin(o_orderkey = l_orderkey)` with delta semantics over ORDERS and
-LINEITEM base tables.
+| Field | Content |
+|-------|---------|
+| What MI absorbs | L-PART join + both table scans; enables pushing `p_name LIKE '%green%'` into the MI |
+| What remains at query time | Joins: ORDERS (orderkey), PARTSUPP (partkey, suppkey), SUPPLIER (suppkey), NATION (nationkey) |
+| Note | PART filter absorbed at maintenance time → query-time plan is filter-free |
+| Calcite test | Not yet planned |
+
+#### Candidate D: MI(SUPPLIER, NATION) by `s_nationkey`
+
+| Field | Content |
+|-------|---------|
+| What MI absorbs | S-N join + both table scans; SUPPLIER (SF×10K) and NATION (25 rows) are small |
+| What remains at query time | All other joins unchanged; marginal I/O benefit |
+| Calcite test | Not yet planned |
+
+Candidates A and B both include LINEITEM — they are alternatives, not compatible
+choices. The experimental evaluation determines which reduces I/O most after
+accounting for re-sort cost.
 
 ---
 
-### Q5 — Local Supplier Volume (6 tables: CUSTOMER, ORDERS, LINEITEM, SUPPLIER, NATION, REGION)
+### Q5 — Local Supplier Volume (CUSTOMER, ORDERS, LINEITEM, SUPPLIER, NATION, REGION)
 
-| Field | Content |
-|-------|---------|
-| Selected pipeline | ORDERS ⋈ LINEITEM on `o_orderkey = l_orderkey` (likely leaf pipeline) |
-| MI composition | `MergedIndex(ORDERS, LINEITEM)` by `orderkey` |
-| What MI absorbs | Leaf join + both scans (same as Q9 leaf) |
-| What remains at query time | Joins with CUSTOMER (custkey), SUPPLIER (suppkey), NATION (nationkey), REGION (regionkey); filter `r_name = 'ASIA'`; aggregate; ORDER BY revenue DESC |
-| Why this pipeline | Same rationale as Q9 — LINEITEM+ORDERS dominate; MI gives largest raw I/O savings |
-| Calcite evidence | No existing test — needs new `tpchQ5` test method |
-| Status | Not started |
+TBD — candidates to be identified after SQL rewrite analysis.
 
-**Open questions**:
+Key open questions:
 
-- Does Calcite's Volcano planner produce a merge-join plan for Q5 (star topology)?
-  Q5 has no natural interesting-ordering chain beyond orderkey; hash joins may dominate.
-- If the planner chooses hash join for CUSTOMER (custkey join), the MI output cannot
-  feed a merge join and needs a separate sort anyway.
-- Analysis needed before claiming MI benefit for Q5.
+- Does Calcite's Volcano planner produce merge-join plans for Q5's star topology,
+  or hash joins? MI benefit requires merge joins along the candidate pipeline.
+- If the planner chooses hash join for CUSTOMER (custkey join), the MI output
+  cannot feed a merge join and needs a separate sort anyway.
+
+Calcite test: `tpchQ5` (placeholder).
 
 ---
 
-### Q7 — Volume Shipping (5+ tables, NATION self-join)
+### Q7 — Volume Shipping (SUPPLIER, LINEITEM, ORDERS, CUSTOMER, NATION×2)
 
-| Field | Content |
-|-------|---------|
-| Selected pipeline | Unclear — NATION appears twice (n1, n2); no single dominant pipeline |
-| MI composition | Potentially `MergedIndex(ORDERS, LINEITEM)` by orderkey if the OL join is present |
-| What MI absorbs | TBD |
-| What remains at query time | TBD — NATION self-join complicates ordering |
-| Why this pipeline | TBD — candidate for "MI not helpful" honest evaluation |
-| Calcite evidence | No existing test |
-| Status | Analysis only — not started |
+TBD — potential "MI not helpful" honest evaluation case.
 
-**Hypothesis**: Q7 may be a case where a merged index offers limited benefit because
-the NATION self-join breaks interesting-ordering chains and forces a hash join or
-extra sort regardless. Worth documenting as an honest bound on MI applicability.
+The NATION self-join (`n1.n_name` and `n2.n_name`) may break interesting-ordering
+chains and force hash joins or extra sorts regardless of MI use. Worth documenting
+as a bound on MI applicability.
+
+Calcite test: `tpchQ7` (placeholder).
+
+---
+
+## Test File
+
+`MergedIndexSinglePipelineTpchPlanTest` (same package as `MergedIndexTpchPlanTest`):
+
+- `singleMIPlan(sql, config, tables)` — helper that runs Phase 1 (Volcano),
+  discovers pipelines, selects the pipeline whose leaf table set matches
+  `tables`, creates ONE `MergedIndex`, runs one HEP pass. Not yet implemented
+  (throws `UnsupportedOperationException`).
+- One `@Test` method per candidate above. All currently empty (no assertions).
+- Visualization via `TpchPlanTestUtil`; output to
+  `test-dot-output/single-mi/<query>/`.
 
 ---
 
@@ -184,67 +167,41 @@ Expected directory structure for the leanstore integration:
 ```
 calcite-integration-info/int-ord-plans/
   q12/
-    plan.dot          ← AFTER plan: single MI substituted (= full multi-MI for Q12)
+    plan.dot          ← AFTER plan: single MI = full multi-MI for Q12
     maintenance.dot   ← maintenance plan for MI(ORDERS, LINEITEM)
     README.md         ← tables, key, what's absorbed, what's query-time
-  q3/
-    plan.dot          ← AFTER pass-1-only plan
+  q3-ol/
+    plan.dot          ← AFTER pass-1-only plan (Candidate A)
     maintenance.dot   ← maintenance plan for MI(ORDERS, LINEITEM)
     README.md
-  q9/
-    plan.dot          ← AFTER pass-1-only plan
+  q9-ol/
+    plan.dot          ← AFTER pass-1-only plan (Candidate A)
     maintenance.dot   ← maintenance plan for MI(ORDERS, LINEITEM)
     README.md
 ```
 
 Definitions:
 
-- `plan.dot` — the query-time plan with only the selected pipeline's MI substituted
-  (not full cascade). For Q12 this equals the existing output; for Q3/Q9 it is the
-  intermediate state after HEP pass 1.
-- `maintenance.dot` — the incremental maintenance plan for the one selected MI,
-  showing delta join semantics over ORDERS and LINEITEM base tables.
-- `README.md` — per-query prose: tables, join key, which operators are absorbed into
-  the MI at maintenance time, which operators remain at query time, and the re-sort
-  trade-off where applicable.
+- `plan.dot` — query-time plan with only the selected MI substituted (not full
+  cascade). For Q12 this equals the existing output; for Q3/Q9 it is the
+  intermediate state after the first HEP pass.
+- `maintenance.dot` — incremental maintenance plan for the selected MI, showing
+  delta join semantics over the two base tables.
+- `README.md` — per-query prose: tables, join key, operators absorbed into the MI
+  at maintenance time, operators remaining at query time, re-sort trade-off.
 
 ---
 
-## Implementation Tasks
+## Status
 
-| Priority | Task | File/Method | Notes |
-|----------|------|-------------|-------|
-| Done | Q12 single-MI plan | `tpchQ12` | multi-MI = single-MI; no changes needed |
-| Next | Q3 single-MI variant | Add `tpchQ3SingleMI` to `MergedIndexTpchPlanTest` | Stop after HEP pass 1; export DOTs |
-| Next | Q9 single-MI variant | Add `tpchQ9SingleMI` to `MergedIndexTpchPlanTest` | Stop after HEP pass 1 (leaf-5 only) |
-| Next | Export DOTs | Copy from `test-dot-output/` to `calcite-integration-info/int-ord-plans/` | After variant tests pass |
-| Later | Q5 analysis | New `tpchQ5` test | Verify Volcano produces merge-join plan |
-| Later | Q7 analysis | Documentation only | Honest "MI not helpful" candidate |
-
----
-
-## LeanStore Operator Implications
-
-From `TPCH_experiments.md`: "the only operator directly reading from merged indexes
-is PremergedJoin, but this may no longer be the case with int-ord-plans."
-
-For single-MI, the PremergedJoin output feeds further query-time operators:
-
-| Query | MI output order | Next join key | Re-sort needed? |
-|-------|-----------------|---------------|-----------------|
-| Q12 | orderkey | — (no further join) | No |
-| Q3 | orderkey | custkey (CUSTOMER join) | Yes — sort on custkey, or use hash join |
-| Q9 | orderkey | partkey (PART join) | Yes — sort on partkey unavoidable |
-
-The re-sort cost is O(N_OL × log N_OL) where N_OL is the ORDERS ⋈ LINEITEM result
-size. At scale factor 1 this is ~6M rows. Whether this cost is acceptable relative
-to the I/O savings of the MI is an empirical question for the leanstore experiments.
-
-**Alternative for Q3**: if CUSTOMER is small enough, a broadcast hash join avoids
-the re-sort entirely. PremergedJoin streams orderkey-sorted rows; CUSTOMER fits in
-memory. This is the likely production implementation.
-
-**Alternative for Q9**: PART filter (`p_name LIKE '%green%'`) reduces the effective
-join size before PARTSUPP. If PART is hash-joined first (probe side), the MI output
-can be filtered and then joined to a hash table of matching (partkey, suppkey) pairs
-from PARTSUPP. No re-sort needed if all remaining joins use hash join.
+| Query | Candidate | Calcite test | DOTs | Notes |
+|-------|-----------|--------------|------|-------|
+| Q12 | MI(ORDERS, LINEITEM) | `tpchQ12` (passes) | `q12/` | multi-MI = single-MI |
+| Q3 | Candidate A: MI(ORDERS, LINEITEM) | `tpchQ3OlMI` (placeholder) | — | pass-1-only plan exists in `tpchQ3OrdersLineitem` |
+| Q3 | Candidate B: MI(CUSTOMER, ORDERS) | `tpchQ3CoMI` (placeholder) | — | SQL rewrite needed |
+| Q9 | Candidate A: MI(ORDERS, LINEITEM) | `tpchQ9OlMI` (placeholder) | — | pass-1-only plan exists in `tpchQ9` |
+| Q9 | Candidate B: MI(LINEITEM, PARTSUPP) | `tpchQ9LpsMI` (placeholder) | — | SQL rewrite needed |
+| Q9 | Candidate C: MI(LINEITEM, PART) | — | — | Not yet planned |
+| Q9 | Candidate D: MI(SUPPLIER, NATION) | — | — | Not yet planned |
+| Q5 | TBD | `tpchQ5` (placeholder) | — | Analysis needed |
+| Q7 | TBD | `tpchQ7` (placeholder) | — | Honest "not helpful" candidate |
