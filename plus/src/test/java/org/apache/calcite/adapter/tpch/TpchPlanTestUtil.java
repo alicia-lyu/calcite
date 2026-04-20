@@ -171,8 +171,13 @@ final class TpchPlanTestUtil {
    * </ul>
    */
   static void writeDotFile(String name, RelNode rel) {
-    writeDotToFile(name + ".dot", dumpDot(rel));
-    writeDotToFile(name + "_color.dot", dumpDotColor(rel));
+    writeDotFile("test-dot-output", name, rel);
+  }
+
+  /** Like {@link #writeDotFile(String, RelNode)} but writes to {@code baseDir}. */
+  static void writeDotFile(String baseDir, String name, RelNode rel) {
+    writeDotToFile(baseDir, name + ".dot", dumpDot(rel));
+    writeDotToFile(baseDir, name + "_color.dot", dumpDotColor(rel));
   }
 
   /**
@@ -182,11 +187,20 @@ final class TpchPlanTestUtil {
    */
   static void writeDotFile(String name, RelNode rel,
       @org.checkerframework.checker.nullness.qual.Nullable Pipeline rootPipeline) {
-    writeDotToFile(name + ".dot", dumpDot(rel));
+    writeDotFile("test-dot-output", name, rel, rootPipeline);
+  }
+
+  /**
+   * Like {@link #writeDotFile(String, RelNode, Pipeline)} but writes to {@code baseDir}.
+   */
+  static void writeDotFile(String baseDir, String name, RelNode rel,
+      @org.checkerframework.checker.nullness.qual.Nullable Pipeline rootPipeline) {
+    writeDotToFile(baseDir, name + ".dot", dumpDot(rel));
     if (rootPipeline != null) {
-      writeDotToFile(name + "_color.dot", dumpDotColorWithPipelines(rel, rootPipeline));
+      writeDotToFile(baseDir, name + "_color.dot",
+          dumpDotColorWithPipelines(rel, rootPipeline));
     } else {
-      writeDotToFile(name + "_color.dot", dumpDotColor(rel));
+      writeDotToFile(baseDir, name + "_color.dot", dumpDotColor(rel));
     }
   }
 
@@ -196,16 +210,26 @@ final class TpchPlanTestUtil {
    * each traversal visit gets a fresh DOT node ID.
    */
   static void writeDotFileTree(String name, RelNode rel) {
-    writeDotToFile(name + ".dot", dumpDotTree(rel));
-    writeDotToFile(name + "_color.dot", dumpDotColorTree(rel));
+    writeDotFileTree("test-dot-output", name, rel);
+  }
+
+  /** Like {@link #writeDotFileTree(String, RelNode)} but writes to {@code baseDir}. */
+  static void writeDotFileTree(String baseDir, String name, RelNode rel) {
+    writeDotToFile(baseDir, name + ".dot", dumpDotTree(rel));
+    writeDotToFile(baseDir, name + "_color.dot", dumpDotColorTree(rel));
   }
 
   static void writeDotToFile(String filename, String content) {
-    final java.nio.file.Path file = java.nio.file.Paths.get("test-dot-output", filename);
+    writeDotToFile("test-dot-output", filename, content);
+  }
+
+  /** Writes {@code content} to {@code baseDir/filename}, creating directories as needed. */
+  static void writeDotToFile(String baseDir, String filename, String content) {
+    final java.nio.file.Path file = java.nio.file.Paths.get(baseDir, filename);
     try {
       java.nio.file.Files.createDirectories(file.getParent());
       java.nio.file.Files.writeString(file, content);
-      System.out.println("DOT written → " + file.toAbsolutePath());
+      System.out.println("DOT written -> " + file.toAbsolutePath());
     } catch (java.io.IOException e) {
       System.err.println("Failed to write DOT file " + filename + ": " + e.getMessage());
     }

@@ -57,6 +57,8 @@ import static org.hamcrest.Matchers.is;
 @Execution(ExecutionMode.SAME_THREAD)
 public class MergedIndexSinglePipelineTpchPlanTest {
 
+  private static final String OUTPUT_DIR = "plus/test-output-ind-ord";
+
   @AfterEach
   void clearRegistry() {
     MergedIndexRegistry.clear();
