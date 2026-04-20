@@ -4,10 +4,10 @@
 
 The VLDB experiments compare four storage structures on TPC-H:
 
-1. Traditional single-table indexes (B-trees, one per table)
+1. Traditional single-table indexes (B-trees, one per table) + merge join
 2. Materialized views (pre-computed join results)
 3. **Single merged index** — one MI covering the most I/O-dominant pipeline
-4. Clustered + hash index combination
+4. Traditional single-table indexes (B-trees, one per table) + hash join
 
 The existing Calcite tests in `MergedIndexTpchPlanTest` demonstrate **multi-MI
 cascade**: every pipeline in the query gets its own merged index, collapsing the
@@ -20,15 +20,16 @@ query-time operators.
 
 ### Key framing: candidates are conceptual
 
-MI candidates are defined by **tables and sort key**, not by plan shape. Any set
+Single MI candidates are defined by **tables and sort key**, not by the current multi-MI plan shape. A choice of MI may dictate the plan shape. Any set
 of tables whose join/aggregation operations require compatible sort orders can be
 stored in one merged index. This is independent of how many pipelines the current
 Volcano plan happens to produce. Two candidates may overlap (share tables). The
 experimental evaluation determines which candidate yields the best trade-off.
 
-The test file `MergedIndexSinglePipelineTpchPlanTest` selects a pipeline by
-matching the set of leaf table qualified names — NOT by pipeline index — making
-the selection robust to planner changes.
+Pipeline selection is done **manually through SQL rewrites**, not automatically.
+Each test method rewrites the SQL query to force the desired join order (the same
+technique used in `MergedIndexTpchPlanTest`), ensuring the target pipeline appears
+in the plan. Then a single HEP pass substitutes only that pipeline's MI.
 
 ---
 

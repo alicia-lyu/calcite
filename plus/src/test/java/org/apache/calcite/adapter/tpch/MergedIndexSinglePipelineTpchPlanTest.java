@@ -27,7 +27,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
 
-import java.util.Set;
 
 /**
  * Single-MI TPC-H plan tests.
@@ -54,63 +53,48 @@ public class MergedIndexSinglePipelineTpchPlanTest {
   }
 
   /**
-   * Runs Phase 1 (Volcano), discovers all pipelines, selects the pipeline
-   * whose leaf table qualified names match {@code tables}, creates exactly ONE
-   * {@link MergedIndex}, and runs a single HEP pass to substitute it.
+   * Runs Phase 1 (Volcano), discovers all pipelines, creates exactly ONE
+   * {@link MergedIndex} for the pipeline at {@code pipelineIndex} in post-order
+   * {@link Pipeline#flatten()}, and runs a single HEP pass to substitute it.
    *
-   * <p>Phase 1 steps (same as {@link MergedIndexTpchPlanTest}):
+   * <p>The caller is responsible for rewriting the SQL so that the desired
+   * pipeline (the MI candidate) appears at {@code pipelineIndex} in the
+   * flattened list. This is the same technique used in
+   * {@link MergedIndexTpchPlanTest}: explicit {@code JOIN … ON …} syntax and
+   * subqueries or left-deep join order to surface the target interesting-ordering
+   * chain. Index 0 is always the innermost leaf pipeline.
    *
+   * <p>Phase 1 steps:
    * <ol>
-   *   <li>{@code injectSortsBeforeSortBasedOps} — inject LogicalSort before
-   *       joins/aggregates
-   *   <li>{@code hoistFiltersAboveBoundaries} — move predicates above pipeline
-   *       boundaries
+   *   <li>{@code injectSortsBeforeSortBasedOps} — inject LogicalSort before joins/aggs
+   *   <li>{@code hoistFiltersAboveBoundaries} — move predicates above pipeline boundaries
    *   <li>{@code planner.transform} — Volcano: logical to physical
-   *   <li>{@code splitLimitSorts} — separate EnumerableLimitSort into
-   *       Limit + Sort
-   *   <li>{@code Pipeline.buildTree} — discover pipeline boundaries
-   *   <li>{@code captureLogicalRoots} — pair pipelines with logical subtrees
-   *       for IVM
+   *   <li>{@code splitLimitSorts} — separate EnumerableLimitSort into Limit + Sort
+   *   <li>{@code Pipeline.buildTree} + {@code captureLogicalRoots} — pipeline discovery
    * </ol>
    *
-   * <p>Pipeline selection: finds the pipeline in {@link Pipeline#flatten()}
-   * whose leaf {@link org.apache.calcite.plan.RelOptTable} qualified names
-   * (as {@code "SCHEMA.TABLE"}) equal {@code tables}. Only multi-source
-   * pipelines ({@code sources.size() >= 2}) are considered — single-source
-   * indexed views are excluded.
-   *
-   * @param sql    SQL string (rewritten for desired join order)
-   * @param config framework config (rules, schema, trait defs)
-   * @param tables set of qualified table names identifying the target pipeline,
-   *               e.g. {@code Set.of("TPCH.ORDERS", "TPCH.LINEITEM")}
-   * @return phase-2 plan with the selected MI substituted; remaining joins
-   *         intact
-   * @throws IllegalArgumentException if no pipeline matches {@code tables}
+   * @param sql            SQL string (rewritten for desired join order)
+   * @param config         framework config (rules, schema, trait defs)
+   * @param pipelineIndex  index into {@link Pipeline#flatten()} identifying the
+   *                       target pipeline (0 = innermost leaf)
+   * @return phase-2 plan with the selected MI substituted; remaining joins intact
    */
   @SuppressWarnings("unused")
   private static RelNode singleMIPlan(String sql, FrameworkConfig config,
-      Set<String> tables) throws Exception {
+      int pipelineIndex) throws Exception {
     // TODO: implement
     // Sketch:
     //   Planner planner = Frameworks.getPlanner(config);
     //   RelRoot root = planner.rel(planner.validate(planner.parse(sql)));
-    //   RelNode injected =
-    //       MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
-    //   RelNode logicalWithSorts =
-    //       MergedIndexTestUtil.hoistFiltersAboveBoundaries(injected);
-    //   RelTraitSet desired =
-    //       root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
+    //   RelNode injected = MergedIndexTestUtil.injectSortsBeforeSortBasedOps(root.rel);
+    //   RelNode logicalWithSorts = MergedIndexTestUtil.hoistFiltersAboveBoundaries(injected);
+    //   RelTraitSet desired = root.rel.getTraitSet().replace(EnumerableConvention.INSTANCE);
     //   RelNode phase1Plan = MergedIndexTestUtil.splitLimitSorts(
     //       planner.transform(0, desired, logicalWithSorts));
     //   Pipeline rootPipeline = Pipeline.buildTree(phase1Plan);
     //   List<Pipeline> pipelines = rootPipeline.flatten();
     //   Pipeline.captureLogicalRoots(rootPipeline, logicalWithSorts);
-    //   Pipeline selected = pipelines.stream()
-    //       .filter(p -> p.sources.size() >= 2)
-    //       .filter(p -> MergedIndex.leafTableNames(p).equals(tables))
-    //       .findFirst()
-    //       .orElseThrow(() ->
-    //           new IllegalArgumentException("No pipeline for " + tables));
+    //   Pipeline selected = pipelines.get(pipelineIndex);
     //   new MergedIndex(selected);
     //   if (selected.logicalRoot != null) {
     //     selected.mergedIndex.setMaintenancePlan(
@@ -118,8 +102,7 @@ public class MergedIndexSinglePipelineTpchPlanTest {
     //   }
     //   MergedIndexRegistry.register(selected.mergedIndex);
     //   HepProgram hp = HepProgram.builder()
-    //       .addRuleInstance(
-    //           EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
+    //       .addRuleInstance(EnumerableRules.ENUMERABLE_PIPELINE_TO_MERGED_INDEX_SCAN_RULE)
     //       .build();
     //   HepPlanner hep = new HepPlanner(hp);
     //   hep.setRoot(phase1Plan);
