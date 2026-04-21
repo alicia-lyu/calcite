@@ -135,6 +135,18 @@ calcite-integration-info/int-ord-plans/
 
 ---
 
+## Running Tests
+
+```bash
+# Single-MI pipeline identification + substitution tests
+./gradlew :plus:cleanTest :plus:test --tests "*.MergedIndexSinglePipelineTpchPlanTest" --info
+
+# Multi-MI tests (regression check)
+./gradlew :plus:cleanTest :plus:test --tests "*.MergedIndexTpchPlanTest" --info
+```
+
+---
+
 ## Test Files
 
 **`MergedIndexSinglePipelineTpchPlanTest`** (same package as

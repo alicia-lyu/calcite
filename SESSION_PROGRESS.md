@@ -49,6 +49,9 @@
 
 # Run core rule test
 ./gradlew :core:test --tests "*.PipelineToMergedIndexScanRuleTest"
+
+# Run single-MI pipeline tests
+./gradlew :plus:cleanTest :plus:test --tests "*.MergedIndexSinglePipelineTpchPlanTest" --info
 ```
 
 Search for `=== Q12 BEFORE`, `=== Q12 AFTER`, `=== Q3 OL AFTER`, `=== Q9 AFTER` in output.
