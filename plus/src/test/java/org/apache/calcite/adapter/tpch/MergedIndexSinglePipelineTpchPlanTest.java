@@ -665,13 +665,94 @@ public class MergedIndexSinglePipelineTpchPlanTest {
   }
 
   /**
-   * Single-MI substitution for Q3 (ORDERS ⋈ LINEITEM inner pipeline only).
+   * Single-MI substitution for TPC-H Q3: replaces only the ORDERS ⋈ LINEITEM
+   * inner pipeline (orderkey) with a merged index scan. The outer custkey join
+   * with CUSTOMER and the final ORDER BY sort remain in the query-time plan.
    *
-   * <p>TODO: implement via {@code singleMIPlan} when that helper is complete.
+   * <p>Uses the same subquery SQL as the multi-MI
+   * {@link MergedIndexTpchPlanTest#tpchQ3OrdersLineitem}: the subquery forces
+   * LINEITEM's aggregate as the left input to the inner join on orderkey, and
+   * CUSTOMER stays as an independent outer join on custkey.
+   *
+   * <h3>Expected AFTER structure</h3>
+   * <pre>
+   *   EnumerableLimit
+   *     EnumerableSort(revenue DESC, orderdate)
+   *       EnumerableProject(...)
+   *         EnumerableMergeJoin(custkey)              — outer join stays
+   *           EnumerableSort(custkey)                 — re-sort stays
+   *             EnumerableMergeJoin(orderkey)         — inner assembly stays
+   *               EnumerableMergedIndexScan(MI, 0)    — LINEITEM/agg source
+   *               EnumerableMergedIndexScan(MI, 1)    — ORDERS source
+   *           EnumerableSort(custkey)                 — stays
+   *             EnumerableTableScan(CUSTOMER)         — not in candidate
+   * </pre>
+   *
+   * <p>Exactly 1 registered pipeline (the inner orderkey join). 2 MIScans.
+   * MergeJoin present (outer custkey). CUSTOMER TableScan remains.
+   * EnumerableLimit present (LIMIT 10).
    */
   @Test
   void tpchQ3OlMI() throws Exception {
-    // TODO
+    final String sql =
+        "SELECT v.l_orderkey, v.l_revenue, o.o_orderdate, o.o_shippriority"
+            + " FROM (SELECT l.l_orderkey,"
+            + "   SUM(l.l_extendedprice * (1 - l.l_discount)) AS l_revenue"
+            + "   FROM tpch.lineitem l GROUP BY l.l_orderkey) AS v"
+            + " JOIN tpch.orders o ON v.l_orderkey = o.o_orderkey"
+            + " JOIN tpch.customer c ON o.o_custkey = c.c_custkey"
+            + " ORDER BY v.l_revenue DESC, o.o_orderdate LIMIT 10";
+
+    final SingleMIPlanResult result = singleMIPlan(sql,
+        Set.of("ORDERS", "LINEITEM"), null, false);
+
+    System.out.println("=== Q3 Single-MI BEFORE ===");
+    System.out.println(dumpText(result.phase1Plan));
+    writeDotFile("q3-ol/before-pipeline", result.phase1Plan, result.rootPipeline);
+
+    System.out.println("=== Q3 Single-MI AFTER ===");
+    System.out.println(dumpText(result.phase2Plan));
+    writeDotFile("q3-ol/after-single-mi", result.phase2Plan);
+
+    // Print maintenance plans for registered pipelines.
+    for (int i = 0; i < result.registeredPipelines.size(); i++) {
+      final Pipeline p = result.registeredPipelines.get(i);
+      final RelNode mp = p.mergedIndex.getMaintenancePlan();
+      if (mp != null) {
+        System.out.println("=== Q3 Single-MI Maintenance " + i + " ===");
+        System.out.println(dumpText(mp));
+        writeDotFile("q3-ol/maintenance-" + i, mp);
+      }
+    }
+
+    final String afterStr = dumpText(result.phase2Plan);
+
+    // 2 MIScans: one per source in the inner orderkey pipeline.
+    assertThat("Q3-OL should have exactly 2 MIScans",
+        MergedIndexTestUtil.countOccurrences(afterStr, "EnumerableMergedIndexScan"), is(2));
+
+    // Outer MergeJoin (custkey) stays: CUSTOMER is not in the candidate set.
+    assertThat("Q3-OL should still have MergeJoin for outer custkey join",
+        afterStr, containsString("EnumerableMergeJoin"));
+
+    // CUSTOMER TableScan remains: it is not part of the {ORDERS, LINEITEM} candidate.
+    assertThat("Q3-OL should still have CUSTOMER TableScan",
+        afterStr, containsString("CUSTOMER"));
+
+    // EnumerableLimit present (LIMIT 10).
+    assertThat("Q3-OL should have EnumerableLimit",
+        afterStr, containsString("EnumerableLimit"));
+
+    // Exactly 1 registered pipeline: the inner orderkey join.
+    assertThat("Q3-OL should register exactly 1 pipeline",
+        result.registeredPipelines, hasSize(1));
+
+    // Maintenance plan exists with 2 delta branches (one per source table).
+    final RelNode mp = result.registeredPipelines.get(0).mergedIndex.getMaintenancePlan();
+    assertThat("Q3-OL maintenance plan should exist", mp != null, is(true));
+    final String maintStr = dumpText(mp);
+    assertThat("Q3-OL maintenance plan should have 2 LogicalDelta branches",
+        MergedIndexTestUtil.countOccurrences(maintStr, "LogicalDelta"), is(2));
   }
 
   /**
