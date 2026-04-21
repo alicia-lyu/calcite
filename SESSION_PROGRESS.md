@@ -323,23 +323,32 @@ full design. Key production classes:
   predicate-reusable (Q9: P5 indexed view on n_name, o_year without PART filter).
 - **All TPC-H tests pass**: Q12, Q3-OL, Q9 fully verified.
 
+### 2026-04-20
+
+- **Single-MI plan generation (Step A+B)**: Implemented `singleMIPlan()` helper in
+  `MergedIndexSinglePipelineTpchPlanTest.java` — same Volcano flow as multi-MI but
+  selective pipeline registration (only candidate's leaf tables).
+- **Helpers**: `SingleMIPlanResult` (plan artifacts), `getLeafTableNames(Pipeline)` (recurse
+  pipeline sources to find base table names).
+- **Q12 single-MI test** (`tpchQ12OlMI`): {ORDERS, LINEITEM} by orderkey. 2 MIScans, MergeJoin
+  (assembly) stays, Sort(l_shipmode) re-sort at query time. All assertions pass.
+- **Registration strategy**: bottom-up from leaf, `sources.size() >= 2` (join pipelines only),
+  stop when all candidate tables covered. Indexed views with different sort keys excluded.
+
 ---
 
 ## Next Steps
 
 ### Short-term (next session)
 
-**Implement `singleMIPlan()` helper** in `MergedIndexSinglePipelineTpchPlanTest.java`:
-- SQL rewrite to put identified pipeline tables as contiguous join sub-plan
-- `injectSortsBeforeSortBasedOps` → Volcano → `Pipeline.buildTree` → register one MI → HEP
-- Produce query-time plan + maintenance plan; write DOTs to `plus/test-output-ind-ord/`
-- Start with Q12 (simplest: 2-table, single candidate)
-
-**Per-query MI substitution tests**: fill in `tpchQ12OlMI()`, `tpchQ3OlMI()`, `tpchQ3CoMI()`, `tpchQ9OlMI()`, `tpchQ9LpsMI()` — one candidate per test method.
+**Implement remaining single-MI tests**:
+- `tpchQ3OlMI()` — {ORDERS, LINEITEM} by orderkey in 3-table query (Step C)
+- `tpchQ9LpsMI()` — {LINEITEM, PART, PARTSUPP} by (partkey, suppkey) in 6-table query (Step D)
 
 ### Medium-term
 
-- **Q5, Q7 identification**: run `SingleMIPipelineIdentifier` on Q5/Q7 SQL, add test methods
+- `tpchQ3CoMI()` — {CUSTOMER, ORDERS} by custkey (alternative to OL, Step E)
+- Q5, Q7 identification: run `SingleMIPipelineIdentifier` on Q5/Q7 SQL, add test methods
 - **int-ord-plans/ export**: generate plan.dot + maintenance.dot per query for LeanStore integration
 - **Pre-aggregation extension**: flag decomposable aggregates on MI candidates
 
