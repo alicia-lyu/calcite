@@ -766,13 +766,126 @@ public class MergedIndexSinglePipelineTpchPlanTest {
   }
 
   /**
-   * Single-MI substitution: LINEITEM ⋈ PARTSUPP compound-key pipeline for Q9.
+   * Single-MI substitution for TPC-H Q9: replaces only the {LINEITEM, PART,
+   * PARTSUPP} pipeline with a merged index, leaving the outer joins with
+   * ORDERS, SUPPLIER, and NATION at query time.
    *
-   * <p>TODO: implement via {@code singleMIPlan} when that helper is complete.
+   * <p>The SQL is rewritten so that LINEITEM ⋈ PART (on partkey) is the
+   * innermost join, followed by (L⋈P) ⋈ PARTSUPP on (partkey, suppkey).
+   * This makes the {L,P,PS} candidate the leaf pipeline group, matching the
+   * top-ranked 3-table candidate from {@link #testIdentifyQ9}.
+   *
+   * <p>Two pipelines are registered bottom-up:
+   * <ol>
+   *   <li>P0: LINEITEM ⋈ PART on partkey (2 sources, leaf tables = {L, P})</li>
+   *   <li>P1: view(L⋈P) ⋈ PARTSUPP on (partkey, suppkey) (2 sources, leaf tables = {L, P, PS})</li>
+   * </ol>
+   * P2+ (ORDERS, SUPPLIER, NATION) are outside the candidate set and stay at query time.
+   *
+   * <h3>Expected AFTER structure</h3>
+   * <pre>
+   *   EnumerableAggregate(n_name, o_year)
+   *     EnumerableSort(n_name ASC, o_year DESC)     — GROUP BY sort
+   *       EnumerableProject(...)
+   *         EnumerableMergeJoin(s_nationkey)         — stays (SUPPLIER ⋈ NATION)
+   *           EnumerableSort(s_nationkey) → ...
+   *           EnumerableSort(s_nationkey) → Scan(NATION)
+   *           (with ORDERS and the L⋈P⋈PS MIScans further inside)
+   * </pre>
+   *
+   * <p>Exactly 2 registered pipelines. MIScans for {L,P} and {L,P,PS} sources.
+   * MergeJoins for ORDERS, SUPPLIER, and NATION remain. ORDERS, SUPPLIER, NATION
+   * TableScans remain. The {@code p_name LIKE '%green%'} filter stays in the plan
+   * since filter hoisting is not applied in single-MI mode.
    */
   @Test
   void tpchQ9LpsMI() throws Exception {
-    // TODO
+    // L⋈P as innermost join (on partkey), then (L⋈P)⋈PS on (partkey,suppkey).
+    // ps_partkey = l_partkey must be listed first so splitJoinCondition produces
+    // the compound collation (partkey, suppkey) matching PARTSUPP's PK order.
+    final String sql = "SELECT n.n_name AS nation,"
+        + " EXTRACT(YEAR FROM o.o_orderdate) AS o_year,"
+        + " SUM(l.l_extendedprice * (1 - l.l_discount)"
+        + "   - ps.ps_supplycost * l.l_quantity) AS sum_profit"
+        + " FROM tpch.lineitem l"
+        + " JOIN tpch.part p ON p.p_partkey = l.l_partkey"
+        + " JOIN tpch.partsupp ps ON ps.ps_partkey = l.l_partkey"
+        + "   AND ps.ps_suppkey = l.l_suppkey"
+        + " JOIN tpch.orders o ON o.o_orderkey = l.l_orderkey"
+        + " JOIN tpch.supplier s ON s.s_suppkey = l.l_suppkey"
+        + " JOIN tpch.nation n ON s.s_nationkey = n.n_nationkey"
+        + " WHERE p.p_name LIKE '%green%'"
+        + " GROUP BY n.n_name, EXTRACT(YEAR FROM o.o_orderdate)"
+        + " ORDER BY n.n_name, o_year DESC";
+
+    final SingleMIPlanResult result = singleMIPlan(sql,
+        Set.of("LINEITEM", "PART", "PARTSUPP"),
+        TpchPlanTestUtil::propagateOrderByDirection,
+        true);
+
+    System.out.println("=== Q9-LPS Single-MI BEFORE ===");
+    System.out.println(dumpText(result.phase1Plan));
+    writeDotFile("q9-lps/before-pipeline", result.phase1Plan, result.rootPipeline);
+
+    System.out.println("=== Q9-LPS Single-MI AFTER ===");
+    System.out.println(dumpText(result.phase2Plan));
+    writeDotFile("q9-lps/after-single-mi", result.phase2Plan);
+
+    // Print maintenance plans for registered pipelines.
+    for (int i = 0; i < result.registeredPipelines.size(); i++) {
+      final Pipeline p = result.registeredPipelines.get(i);
+      final RelNode mp = p.mergedIndex.getMaintenancePlan();
+      if (mp != null) {
+        System.out.println("=== Q9-LPS Single-MI Maintenance " + i + " ===");
+        System.out.println(dumpText(mp));
+        writeDotFile("q9-lps/maintenance-" + i, mp);
+      }
+    }
+
+    final String afterStr = dumpText(result.phase2Plan);
+
+    // MIScans present from the {L,P} and {L,P,PS} candidate pipelines.
+    assertThat("Q9-LPS should have MIScans",
+        afterStr, containsString("EnumerableMergedIndexScan"));
+
+    // MergeJoins remain for non-candidate joins (O, S, N at query time).
+    assertThat("Q9-LPS should still have MergeJoin for outer joins",
+        afterStr, containsString("EnumerableMergeJoin"));
+
+    // Non-candidate tables remain as TableScans.
+    assertThat("Q9-LPS should still have ORDERS TableScan",
+        afterStr, containsString("ORDERS"));
+    assertThat("Q9-LPS should still have SUPPLIER TableScan",
+        afterStr, containsString("SUPPLIER"));
+    assertThat("Q9-LPS should still have NATION TableScan",
+        afterStr, containsString("NATION"));
+
+    // Candidate tables (L, P, PS) should be absorbed into MIScans.
+    assertThat("Q9-LPS should not have bare LINEITEM TableScan",
+        afterStr, not(containsString("EnumerableTableScan(table=[[TPCH, LINEITEM]])")));
+    assertThat("Q9-LPS should not have bare PART TableScan",
+        afterStr, not(containsString("EnumerableTableScan(table=[[TPCH, PART]])")));
+    assertThat("Q9-LPS should not have bare PARTSUPP TableScan",
+        afterStr, not(containsString("EnumerableTableScan(table=[[TPCH, PARTSUPP]])")));
+
+    // Exactly 2 registered pipelines: P0 ({L,P} by partkey) and P1 ({L,P,PS} by (partkey,suppkey)).
+    assertThat("Q9-LPS should register exactly 2 pipelines",
+        result.registeredPipelines, hasSize(2));
+
+    // Maintenance plan for P0 ({L,P}) should have 2 LogicalDelta branches.
+    final RelNode mp0 = result.registeredPipelines.get(0).mergedIndex.getMaintenancePlan();
+    assertThat("Q9-LPS P0 maintenance plan should exist", mp0 != null, is(true));
+    final String maint0Str = dumpText(mp0);
+    assertThat("Q9-LPS P0 maintenance should have 2 delta branches",
+        MergedIndexTestUtil.countOccurrences(maint0Str, "LogicalDelta"), is(2));
+
+    // Maintenance plan for P1 ({L,P,PS}) should have >= 2 LogicalDelta branches.
+    final RelNode mp1 = result.registeredPipelines.get(1).mergedIndex.getMaintenancePlan();
+    assertThat("Q9-LPS P1 maintenance plan should exist", mp1 != null, is(true));
+    final String maint1Str = dumpText(mp1);
+    assertThat("Q9-LPS P1 maintenance should have >= 2 delta branches",
+        MergedIndexTestUtil.countOccurrences(maint1Str, "LogicalDelta"),
+        greaterThanOrEqualTo(2));
   }
 
   /** TPC-H Q5 MI candidate analysis. TODO: identify and implement. */
