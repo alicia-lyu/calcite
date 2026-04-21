@@ -175,8 +175,8 @@ calcite-integration-info/int-ord-plans/
 
 | Query | Identification | Candidates found | MI substitution test | DOTs |
 |-------|---------------|-----------------|---------------------|------|
-| Q12 | ✅ Done | `{O,L}` by orderkey | placeholder | — |
-| Q3 | ✅ Done | `{C,O}` by custkey; `{O,L}` by orderkey | placeholder | — |
-| Q9 | ✅ Done | `{L,P,PS}` 3-table + four 2-table | placeholder | — |
-| Q5 | — | — | placeholder | — |
-| Q7 | — | — | placeholder | — |
+| Q12 | ✅ Done | `{O,L}` by orderkey | ✅ `tpchQ12OlMI` | ✅ `q12-ol/` |
+| Q3 | ✅ Done | `{C,O}` by custkey; `{O,L}` by orderkey (tied) | ✅ `tpchQ3OlMI` ({O,L} chosen) | ✅ `q3-ol/` |
+| Q9 | ✅ Done | `{L,P,PS}` 3-table + `{L,PS,S}` 3-table (tied) + 2-table | ✅ `tpchQ9LpsMI` ({L,P,PS} chosen) | ✅ `q9-lps/` |
+| Q5 | — | — | — | — |
+| Q7 | — | — | — | — |

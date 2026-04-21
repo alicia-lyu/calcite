@@ -330,8 +330,14 @@ full design. Key production classes:
   selective pipeline registration (only candidate's leaf tables).
 - **Helpers**: `SingleMIPlanResult` (plan artifacts), `getLeafTableNames(Pipeline)` (recurse
   pipeline sources to find base table names).
-- **Q12 single-MI test** (`tpchQ12OlMI`): {ORDERS, LINEITEM} by orderkey. 2 MIScans, MergeJoin
-  (assembly) stays, Sort(l_shipmode) re-sort at query time. All assertions pass.
+- **Q12 single-MI test** (`tpchQ12OlMI`): {ORDERS, LINEITEM} by orderkey in 2-table query.
+  2 MIScans, MergeJoin (assembly) stays, Sort(l_shipmode) re-sort at query time.
+- **Q3 single-MI test** (`tpchQ3OlMI`): {ORDERS, LINEITEM} by orderkey in 3-table query.
+  Inner pipeline replaced with MIScans, outer custkey join + CUSTOMER TableScan stay.
+- **Q9-LPS single-MI test** (`tpchQ9LpsMI`): {LINEITEM, PART, PARTSUPP} by (partkey,suppkey)
+  in 6-table query. Two nested pipelines registered (L⋈P + (L⋈P)⋈PS). ORDERS, SUPPLIER,
+  NATION remain at query time.
+- **All 16 tests pass** (9 single-MI + 3 multi-MI + 4 core rule).
 - **Registration strategy**: bottom-up from leaf, `sources.size() >= 2` (join pipelines only),
   stop when all candidate tables covered. Indexed views with different sort keys excluded.
 
@@ -341,19 +347,19 @@ full design. Key production classes:
 
 ### Short-term (next session)
 
-**Implement remaining single-MI tests**:
-- `tpchQ3OlMI()` — {ORDERS, LINEITEM} by orderkey in 3-table query (Step C)
-- `tpchQ9LpsMI()` — {LINEITEM, PART, PARTSUPP} by (partkey, suppkey) in 6-table query (Step D)
+**Single-MI plan generation complete for Q12, Q3, Q9.** Next:
+- Review DOT output in `plus/test-output-ind-ord/` for plan shape verification
+- Q5, Q7 identification + single-MI tests
+- `int-ord-plans/` export for LeanStore integration
 
 ### Medium-term
 
-- `tpchQ3CoMI()` — {CUSTOMER, ORDERS} by custkey (alternative to OL, Step E)
-- Q5, Q7 identification: run `SingleMIPipelineIdentifier` on Q5/Q7 SQL, add test methods
-- **int-ord-plans/ export**: generate plan.dot + maintenance.dot per query for LeanStore integration
+- `tpchQ3CoMI()` — {CUSTOMER, ORDERS} by custkey (alternative MI, Step E)
+- **int-ord-plans/ directory structure**: plan.dot + maintenance.dot + README.md per query
 - **Pre-aggregation extension**: flag decomposable aggregates on MI candidates
+- Cardinality-based ranking metric (input/output size) for candidate tie-breaking
 
 ### Long-term
 
-- Cardinality-based ranking metric (pipeline input/output size)
 - Window functions, DISTINCT in sort-based pipelines
 - Functional dependency-based matching (`o_orderkey → o_custkey`)
