@@ -74,15 +74,18 @@ plan, the algorithm:
 
 **Q9** (6 tables, multi-table candidates):
 
-- `{LINEITEM, PART, PARTSUPP}` by (partkey, suppkey) — **3 tables** (best)
+- `{LINEITEM, PART, PARTSUPP}` by (partkey, suppkey) — **3 tables** (tied)
 - `{ORDERS, LINEITEM}` by orderkey — 2 tables
 - `{LINEITEM, SUPPLIER}` by (suppkey, partkey) — 2 tables (reordered compound key)
 - `{SUPPLIER, NATION}` by nationkey — 2 tables
 - `{PART, PARTSUPP}` by partkey — 2 tables
 - Cannot extend `{L, P, PS}` with SUPPLIER: L's sort `[partkey, suppkey]` does
   not provide `[suppkey]` order alone
-- With key reordering to `[suppkey, partkey]`: trades PART for SUPPLIER in the
-  3-table candidate
+- `{LINEITEM, PARTSUPP, SUPPLIER}` by (suppkey, partkey) — **3 tables** (tied;
+  reordered compound key trades PART for SUPPLIER)
+- Tie-breaking between the two 3-table candidates requires a richer metric
+  (cardinality, filter selectivity, re-sort cost). Current default: table count
+  only, so enumeration order determines output position.
 
 ---
 

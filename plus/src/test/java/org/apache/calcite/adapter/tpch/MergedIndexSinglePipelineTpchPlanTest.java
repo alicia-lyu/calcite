@@ -283,7 +283,10 @@ public class MergedIndexSinglePipelineTpchPlanTest {
     assertThat("Q9 must produce at least one candidate",
         candidates.size(), greaterThanOrEqualTo(1));
 
-    // Top candidate must be the 3-table {LINEITEM, PART, PARTSUPP}.
+    // {L,P,PS} by (partkey, suppkey) and {L,PS,S} by (suppkey, partkey) are both
+    // 3-table candidates, tied under table-count ranking. {L,P,PS} appears first
+    // because original key orderings are enumerated before reordered variants.
+    // A richer ranking metric (cardinality, filter selectivity) could break the tie.
     assertThat("Q9 top candidate must cover 3 tables (LINEITEM+PART+PARTSUPP)",
         candidates.get(0).tableCount(), is(3));
 
