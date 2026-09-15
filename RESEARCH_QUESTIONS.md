@@ -26,8 +26,9 @@ prove that only one storage pass is used.
 - Cascade step: applying one pipeline output delta to a downstream MI or query
   result.
 
-A source-record write can be 1-to-1 for a raw-source MI, while the pipeline output
-delta can still have fanout. Keep these counts separate.
+A source-record write can be 1-to-1 for the MI currently being updated, while the
+pipeline output delta sent to a parent MI can still have fanout. Keep per-MI
+update counts separate from across-MI cascade counts.
 
 ## Q1: Per-Update I/O for One B-tree Pipeline
 
@@ -48,6 +49,10 @@ rows. The write work then depends on what the pipeline emits:
 - joined-row delta
 - aggregate-state replacement
 - parent MI entry update
+
+When an experiment reports "one scan," specify whether it means one scan of the
+root MI followed by remaining query execution, or one local scan inside a
+maintenance step.
 
 Needed evidence:
 

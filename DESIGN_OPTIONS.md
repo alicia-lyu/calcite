@@ -81,8 +81,10 @@ Open choices:
 - downstream write ordering
 - how a scan group maps to one storage cursor
 
-Do not state that cascades are 1-to-1 in general. A base-table change can produce
-multiple downstream output changes depending on join fanout and aggregation.
+State 1-to-1 maintenance with its scope. Updating one MI entry or state can be a
+1-to-1 index-maintenance step. A cascade across MIs is a sequence of such steps
+and can still fan out depending on join multiplicity, aggregation, and key
+changes between parent and child MIs.
 
 ### 6. Final Ordering
 
@@ -110,6 +112,7 @@ For the next phase, treat the current repository as:
 
 - a reproducible plan-shape artifact for multiple pipelines
 - a source of DOT plans and maintenance-plan hypotheses
+- a record of plan intent that DOT files cannot fully reconstruct
 - a guide for manual LeanStore C++ implementations
 
 Do not treat it as:
@@ -117,4 +120,4 @@ Do not treat it as:
 - a finished full TPC-H optimizer
 - an executable MI implementation in Java
 - proof that all substitutions are cheaper
-- proof that all maintenance cascades have single-row fanout
+- proof that all across-MI cascades have single-row fanout

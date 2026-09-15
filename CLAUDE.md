@@ -55,6 +55,17 @@ through a cascade. Fanout depends on the changed relation, matching rows,
 aggregations, and downstream storage. Physical scan sharing is an execution
 objective represented by metadata, not demonstrated by the Java scan stubs.
 
+State the maintenance claim precisely. An update to one MI can be 1-to-1 with
+that MI's stored entry or state, just like an ordinary index update. A cascade
+across MIs is not globally 1-to-1: the delta emitted by `MI_leaf` can fan out,
+change an aggregate, or become multiple updates to `MI_root`. Keep "per-MI
+update" and "across-MI cascade" separate in all future notes.
+
+Likewise, "one scan" is valid when referring to the root MI scan used to enter
+the remaining query execution. It is an overstatement only if it is used to imply
+that the Java `EnumerableMergedIndexScan` already implements storage execution,
+or that no operators remain above the root MI scan.
+
 ## Current Planner Architecture
 
 ### Phase 1: construct an order-based physical plan
@@ -140,11 +151,37 @@ for maintaining aggregate results under insertions and deletions.
 traversal order with a fallback for split LIMIT sorts. New query shapes must
 validate these associations rather than assume they generalize.
 
+### Plan intent not fully recoverable from DOT
+
+DOT files are useful for recovering operator shape, substitution points, and
+stored plan trees. They do not fully recover why a plan was shaped that way.
+Preserve these design notes unless the code itself changes the invariant:
+
+- **Volcano then HEP:** Phase 1 builds an order-based Enumerable plan. Phase 2
+  applies deterministic HEP substitutions after MI registration. HEP is used
+  because the substitutions are a research artifact choice, not a planner cost
+  alternative.
+- **Sort boundaries:** a boundary Sort marks the transition between pipelines.
+  Replacing the boundary with an MI scan means the boundary's input has become
+  stored or maintained under that MI's order.
+- **Nested order:** inner pipeline substitutions must be available before a
+  parent pipeline can treat the child output as an MI source. The tests currently
+  make this explicit with leaf-to-root registration and repeated HEP passes.
+- **Root scan:** a fully substituted root can be represented as one root-MI scan
+  followed by any remaining query operators. That is the intended "one scan"
+  query-time property for the stored root pipeline.
+- **Maintenance tier:** non-root pipeline plans are not discarded. They become
+  index-creation and maintenance plans that populate the parent MI.
+
 ## Query-Specific Lessons
 
 - **Q3:** the current example preaggregates LINEITEM by orderkey, joins ORDERS,
   then CUSTOMER, and adds a revenue/date sort. It omits the real Q3 predicates.
   See the status document before treating it as benchmark SQL.
+- **Q3 join order:** `tpchQ3OrdersLineitem` manually shapes SQL so ORDERS joins
+  LINEITEM as the leaf pipeline before CUSTOMER. This is intentional test design:
+  the registered rule set does not include general join reordering, and relying
+  on Volcano to rediscover this exact shape would make the artifact brittle.
 - **Functional dependencies:** `orderkey -> custkey` does not make an orderkey
   scan custkey-sorted. LeanStore's COL design explicitly extends keys to
   `(custkey, orderkey, linenumber)`; the Calcite examples do not model this
@@ -155,6 +192,15 @@ validate these associations rather than assume they generalize.
   suppkey)` supplies partkey order, not suppkey order. The helper aligns a sort
   with nation/year ordering but removes ORDER BY above a hash aggregate;
   the final required order is not guaranteed.
+- **Q9 interesting-order constraints:** the original query uses orderkey,
+  partkey, `(partkey, suppkey)`, suppkey, and nationkey. PART breaks the
+  orderkey and suppkey chains. The test writes the PARTSUPP condition as
+  `ps_partkey = l_partkey AND ps_suppkey = l_suppkey` so
+  `splitJoinCondition` extracts the compound key in PARTSUPP primary-key order.
+- **Q9 query tier vs. maintenance tier:** the intended fully substituted shape
+  is a query tier entered through one indexed-view/root-MI scan, plus maintenance
+  tiers for the intermediate joins. A PART filter above the root scan is a
+  query-time remainder unless that predicate is deliberately baked into an MI.
 - **Q12:** shipmode grouping remains at query time. The second MI stores
   intermediate joined/projected rows, not the final grouped answer.
 

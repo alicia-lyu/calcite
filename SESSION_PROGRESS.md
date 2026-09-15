@@ -78,6 +78,11 @@ multi-MI artifacts and should not be counted as implemented MI plans.
 
 DOT files are written under `plus/test-dot-output/`.
 
+The DOT output is enough to recover the operator tree, but not all plan intent.
+Keep these text notes with the DOTs: forced join order, compound-key ordering,
+which operators belong to query time versus maintenance time, and whether "one
+scan" refers to the root MI scan or a lower-level source scan.
+
 ### Q3
 
 The current Q3-style plan preaggregates LINEITEM by orderkey, joins ORDERS by
@@ -88,6 +93,10 @@ Q3 semantic test because the important predicates are missing.
 LeanStore's manual Q3 implementation has already adapted the physical design by
 using a custkey-extended COL index. That is stronger than what the Calcite plan
 currently models.
+
+The manually shaped ORDERS/LINEITEM leaf join is intentional. The TPC-H examples
+do not register general join-reordering rules, so the SQL form is part of the
+test fixture that makes the desired pipeline visible.
 
 ### Q9
 
@@ -106,6 +115,12 @@ Known issue: the saved root query plan currently contains an MI scan feeding a
 filter and `EnumerableAggregate`. A hash aggregate does not guarantee the final
 `ORDER BY n_name, o_year DESC`.
 
+Important intent from the older notes: Q9's PARTSUPP join condition is written
+with `ps_partkey` before `ps_suppkey` so Calcite extracts `(partkey, suppkey)` in
+primary-key order. The intended fully substituted query tier is one scan of the
+root indexed view/MI, followed by any remaining query operators. The five lower
+join pipelines are still present as index-creation and maintenance tiers.
+
 ### Q12
 
 The current Q12 example demonstrates an ORDERS/LINEITEM pipeline and a grouped
@@ -119,10 +134,10 @@ The maintenance converter can derive scoped logical delta plans and convert them
 to Enumerable plans. Treat those plans as reference structures. They are not an
 execution contract yet.
 
-Do not claim blanket 1-to-1 cascade cost. One source-record update adds one
-entry to a raw-source MI, but a downstream pipeline can emit multiple rows if
-the changed record joins with many rows, changes an aggregate state, or feeds a
-parent MI with a different key.
+State 1-to-1 maintenance at the right level. One source-record update can be
+1-to-1 with the MI being updated. That does not make the entire cascade 1-to-1:
+the delta from one MI to its parent can fan out, change an aggregate state, or
+be represented under a different key.
 
 Open execution details include signed deltas, aggregate retractions, old/new
 row visibility, batching, downstream application order, and transaction rules.
