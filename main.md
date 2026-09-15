@@ -5,6 +5,16 @@ PVLDB Vol. 19, 2026 — [Artifact](https://github.com/alicia-lyu/vldb19-artifact
 
 ---
 
+## Current Repository Note
+
+This file summarizes the published single-pipeline paper. It is background for
+the current Calcite fork, not the current implementation status. The active
+repository direction is multiple-pipeline planning as a research artifact, with
+manual LeanStore C++ implementations to follow. See
+[SESSION_PROGRESS.md](SESSION_PROGRESS.md) for the current state.
+
+---
+
 ## Abstract
 
 Relational databases face a tension between fast multi-table queries and frequent updates. Materialized join views accelerate queries but slow updates and waste space. Query-time joins over traditional indexes favor updates but limit query speed. This paper generalizes **merged indexes** — a multi-table B-tree/LSM structure — from two-table joins to multi-way joins and grouping operations that share a sort order. Multi-table merged indexes match materialized views for query performance (sometimes 2× faster) while matching traditional single-table indexes for update performance and space efficiency.
@@ -175,7 +185,16 @@ Merged indexes occupy the middle ground: they shift **sorting and clustering** t
 
 ## 9. Connection to This Calcite Implementation
 
-The Calcite proof-of-concept demonstrates **PATH A** (substitution): the planner identifies an order-based pipeline
+The current Calcite fork extends the published single-pipeline idea into a
+multi-pipeline plan artifact. It uses a substitution path: tests build
+order-based physical plans, register pipeline-backed MIs, and apply a HEP rule
+that replaces sort boundaries with `EnumerableMergedIndexScan` nodes.
+
+The scan nodes are structural. Their Java execution methods return empty
+enumerables, so this repository does not by itself prove query-result parity,
+runtime performance, or executable cascade maintenance.
+
+At a high level, the planner identifies an order-based pipeline
 
 ```
 EnumerableMergeJoin
@@ -183,10 +202,16 @@ EnumerableMergeJoin
   EnumerableSort → EnumerableTableScan(B)
 ```
 
-and replaces it wholesale with `EnumerableMergedIndexScan`, which represents the single-pass scan of Algorithm 1 above. The rule (`PipelineToMergedIndexScanRule`) fires when a registered `MergedIndex` covers the tables, and the cost model reflects that all sorts are eliminated (O(N log N) → O(N)) and N table scans collapse to one.
+and can replace the source sort boundaries with MI scans when a registered
+`MergedIndex` covers the relevant source and collation. Parent joins,
+aggregates, and later pipeline substitutions determine whether the final root
+plan collapses further.
 
-TPC-H tests exercise:
-- **Q12**: full 2-table pipeline (ORDERS ⋈ LINEITEM) replacement.
-- **Q3**: partial 3-table plan — inner (CUSTOMER ⋈ ORDERS) replaced; outer join with LINEITEM remains.
-- **Q3-OL**: inner (ORDERS ⋈ LINEITEM) replaced; outer join with CUSTOMER remains.
-- **Q9**: 6-table plan — all qualifying leaf joins replaced simultaneously.
+Current TPC-H structural examples:
+
+- **Q3-style**: nested ORDERS/LINEITEM and CUSTOMER structure, but not faithful
+  TPC-H Q3 predicate semantics.
+- **Q9**: nested six-table example for pipeline registration and maintenance-plan
+  capture; final ordering still needs validation.
+- **Q12**: ORDERS/LINEITEM example with grouped root plan; high-priority
+  predicate logic needs correction before it is semantic evidence.

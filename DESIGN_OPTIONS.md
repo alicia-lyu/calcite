@@ -1,246 +1,120 @@
 # Design Options for Multi-Table Merged Indexes
 
-This document catalogs open and settled design decisions for the merged index
-implementation in Calcite. Open decisions are research-relevant policy choices;
-settled decisions are engineering choices already committed to.
+This document separates implemented mechanics from research policy choices.
+Current code is a plan-generation artifact; it does not yet prove executable
+query performance or maintenance cost.
 
----
+## Settled Mechanics
+
+| Decision | Current choice |
+|----------|----------------|
+| Planning architecture | Volcano first, then HEP substitution |
+| Pipeline detection | Sort-boundary discovery in `Pipeline.buildTree` |
+| MI descriptor | `MergedIndex` wraps a `Pipeline` |
+| Rule trigger | Explicit sort boundaries, opt-in rule |
+| Nested registration | Leaf-to-root registration with repeated HEP passes |
+| Execution in Calcite | Stub scans return empty enumerables |
+| LeanStore path | Manual C++ plans first |
+| Automatic bridge | Deferred |
+| Cost-based MI choice | Deferred |
 
 ## Open Decisions
 
-### 1. Materialization Policy for Pipelines
+### 1. Materialization Policy
 
-**Question**: Should every pipeline's merged index be materialized
-(persisted), or should some be recomputed at query time from their preceding pipeline
+Should every discovered pipeline be stored as a physical MI?
 
-**Alternatives**:
+- All materialized: simplest query-time story, highest write and space cost.
+- Selective materialization: stores only valuable pipeline outputs.
+- Cost-based choice: uses query frequency, update frequency, fanout, and storage
+  estimates.
 
-- **All materialized** — every MI is a physical B-tree. Fastest queries, highest
-  space usage, most update overhead for deeply nested pipelines.
-- **Selective materialization** — only leaf MIs are materialized; intermediate
-  views are recomputed at query time from leaf scans. Reduces space and update
-  fan-out but adds query-time join work.
-- **Cost-based** — the optimizer chooses per-MI based on update frequency, query
-  frequency, and fan-out. Most flexible but requires accurate statistics.
+Current default in tests: materialize all registered pipelines for the selected
+example. This is a test policy, not an optimizer result.
 
-**Current default**: All materialized.
+### 2. Filter Placement
 
-**Prior paper reference** (`main.md`): §6 (Spectrum of Pre-computation, Table 4).
+Should filters be included in an MI creation plan or left above the MI scan?
 
-**Code reference**: `Pipeline.java:78` (`mergedIndex` field),
-`overhaul-03-10.md` pipeline categories table.
+- Unfiltered MI: more reusable across predicates, larger stored structure.
+- Filtered MI: smaller and faster for one predicate, less reusable.
 
----
+Current default in helpers: hoist filters toward the root pipeline so child MIs
+are predicate-agnostic when possible. This must be checked per query because
+hoisting can require widening projections and preserving predicate columns.
 
-### 2. Filter Handling When Creating Merged Indexes
+### 3. Hierarchical and Functional-Dependency Keys
 
-**Question**: When an order-based pipeline contains filters (e.g., Q9's
-`p_name LIKE '%green%'`), should the filter be included or deleted when
-creating the merged index?
+When can one MI serve several logical keys?
 
-Note: `EnumerableMergedIndexScan` is just a special `TableScan` — nothing is
-"pushed down" into it. The question is whether the MI creation plan (which
-replaces the pipeline) retains or drops the filter. Index creation plans and
-materialized view plans typically delete filters by default, producing an
-unfiltered index. Filters in the root pipeline then stay in the query plan above the scan.
-If inner pipelines drop their filters, those filters need to be moved to the
-final pipeline, provided that the filtered column is still included at that
-point.
+- Prefix-chain support is valid when keys are lexicographic prefixes.
+- Functional dependencies such as `orderkey -> custkey` do not automatically
+  make an orderkey scan custkey-sorted.
+- A physical design can extend keys, for example `(custkey, orderkey,
+  linenumber)`, but Calcite must model that design explicitly before matching it.
 
-A useful heuristic may be to omit predicates whose parameters can change across
-queries (e.g., `p_name LIKE '%green%'` vs. `'%blue%'`), preserving MI
-reusability. Predicates on stable attributes (e.g., status flags, type codes)
-may be safe to bake into the MI. Existing research on partial indexes and
-parameterized views is likely relevant — further investigation needed.
+Current default: exact collation/prefix matching, no FD-derived key rewriting.
 
-**Alternatives**:
+### 4. Shared Physical Scan Costing
 
-- **Delete filter (unfiltered MI)** — the MI stores all records; the filter
-  remains in the query plan above the scan. MI is maximally reusable across
-  queries with different predicates. This filter needs to be moved to the final pipeline.
-  We also need to ensure that the selected column stay in that final pipeline.
-- **Retain filter (filtered MI)** — the MI only stores records matching the
-  predicate. Smaller MI, but limits reuse (query-specific). Only appropriate
-  for stable predicates unlikely to change.
+Multiple logical `EnumerableMergedIndexScan` nodes can describe one intended
+physical pass over an MI. How should this be costed?
 
-**Current default**: Delete filter (unfiltered MI); filter stays in query plan.
+- Independent costing: each logical scan pays its own estimate.
+- Shared-scan costing: first scan pays I/O; later scans pay mainly CPU.
+- Amortized costing: split I/O across a scan group.
 
-**Prior paper reference** (`main.md`): §4.3 (complex queries).
+Current default: independent local estimates. HEP substitution does not consult
+these costs, so the estimates are descriptive only.
 
-**Code reference**: `CLAUDE.md:166-169` (Q9 two-tier plan).
+### 5. Maintenance Semantics
 
----
+The converter can build logical and physical maintenance-plan trees. The storage
+and transaction contract remains open.
 
-### 3. Hierarchical vs. Independent Keys
+Open choices:
 
-**Question**: When can a single MI serve a prefix-chain of join keys (§3.2) vs.
-requiring separate MIs per key?
+- eager versus batched propagation
+- signed delta representation
+- aggregate replacement and retraction
+- old/new row visibility
+- downstream write ordering
+- how a scan group maps to one storage cursor
 
-**Alternatives**:
+Do not state that cascades are 1-to-1 in general. A base-table change can produce
+multiple downstream output changes depending on join fanout and aggregation.
 
-- **Independent keys only** — each MI serves exactly one shared key. Separate MIs
-  needed for `orderkey` and `custkey` even if one is functionally dependent on
-  the other. Simple matching logic.
-- **Prefix-chain support** — a single MI sorted on `(k1, k2, k3)` serves joins
-  on any prefix `(k1)`, `(k1, k2)`, etc. Requires hierarchical key detection
-  in `MergedIndex.satisfies()`.
-- **FD-aware prefix chains** — extends prefix-chain support with functional
-  dependency reasoning (see decision #4).
+### 6. Final Ordering
 
-**Current default**: Independent keys only; `MergedIndex.satisfies()` uses exact
-prefix matching.
+Injected sorts are mostly driven by join and aggregate requirements. ORDER BY
+requirements need separate validation after MI substitution, especially when a
+hash aggregate remains in the root plan.
 
-**Prior paper reference** (`main.md`): §3.2 (Hierarchical Join Keys).
+Current known issue: the Q9 root plan can feed an `EnumerableAggregate`; that
+operator does not guarantee the requested final order.
 
-**Code reference**: `MergedIndex.java:174` (`satisfies()`),
-`CLAUDE.md:158-164`.
+### 7. Tagged-Row Representation
 
----
+How should interleaved records be represented when execution is implemented?
 
-### 4. Functional Dependency Exploitation
+- Java `Object[]` plus domain tags is useful for plan debugging.
+- Byte-string keys and typed payloads match LeanStore/RocksDB more closely.
+- A hybrid representation may help tests without requiring a full storage engine.
 
-**Question**: Can FDs (e.g., `o_orderkey -> o_custkey`) allow a single 3-table MI
-instead of two nested MIs?
+Current Calcite code only carries metadata. LeanStore owns the real physical
+representation.
 
-This is equivalent to minimizing pipeline count. For Q3, the sort on custkey can be pushed down to the sorts on orderkey, and this will require extending the lineitem rows with custkey.
+## Current Artifact Decisions
 
-**Current default**: Not exploited (two nested MIs).
+For the next phase, treat the current repository as:
 
-**Prior paper reference** (`main.md`): §3.4 (Multi-Table Aggregations, FD example).
+- a reproducible plan-shape artifact for multiple pipelines
+- a source of DOT plans and maintenance-plan hypotheses
+- a guide for manual LeanStore C++ implementations
 
-**Code reference**: `CLAUDE.md:105-117` (Functional Dependencies and 3-Table Q3),
-`MergedIndex.java` TODO at `satisfies()`.
+Do not treat it as:
 
----
-
-### 5. Cost Model for Shared Physical Scan
-
-**Question**: How should the optimizer cost N logical MI scans that share one
-physical sequential scan of the same merged index?
-
-**Alternatives**:
-
-- **Independent costing** — each `EnumerableMergedIndexScan` is costed as a
-  separate sequential scan. Overstates I/O when multiple scans share the same
-  physical pass.
-- **Shared-scan costing** — the first scan pays full I/O; subsequent scans of the
-  same MI pay only CPU (buffer hit). Requires scan-sharing detection in the cost
-  model.
-- **Amortized costing** — total I/O divided equally among all scans of the same
-  MI. Simpler but less accurate for plans where not all scans execute.
-
-**Current default**: Independent costing.
-
-**Prior paper reference** (`main.md`): §6 (pre-computation spectrum implies shared maintenance).
-
-**Code reference**: `overhaul-03-10.md` Subtask 4,
-`EnumerableMergedIndexScan.java` (`computeSelfCost`).
-
----
-
-### 6. Maintenance Plan Structure
-
-**Question**: For cascading updates through nested MIs, what is the update
-propagation model and how to represent it in the plan?
-
-**Logical Plan Derivation** (settled):
-- **Scoped logical maintenance plans** (commit `b51533254`): Each pipeline's
-  maintenance plan is derived only from its own `logicalRoot` subtree. Child
-  pipeline subtrees are replaced with `LogicalValues.createEmpty` placeholders at
-  derivation time to avoid re-deriving the same subtree twice. The original
-  `p.logicalRoot` stays immutable; scoping is performed via a temporary copy in
-  `scopeLogicalRoot()`.
-- **General-purpose derivation** (commits `cdaa4b637`, `e27b14124`): Wrapped in
-  `LogicalDelta` + applied `StreamRules` via HEP (6 rules: all except
-  DeltaTableScanRule/EmptyRule). Works for any logical subtree (not just joins).
-  Eliminates type-equivalence failures via `SetOp.deriveRowType()` fast-path.
-
-**Physical Plan Conversion** (open):
-- Current state: Logical maintenance plans are complete; physical conversion is
-  the next milestone.
-- Design question: how to represent `LogicalDelta(TableScan)` physically?
-  Options: (a) `EnumerableDeltaTableScan`, (b) reuse stream infrastructure,
-  (c) Volcano conversion of logical plan.
-- Single-source pipeline maintenance: indexed views currently lack maintenance
-  plans; need to extend `deriveMaintenancePlan` to cover single-source pipelines.
-
-**Update Propagation Model** (future):
-- **Eager cascade** — a base-table update immediately propagates through all
-  dependent MIs. Simple semantics, potentially high write amplification for
-  deep nesting.
-- **Lazy (tag-based) propagation** — updates are tagged and deferred; dependent
-  MIs are refreshed on next read or at batch boundaries. Lower write
-  amplification but stale reads possible.
-- **Hybrid** — leaf MIs updated eagerly (1-to-1 cost); outer MIs updated lazily
-  or on demand.
-
-**Current default**: Eager cascade (no implementation yet; derived plans only).
-
-**Prior paper reference** (`main.md`): §5 (Index Maintenance).
-
-**Code reference**: `materialize/Pipeline.java` (`deriveMaintenancePlan`),
-`materialize/Pipeline.java` (`scopeLogicalRoot`),
-`async-spinning-beacon.md` (Grand Plan for logical→physical conversion).
-
----
-
-### 7. Sort Direction Propagation
-
-**Question**: Should injected sorts match downstream direction requirements to
-avoid redundant re-sorts?
-
-**Alternatives**:
-
-- **Always ASC** — simplest. Downstream operators that need DESC (e.g., Q9
-  `ORDER BY o_year DESC`) require an additional sort.
-- **Direction-aware injection** — `injectSortsBeforeSortBasedOps` inspects
-  downstream consumers and injects sorts with the required direction. Eliminates
-  redundant re-sorts but adds complexity to sort injection.
-- **Bidirectional MI storage** — the MI stores records in both directions (or
-  supports reverse iteration). Eliminates the problem at the storage level.
-
-**Current default**: Always ASC (`new RelFieldCollation(idx)` defaults to ASC).
-
-**Prior paper reference** (`main.md`): §3.1 (sort order in merged indexes).
-
-**Code reference**: `overhaul-03-10.md:17-19`,
-`MergedIndexTestUtil.java` (`injectSortsBeforeSortBasedOps`).
-
----
-
-### 8. Physical Representation of Tagged Rows
-
-**Question**: How should interleaved records be represented in the scan operator?
-
-**Alternatives**:
-
-- **Object[] with domain tags** — Java-native, easy to debug, works with
-  Calcite's `Enumerable<Object[]>` interface. Not representative of real B-tree
-  storage.
-- **Byte strings** — closer to actual B-tree/LSM storage format described in
-  §3.3. Requires serialization/deserialization, but demonstrates the paper's
-  record structure faithfully.
-- **Hybrid** — byte-string keys with Object[] payloads. Demonstrates key
-  comparison semantics without full serialization overhead.
-
-**Current default**: Object[] with domain tags.
-
-**Prior paper reference** (`main.md`): §3.3 (Record Structure).
-
-**Code reference**: `TaggedRowSchema.java`.
-
----
-
-## Settled Decisions
-
-These are engineering choices already committed to. Included for completeness.
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Architecture | Transparent per-source MI scans | Each boundary Sort replaced by per-source MIScan returning source-native rows; parent operators (MergeJoin, SortedAgg) stay unchanged |
-| Execution scope | Plan generation only; no real execution in Calcite | Calcite has no storage engine; `implement()` stubs return empty enumerables. Real B-tree/LSM execution is a separate system |
-| Pipeline identification | Sort-boundary-based | More robust than join-centered; aligns with interesting ordering theory |
-| PoC path | PATH A (substitution) | PATH B (native collation reporting) deferred; substitution sufficient for paper |
-| Rule registration | Opt-in explicit (not in `ENUMERABLE_RULES`) | Avoids interfering with unrelated Calcite tests |
-| Multi-pass HEP | Separate `HepPlanner` per nesting level | Single-pass unreliable for dependent pipeline replacements |
-| Aggregate views in MI | MI stores whatever `p.sources` produces | Obsolete from prior paper (`main.md`); aggregates are just part of the pipeline, not a separate MI design choice |
+- a finished full TPC-H optimizer
+- an executable MI implementation in Java
+- proof that all substitutions are cheaper
+- proof that all maintenance cascades have single-row fanout

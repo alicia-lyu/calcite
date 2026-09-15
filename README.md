@@ -22,6 +22,22 @@ limitations under the License.
 
 # Apache Calcite
 
+## Merged-index research fork
+
+This fork explores rule-based plans for queries with multiple order-sharing
+pipelines, extending the [published single-pipeline study](https://www.vldb.org/pvldb/vol19/p3621-lyu.pdf).
+Calcite serves as a reproducible planning artifact. Future query execution will
+be implemented manually in LeanStore and may adapt the reference plans;
+automatic integration and MI-aware cost optimization are deferred.
+
+Start with [current status and TPC-H coverage](SESSION_PROGRESS.md),
+[research and agent guidance](CLAUDE.md), and the
+[manual LeanStore handoff](CALCITE_LEANSTORE_INTEGRATION.md).
+The existing examples validate plan structure, not complete benchmark results
+or executable cascade maintenance.
+
+## Upstream project
+
 Apache Calcite is a dynamic data management framework.
 
 It contains many of the pieces that comprise a typical

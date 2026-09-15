@@ -1,182 +1,62 @@
-# Single-Pipeline Merged Index: TPC-H Analysis
+# Single-Pipeline Merged Index Notes
 
-## Overview
+This document is historical context from the published single-pipeline phase.
+The active next phase is multiple-pipeline planning and manual LeanStore C++
+implementation. Do not treat this file as the current roadmap.
 
-The VLDB experiments compare four storage structures on TPC-H:
+## Historical Scope
 
-1. Traditional single-table indexes (B-trees, one per table) + merge join
-2. Materialized views (pre-computed join results)
-3. **Single merged index** — one MI covering one pipeline of the query
-4. Traditional single-table indexes (B-trees, one per table) + hash join
+The VLDB paper compares:
 
-The existing Calcite tests in `MergedIndexTpchPlanTest` demonstrate **multi-MI
-cascade**: every pipeline in the query gets its own merged index, collapsing the
-entire plan into a single `EnumerableMergedIndexScan`. That is the subject of the
-next paper.
+1. traditional single-table indexes plus query-time joins
+2. materialized views
+3. one merged index covering one order-sharing pipeline
+4. hash-join baselines
 
-The **single-MI** approach is the focus of the current paper: pick exactly ONE
-pipeline, build ONE merged index for it, and leave all remaining joins as regular
-query-time operators.
+In that setting, a query may contain one useful MI pipeline while the rest of the
+query executes conventionally. This is different from the current multi-pipeline
+Calcite artifact, where nested pipeline descriptors can be registered and
+substituted level by level.
 
-### Key framing: candidates are conceptual
+## Candidate Enumeration
 
-Single MI candidates are defined by **tables and sort key**, not by the current
-multi-MI plan shape. A choice of MI may dictate the plan shape. Any set of tables
-whose join/aggregation operations require compatible sort orders can be stored in
-one merged index — including single-table indexed views (one row type, sorted on a
-query-relevant key). This is independent of how many pipelines the current Volcano
-plan happens to produce. Two candidates may overlap (share tables). The
-experimental evaluation determines which candidate yields the best trade-off.
+`testkit/src/main/java/org/apache/calcite/test/SingleMIPipelineIdentifier.java`
+enumerates conceptual single-MI candidates from a logical plan:
 
-The `SingleMIPipelineIdentifier` algorithm automates candidate enumeration from
-the logical plan, replacing the earlier approach of purely manual SQL rewrites.
+1. collect sort requirements from joins, aggregates, and ORDER BY
+2. build equivalence classes from equi-join predicates
+3. consolidate prefix-compatible collations
+4. enumerate globally consistent table/key subsets
+5. rank candidates, currently by table count
 
----
+These candidates are useful background for choosing manual LeanStore plans, but
+they are not a complete optimizer.
 
-## Pipeline Identification Algorithm
+## Historical Results
 
-Implemented in `testkit/.../SingleMIPipelineIdentifier.java`. Given a logical
-plan, the algorithm:
+| Query | Candidates found in historical tests | Notes |
+|-------|--------------------------------------|-------|
+| Q12 | `{ORDERS, LINEITEM}` by orderkey | Single-MI substitution test existed |
+| Q3 | `{CUSTOMER, ORDERS}` by custkey and `{ORDERS, LINEITEM}` by orderkey | No 3-table candidate without modeling extended keys |
+| Q9 | `{LINEITEM, PART, PARTSUPP}` and `{LINEITEM, PARTSUPP, SUPPLIER}` style candidates | Tie-breaking needed better cardinality metrics |
 
-1. **Enumerate sort requirements** — Walk the plan tree. For each sort-based
-   operator (Join, Aggregate, Sort), trace key columns to base tables via
-   `RelMetadataQuery.getColumnOrigins()`. Each produces a `(table, collation)`
-   requirement. All operators are treated uniformly — joins are not special.
+Older notes mention Q5 and Q7 as next candidates. Those are no longer the active
+documentation target; the current plan is a broader query-by-query worksheet for
+manual LeanStore work.
 
-2. **Build column equivalence classes** — Extract all equi-join conditions, build
-   union-find of `(table, column)` pairs. Two columns in different tables belong
-   to the same class when equi-joined.
+## Relationship to Multi-Pipeline Work
 
-3. **Prefix consolidation** — Group requirements by table. Merge collations
-   sharing a prefix relationship. **Compound-key reordering**: multi-column keys
-   from joins or GROUP BY can be reordered to maximize prefix matches (ORDER BY
-   keys cannot). Both original and reordered versions are kept as options.
+The single-MI candidate finder is still useful for:
 
-4. **Find globally-consistent subsets** — Enumerate table combinations. Map each
-   collation to equivalence-class space. Check if all form a valid prefix chain
-   (one subsumes all others as prefixes). No separate connectivity check is
-   needed — a valid prefix chain implicitly ensures tables share a logical sort
-   key.
+- identifying order-sharing subsets inside a larger query
+- explaining why independent keys need separate pipelines
+- comparing one-MI and cascade-style designs
 
-5. **Rank candidates** — Sort by table count (descending). Cardinality-based
-   ranking is future work.
+It does not answer:
 
-### Verified results
+- how to maintain nested MIs
+- how to share one physical scan across logical source scans
+- whether final ordering survives substitution
+- which LeanStore physical key layout is best
 
-**Q12** (2 tables): `{ORDERS, LINEITEM}` by orderkey
-
-**Q3** (3 tables, 2 candidates):
-
-- `{CUSTOMER, ORDERS}` by custkey
-- `{ORDERS, LINEITEM}` by orderkey
-- No 3-table candidate — custkey and orderkey are independent keys with no
-  prefix relationship
-
-**Q9** (6 tables, multi-table candidates):
-
-- `{LINEITEM, PART, PARTSUPP}` by (partkey, suppkey) — **3 tables** (tied)
-- `{ORDERS, LINEITEM}` by orderkey — 2 tables
-- `{LINEITEM, SUPPLIER}` by (suppkey, partkey) — 2 tables (reordered compound key)
-- `{SUPPLIER, NATION}` by nationkey — 2 tables
-- `{PART, PARTSUPP}` by partkey — 2 tables
-- Cannot extend `{L, P, PS}` with SUPPLIER: L's sort `[partkey, suppkey]` does
-  not provide `[suppkey]` order alone
-- `{LINEITEM, PARTSUPP, SUPPLIER}` by (suppkey, partkey) — **3 tables** (tied;
-  reordered compound key trades PART for SUPPLIER)
-- Tie-breaking between the two 3-table candidates requires a richer metric
-  (cardinality, filter selectivity, re-sort cost). Current default: table count
-  only, so enumeration order determines output position.
-
----
-
-## Candidate MI Analysis
-
-For each candidate MI, the analysis reasons about:
-
-1. **Plan shape required** — what join order the query plan must take
-2. **What the MI absorbs** — which joins, sorts, aggregations move to maintenance
-   time
-3. **What remains at query time** — remaining joins, filters, projections; re-sort
-   cost
-4. **Storage cost** — row count, row width, index size estimate
-5. **Update cost** — maintenance overhead per base-table insert/delete
-
-The pipelines from the current multi-MI plans (in `MergedIndexTpchPlanTest`) are
-valid candidates, but not the only ones. For example, Q12 admits both the
-two-table join pipeline (ORDERS ⋈ LINEITEM by orderkey) and a single-table
-indexed view (LINEITEM sorted by shipmode, used directly for the GROUP BY).
-
-Per-query analysis: TBD — to be filled as each candidate is implemented in tests.
-
----
-
-## int-ord-plans/ Deliverables
-
-Expected directory structure for the leanstore integration:
-
-```
-calcite-integration-info/int-ord-plans/
-  q12/
-    plan.dot          ← query-time plan with selected MI substituted
-    maintenance.dot   ← maintenance plan for the selected MI
-    README.md         ← candidate chosen, analysis summary
-  q3/
-    plan.dot
-    maintenance.dot
-    README.md
-  q9/
-    plan.dot
-    maintenance.dot
-    README.md
-```
-
-- `plan.dot` — query-time plan with only the selected MI substituted; remaining
-  joins intact (not full cascade)
-- `maintenance.dot` — incremental maintenance plan for the selected MI
-- `README.md` — candidate chosen, plan shape, operators absorbed, query-time
-  remainder, re-sort cost
-
----
-
-## Running Tests
-
-```bash
-# Single-MI pipeline identification + substitution tests
-./gradlew :plus:cleanTest :plus:test --tests "*.MergedIndexSinglePipelineTpchPlanTest" --info
-
-# Multi-MI tests (regression check)
-./gradlew :plus:cleanTest :plus:test --tests "*.MergedIndexTpchPlanTest" --info
-```
-
----
-
-## Test Files
-
-**`MergedIndexSinglePipelineTpchPlanTest`** (same package as
-`MergedIndexTpchPlanTest`):
-
-- `testIdentifyQ12()`, `testIdentifyQ3()`, `testIdentifyQ9()` — pipeline
-  identification tests (working, all pass)
-- `tpchQ12OlMI()`, `tpchQ3OlMI()`, `tpchQ3CoMI()`, `tpchQ9OlMI()`,
-  `tpchQ9LpsMI()` — MI substitution tests (placeholders)
-- `tpchQ5()`, `tpchQ7()` — TBD
-
-**`SingleMIPipelineIdentifier`** (`testkit/`):
-
-- 5-step algorithm: enumerate → equivalence classes → consolidate → find subsets
-  → rank
-- Key inner classes: `SortRequirement`, `Candidate`, `TableCol`, `UnionFind`
-
-**`TpchPlanTestUtil`** — shared DOT visualization helpers
-
----
-
-## Status
-
-| Query | Identification | Candidates found | MI substitution test | DOTs |
-|-------|---------------|-----------------|---------------------|------|
-| Q12 | ✅ Done | `{O,L}` by orderkey | ✅ `tpchQ12OlMI` | ✅ `q12-ol/` |
-| Q3 | ✅ Done | `{C,O}` by custkey; `{O,L}` by orderkey (tied) | ✅ `tpchQ3OlMI` ({O,L} chosen) | ✅ `q3-ol/` |
-| Q9 | ✅ Done | `{L,P,PS}` 3-table + `{L,PS,S}` 3-table (tied) + 2-table | ✅ `tpchQ9LpsMI` ({L,P,PS} chosen) | ✅ `q9-lps/` |
-| Q5 | — | — | — | — |
-| Q7 | — | — | — | — |
+Use [SESSION_PROGRESS.md](SESSION_PROGRESS.md) for current status and next steps.

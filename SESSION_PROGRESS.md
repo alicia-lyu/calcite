@@ -1,365 +1,157 @@
-# Session Progress: Merged Index Feature
+# Session Progress: Multi-Pipeline Merged Indexes
 
-## Status
+This file is the current entry point for resuming work. It supersedes older
+notes that described the single-pipeline paper phase or earlier integration
+plans.
 
-| Item                                                                    | Status  |
-|-------------------------------------------------------------------------|---------|
-| `CLAUDE.md` + `main.md`                                                 | Done    |
-| `core/.../materialize/MergedIndex.java` (+ `sources` field, `of()` factory) | Done |
-| `core/.../materialize/MergedIndexRegistry.java` (`findFor(List<Object>, ...)`) | Done |
-| `core/.../adapter/enumerable/EnumerableMergedIndexScan.java`            | Done    |
-| `core/.../adapter/enumerable/EnumerableMergedIndexJoin.java`            | Deleted (per-source arch) |
-| `core/.../adapter/enumerable/PipelineToMergedIndexScanRule.java` (Sort-boundary) | Done |
-| `core/.../adapter/enumerable/EnumerableRules.java` (constant)           | Done    |
-| `core/.../adapter/enumerable/EnumerableMergedIndexDeltaScan.java` (NEW) | Done ✓ (per-source with sourceIndex+scanGroup) |
-| `core/.../adapter/enumerable/DeltaToMergedIndexDeltaScanRule.java` (NEW)| Done ✓ (updated to pass through sourceIndex/scanGroup) |
-| `core/.../rel/logical/LogicalPipelineOutputScan.java` (NEW)             | Done ✓ |
-| `core/.../adapter/enumerable/LogicalTableScanToMergedIndexRule.java` (NEW) | Done ✓ |
-| `core/.../adapter/enumerable/PipelineOutputScanRule.java` (NEW)         | Done ✓ |
-| `core/.../adapter/enumerable/PipelineToMergedIndexScanRuleTest.java`    | Done ✓  |
-| `core/.../materialize/MaintenancePlanConverter.java` (NEW)              | Done ✓  |
-| `testkit/.../test/SingleMIPipelineIdentifier.java` (NEW, Step A done)    | Done ✓  |
-| TPC-H Q3 (deleted — incorrect CUSTOMER+ORDERS example)                  | Removed |
-| TPC-H Q12 (2-table: ORDERS ⋈ LINEITEM, full substitution)              | Done ✓  |
-| TPC-H Q3-OL full 3-table substitution — `tpchQ3OrdersLineitem()`        | Done ✓  |
-| TPC-H Q9 (6-table, all leaf joins substituted)                          | Done ✓  |
-| Pipeline overhaul: sort-boundary-based discovery                         | Done ✓  |
-| Rule generalization: accept SortedAggregate inputs                       | Done ✓  |
-| `inputAlreadySorted` direction check fix                                 | Done ✓  |
-| `flattenPipelines`: `p.mergedIndex != null` (not source count)           | Done ✓  |
-| `MergedIndexTestUtil` — shared test helpers extracted to `testkit`        | Done ✓  |
-| `TaggedRowSchema` — tagged interleaved row metadata (Subtask 1)          | Done ✓  |
-| Pipeline discovery moved to `Pipeline.java` (production code)            | Done ✓  |
-| Single-source indexed views (Q12, Q9)                                    | Done ✓  |
-| Q9 sort direction fix (`propagateOrderByDirection`)                      | Done ✓  |
-| Index Creation Plan Capture (Subtask 2) — Q12 wired into HEP loop        | Done ✓  |
+## Current State
 
-## Terminology
+The implementation is a Calcite planning artifact. It demonstrates how a query
+can be decomposed into order-sharing pipelines, how registered merged indexes
+(MIs) can replace sort boundaries, and how index-creation and maintenance plan
+trees can be captured for those pipelines.
 
-- **Bottom side** / earlier = input side (table scans, leaf pipelines). Smaller field indices.
-- **Top side** / later = output side (final result, root pipeline).
-- `injectSortsBeforeSortBasedOps` processes bottom-up (starts from input side) for proper
-  recognition of sorted inputs by later operators.
+It is not an executable benchmark system. `EnumerableMergedIndexScan` and
+`EnumerableMergedIndexDeltaScan` are plan nodes whose `implement()` methods
+return empty enumerables. Query execution will be written manually in LeanStore
+first, following the current Q3/Q5/Q10 style there. Automatic Calcite-to-LeanStore
+plan export and an MI-aware cost-based optimizer are deferred.
 
-## Commands
+## Verified Implementation Pieces
+
+| Area | Status |
+|------|--------|
+| `Pipeline` sort-boundary discovery | Implemented |
+| `MergedIndex` pipeline descriptor | Implemented |
+| `MergedIndexRegistry` source and collation matching | Implemented |
+| `PipelineToMergedIndexScanRule` HEP substitution | Implemented |
+| Shared scan metadata with `MergedIndexScanGroup` | Implemented |
+| Tagged-row metadata with `TaggedRowSchema` | Implemented |
+| Logical maintenance derivation with `MaintenancePlanConverter` | Implemented |
+| Physical maintenance-plan conversion to Enumerable | Implemented |
+| TPC-H multi-MI structural examples | Q3, Q9, Q12 only |
+| TPC-H full workload coverage | Not implemented |
+| Query-result parity tests | Not implemented |
+| LeanStore automatic bridge | Deferred |
+
+Focused tests were last rerun during the September 2026 doc sweep:
 
 ```bash
-# Run TPC-H plan tests
-./gradlew :plus:cleanTest :plus:test --tests "*.MergedIndexTpchPlanTest" --info
-
-# Run core rule test
-./gradlew :core:test --tests "*.PipelineToMergedIndexScanRuleTest"
-
-# Run single-MI pipeline tests
-./gradlew :plus:cleanTest :plus:test --tests "*.MergedIndexSinglePipelineTpchPlanTest" --info
+./gradlew :plus:cleanTest :core:cleanTest :plus:test --tests '*.MergedIndexTpchPlanTest' :core:test --tests '*.PipelineToMergedIndexScanRuleTest' --offline
 ```
 
-Search for `=== Q12 BEFORE`, `=== Q12 AFTER`, `=== Q3 OL AFTER`, `=== Q9 AFTER` in output.
+Result: build successful. These tests validate plan structure, DOT generation,
+and rule behavior. They do not validate SQL result equivalence or LeanStore
+execution.
 
-### Sample AFTER output (with indexed views)
+## TPC-H Coverage
 
-**Q12** (2-table + indexed view — MergeJoin absorbed):
+| Query | Current MI plan artifact | Notes |
+|-------|--------------------------|-------|
+| Q1 | None | No multi-pipeline artifact |
+| Q2 | None | No multi-pipeline artifact |
+| Q3 | Partial | Structural Q3-style plan exists, but current test SQL omits the real market-segment and date predicates |
+| Q4 | None | No multi-pipeline artifact |
+| Q5 | None in Calcite multi-MI tests | LeanStore has a manual implementation path |
+| Q6 | None | No multi-pipeline artifact |
+| Q7 | None | No multi-pipeline artifact |
+| Q8 | None | No multi-pipeline artifact |
+| Q9 | Partial | Six-table structural example exists; final ordering and full semantics need validation |
+| Q10 | None in Calcite multi-MI tests | LeanStore has a manual implementation path |
+| Q11 | None | No multi-pipeline artifact |
+| Q12 | Partial | Two-level structural example exists, but high-line-count logic currently omits `2-HIGH` |
+| Q13 | None | No multi-pipeline artifact |
+| Q14 | None | No multi-pipeline artifact |
+| Q15 | None | No multi-pipeline artifact |
+| Q16 | None | No multi-pipeline artifact |
+| Q17 | None | No multi-pipeline artifact |
+| Q18 | None | No multi-pipeline artifact |
+| Q19 | None | No multi-pipeline artifact |
+| Q20 | None | No multi-pipeline artifact |
+| Q21 | None | No multi-pipeline artifact |
+| Q22 | None | No multi-pipeline artifact |
+
+Ordinary Calcite TPC-H examples exist elsewhere in the tests, but they are not
+multi-MI artifacts and should not be counted as implemented MI plans.
+
+## Query Artifacts
+
+DOT files are written under `plus/test-dot-output/`.
+
+### Q3
+
+The current Q3-style plan preaggregates LINEITEM by orderkey, joins ORDERS by
+orderkey, then joins CUSTOMER by custkey and applies a revenue/date ordering.
+It is useful for demonstrating nested pipelines, but it is not a faithful TPC-H
+Q3 semantic test because the important predicates are missing.
+
+LeanStore's manual Q3 implementation has already adapted the physical design by
+using a custkey-extended COL index. That is stronger than what the Calcite plan
+currently models.
+
+### Q9
+
+The current Q9 example fixes a join sequence:
 
 ```text
-EnumerableSort(l_shipmode)                ← ORDER BY (no-op)
-  EnumerableSortedAggregate(l_shipmode)
-    MIScan(ivMI)                           ← indexed view on l_shipmode
+ORDERS -> LINEITEM -> PART -> PARTSUPP -> SUPPLIER -> NATION
 ```
 
-**Q3-OL** root query plan (outer pipeline — no indexed view, LimitSort not a boundary):
-
-```text
-EnumerableLimitSort
-  EnumerableProject
-    EnumerableMergeJoin(custkey)                  ← STAYS
-      MIScan(MI_outer, src=inner_view, group=G2)  ← replaces Sort→(inner result)
-      MIScan(MI_outer, src=CUSTOMER, group=G2)    ← replaces Sort→Scan(CUSTOMER)
-```
-
-**Q9** (6-table + indexed view — entire plan collapses):
-
-```text
-MIScan(ivMI)                               ← single scan, entire plan collapsed
-```
-
-ORDER BY is redundant after GROUP BY and was removed. The final MIScan absorbs
-all 5 joins + filter + aggregate, sorted by the GROUP BY key (n_name, o_year DESC).
-
----
-
-## Test Plan Summaries
-
-Full DOT diagrams in `plus/test-dot-output/`. Plans are accurate as of the last test run.
-
-### Query time vs. maintenance time
-
-The BEFORE plan (Phase 1, pre-HEP) IS the maintenance plan for each merged index.
-At update time, when a base table row is inserted/deleted/updated, the affected
-pipeline segment re-executes for the changed key and updates the merged index.
-This is 1-to-1 cost: one base-table change → one merged index entry change,
-the same as a traditional single-table index.
-
-For nested merged indexes (Q3-OL, Q9), updates cascade level-by-level: a base
-table change triggers the inner maintenance plan, whose output delta triggers the
-outer maintenance plan, and so on. Each individual step is still 1-to-1; there
-are depth-many cascading steps total.
-
----
-
-### Q12 — 2-table + indexed view (`tpchQ12`)
-
-Key: `o_orderkey = l_orderkey`. 2 pipelines: join + indexed view on l_shipmode.
-
-```text
-BEFORE                                     AFTER (indexed view absorbs MergeJoin)
-EnumerableSort(l_shipmode)                 EnumerableSort(l_shipmode)   ← ORDER BY
-  EnumerableSortedAggregate                  EnumerableSortedAggregate
-    EnumerableSort(l_shipmode)                 MIScan(ivMI)             ← indexed view
-      EnumerableMergeJoin(orderkey)
-        EnumerableSort → Scan(ORDERS)
-        EnumerableSort → Scan(LINEITEM)
-```
-
----
-
-### Q3-OL — 3-table (`tpchQ3OrdersLineitem`)
-
-Keys: `l_orderkey = o_orderkey` (inner), `o_custkey = c_custkey` (outer). Two pipelines.
-
-```text
-BEFORE (full plan)
-EnumerableLimitSort
-  EnumerableProject
-    EnumerableMergeJoin(custkey)          ← outer pipeline
-      EnumerableSort(custkey)
-        EnumerableMergeJoin(orderkey)     ← inner pipeline
-          EnumerableSort
-            EnumerableAggregate → Scan(LINEITEM)
-          EnumerableSort → Scan(ORDERS)
-      EnumerableSort → Scan(CUSTOMER)
-```
-
-```text
-AFTER — Root query plan (outer pipeline only)
-EnumerableLimitSort
-  EnumerableProject
-    EnumerableMergeJoin(custkey)                     ← STAYS
-      MIScan(MI_outer, src=inner_view, group=G2)    ← replaces Sort→(inner result)
-      MIScan(MI_outer, src=CUSTOMER, group=G2)      ← replaces Sort→Scan(CUSTOMER)
-```
-
-```text
-AFTER — Index creation plan (inner pipeline, populates MI_inner)
-EnumerableMergeJoin(orderkey)
-  EnumerableSortedAggregate → TableScan(LINEITEM)
-  TableScan(ORDERS)
-```
-
----
-
-### Q9 — 6-table + indexed view (`tpchQ9`)
-
-Keys: orderkey → partkey → (partkey,suppkey) → suppkey → nationkey.
-6 pipelines: 5 join + 1 indexed view on (n_name ASC, o_year DESC).
-
-After `propagateOrderByDirection`, the GROUP BY sort direction changes from
-`(n_name ASC, o_year ASC)` to `(n_name ASC, o_year DESC)` matching the ORDER BY.
-Both ORDER BY and GROUP BY sorts are boundary sorts → two indexed view levels.
-
-```text
-BEFORE (after sort-direction fix)
-EnumerableAggregate(n_name, o_year)
-  EnumerableSort(n_name ASC, o_year DESC)    ← GROUP BY (boundary sort)
-    EnumerableProject → Filter → 5 nested MergeJoins...
-```
-
-```text
-AFTER — Entire plan collapses to indexed view scan
-EnumerableMergedIndexScan(ivMI)               ← indexed view, sorted by n_name, o_year DESC
-```
-
-Inner pipelines (index creation plans, 5 levels):
-- L1: MI(OL) by orderkey — MergeJoin(ORDERS, LINEITEM)
-- L2: MI(OLP) by partkey — MergeJoin(OL_view, PART)
-- L3: MI(OLPS) by (partkey,suppkey) — MergeJoin(OLP_view, PARTSUPP)
-- L4: MI(OLPPS) by suppkey — MergeJoin(OLPS_view, SUPPLIER)
-- L5: MI(OLPPSN) by nationkey — MergeJoin(OLPPS_view, NATION)
-
----
-
-## Maintenance & Index Creation
-
-See `CLAUDE.md` (§ "Architecture: Sort-Boundary-Based Pipeline Replacement") for the
-full design. Key production classes:
-
-- `MaintenancePlanConverter`: `deriveMaintenancePlan`, `scopeLogicalRoot`,
-  `replaceChildBoundaries`, `convertToPhysical`, `IVM_RULES`.
-- Physical maintenance plan (2-source example):
-  ```
-  EnumerableUnion
-  ├─ EnumerableMergeJoin
-  │  ├─ EnumerableMergedIndexScan(MI, ORDERS, group=G)
-  │  └─ EnumerableMergedIndexDeltaScan(MI, LINEITEM, group=G)
-  └─ EnumerableMergeJoin
-     ├─ EnumerableMergedIndexDeltaScan(MI, ORDERS, group=G)
-     └─ EnumerableMergedIndexScan(MI, LINEITEM, group=G)
-  ```
-  All 4 scans share group G (same pipeline, same MI).
-
----
-
-## SingleMIPipelineIdentifier — Pipeline Selection Algorithm
-
-**File**: `testkit/src/main/java/org/apache/calcite/test/SingleMIPipelineIdentifier.java`
-
-### Algorithm (5 steps)
-
-1. **`enumerateRequirements()`**: Walk logical plan. For each sort-based operator (Join, Aggregate, Sort), trace key columns to base tables via `RelMetadataQuery.getColumnOrigins()`. Emit `(table, collation)` per operator side. All operators treated uniformly.
-
-2. **`buildEquivalenceClasses()`**: Union-find over all equi-join conditions. Merges `(table, column)` pairs that are equi-joined into equivalence classes.
-
-3. **`consolidate()`**: Group requirements by table. Merge prefix-compatible collations. Compound-key reordering: try permutations of reorderable keys (join/GROUP BY, not ORDER BY) to maximize prefix matches. **Both original and reordered kept as options** (fix: greedy replacement destroyed valid alternatives).
-
-4. **`findConsistentSubsets()`**: Enumerate table combinations. Map each collation to equivalence-class space. Check if all form a valid prefix chain (one subsumes all others). No separate connectivity check needed.
-
-5. **`rank()`**: Sort candidates by table count descending.
-
-### Verified Results
-
-- **Q12**: `{ORDERS, LINEITEM}` by orderkey
-- **Q3**: `{CUSTOMER, ORDERS}` by custkey + `{ORDERS, LINEITEM}` by orderkey (no 3-table — independent keys)
-- **Q9**: `{LINEITEM, PART, PARTSUPP}` 3-table (top) + four 2-table candidates
-  - With reordering: `{L, PS, S}` trades PART for SUPPLIER
-
-### Key Design Decisions
-
-- Join order inside a pipeline is irrelevant — MI is a single range scan over interleaved records regardless of logical join tree shape
-- Filters don't affect MI content in single-MI case — they're query-time only, delegated to optimizer
-- Everything outside the selected pipeline is standard query optimization, not merged-index-specific
-
----
-
-## What Was Done
-
-### 2026-03-10 to 2026-03-25
-
-- Sort-boundary pipeline architecture, `PipelineToMergedIndexScanRule`, TPC-H tests
-  (Q12, Q3-OL, Q9), index creation plan capture, incremental maintenance plan
-  (`deriveMaintenancePlan` + `SetOp.deriveRowType` fast-path fix).
-
-### 2026-04-01 to 2026-04-02
-
-- `scopeLogicalRoot` fix: ALL child pipelines (leaf + non-leaf) replaced with
-  `LogicalPipelineOutputScan` placeholders before delta push-down.
-- Physical maintenance plan conversion: `convertToPhysicalMaintenancePlan()` — three
-  passes (HEP×2 + Volcano) converts all operators to fully enumerable. Applied to
-  Q12, Q3-OL, Q9.
-- `MaintenancePlanConverter` extracted to production code
-  (`core/materialize/MaintenancePlanConverter.java`). Pure code motion, no logic changes.
-
-### 2026-04-03
-
-- Created `CALCITE_LEANSTORE_INTEGRATION.md`: feasibility study for Calcite→LeanStore
-  bridge (plan export + C++ interpreter, 8 milestones, template classification).
-- Created `RESEARCH_QUESTIONS.md`: formal execution model for maintenance (B-tree delta
-  cache, LSM compaction-as-maintenance, propagation tags), 6 analytically tractable
-  efficiency questions (Q1–Q3 tractable from existing plans).
-
-### 2026-04-04
-
-- **DOT cleanup**: `skipTransparent()` omits `EnumerableProject` from colored DOT output.
-  Pure visualization change, all tests pass.
-- **LimitSort as pipeline boundary**: `Pipeline.isBoundarySort()` now accepts
-  `EnumerableLimitSort` (Sort with FETCH/OFFSET). `PipelineToMergedIndexScanRule` operand
-  widened to `Sort.class`; `onMatch` preserves LIMIT by wrapping MIScan in
-  `EnumerableLimitSort`. Q3-OL plan now shows `EnumerableLimitSort(fetch=[10])` over
-  assembled join — physical sort eliminated, LIMIT preserved.
-- **Filter hoisting above boundary sorts**: `hoistFiltersAboveBoundaries()` in
-  `MergedIndexTestUtil` walks the plan tree and peels off `EnumerableFilter` nodes that
-  are the direct (possibly chained) input of a boundary Sort, stacking them above the
-  Sort. Ensures merged indexes store unfiltered data and remain reusable across queries
-  with different predicates. Applied to Q12, Q3-OL, Q9. All 7 tests pass.
-
-### 2026-04-07
-
-- **Widen-then-narrow filter hoisting pre-pass**: `hoistFiltersAboveBoundaries()` now
-  handles filters nested below Project/Aggregate by a two-stage approach:
-  - **Widen pass**: `widenProjectsForFilters()` walks post-order; for each Project on a
-    filter's ancestor path, appends `RexInputRef` projections for filter columns the
-    Project would otherwise drop, preserving field indices.
-  - **Commute**: filters propagate upward through widened Projects/Aggregates.
-  - **Narrow** (optional): if root node's row type changed due to widening, narrow back to
-    original type using a final `Project`.
-  New helpers: `collectInputRefIndices`, `shiftRightSideRefs`, `WidenResult`.
-- **Join handling**: when widening a Project above a filter with right-side refs, shift
-  indices by the delta (widened-left count minus original-left count).
-- **Aggregate/SetOp**: don't propagate `needed` upward — widening stops at these operators.
-- **Q9 outcome**: `p_name LIKE '%green%'` filter now sits directly between Aggregate and
-  top boundary Sort. P5 indexed view is filter-free, predicate-agnostic, reusable across
-  LIKE variants.
-- **Pipeline counts unchanged**: Q12 and Q3-OL unaffected by widen-then-narrow logic.
-
-- **LimitSort split refactor**: `MergedIndexTestUtil.splitLimitSorts()` rewrites every
-  `EnumerableLimitSort` in Phase 1 plan as `EnumerableLimit(EnumerableSort(...))` before
-  pipeline discovery. Simplifies `PipelineToMergedIndexScanRule.onMatch()` to bare
-  `call.transformTo(miScan)` with no fetch/offset wrapping.
-- **Q3-OL full collapse**: now has 3 pipelines (inner orderkey + outer custkey + top
-  ORDER BY sort). After all three pipeline boundaries are replaced, plan collapses to
-  `EnumerableLimit → EnumerableMergedIndexScan` with no joins or base scans remaining.
-- **Pipeline.captureLogicalRoots() fix**: when splitLimitSorts adds an extra physical
-  boundary not in the logical plan, unmatched non-root pipelines fall back to stripped
-  logical root (LimitSort unwrapped) for IVM maintenance plan derivation.
-
-### 2026-04-13
-
-- **Filter hoisting moved to logical plan (pre-Volcano)**: `hoistFiltersAboveBoundaries()`
-  now applied before `planner.transform()` in all TPC-H tests (Q12, Q3-OL, Q9).
-  Filters lifted to root pipeline level via widen-then-narrow pass before phase 1.
-- **Convention-agnostic helpers**: `MergedIndexTestUtil` refactored to use abstract
-  `Filter`/`Project` instead of enumerable variants. Factory methods `createFilter()` and
-  `createProject()` create logical-plan versions.
-- **Maintenance plan auto-optimization**: filters now end up in root pipeline (no
-  maintenance plan). Child pipelines' index creation plans are filter-free and
-  predicate-reusable (Q9: P5 indexed view on n_name, o_year without PART filter).
-- **All TPC-H tests pass**: Q12, Q3-OL, Q9 fully verified.
-
-### 2026-04-20
-
-- **Single-MI plan generation (Step A+B)**: Implemented `singleMIPlan()` helper in
-  `MergedIndexSinglePipelineTpchPlanTest.java` — same Volcano flow as multi-MI but
-  selective pipeline registration (only candidate's leaf tables).
-- **Helpers**: `SingleMIPlanResult` (plan artifacts), `getLeafTableNames(Pipeline)` (recurse
-  pipeline sources to find base table names).
-- **Q12 single-MI test** (`tpchQ12OlMI`): {ORDERS, LINEITEM} by orderkey in 2-table query.
-  2 MIScans, MergeJoin (assembly) stays, Sort(l_shipmode) re-sort at query time.
-- **Q3 single-MI test** (`tpchQ3OlMI`): {ORDERS, LINEITEM} by orderkey in 3-table query.
-  Inner pipeline replaced with MIScans, outer custkey join + CUSTOMER TableScan stay.
-- **Q9-LPS single-MI test** (`tpchQ9LpsMI`): {LINEITEM, PART, PARTSUPP} by (partkey,suppkey)
-  in 6-table query. Two nested pipelines registered (L⋈P + (L⋈P)⋈PS). ORDERS, SUPPLIER,
-  NATION remain at query time.
-- **All 16 tests pass** (9 single-MI + 3 multi-MI + 4 core rule).
-- **Registration strategy**: bottom-up from leaf, `sources.size() >= 2` (join pipelines only),
-  stop when all candidate tables covered. Indexed views with different sort keys excluded.
-
----
-
-## Next Steps
-
-### Short-term (next session)
-
-**Single-MI plan generation complete for Q12, Q3, Q9.** Next:
-- Review DOT output in `plus/test-output-ind-ord/` for plan shape verification
-- Q5, Q7 identification + single-MI tests
-- `int-ord-plans/` export for LeanStore integration
-
-### Medium-term
-
-- `tpchQ3CoMI()` — {CUSTOMER, ORDERS} by custkey (alternative MI, Step E)
-- **int-ord-plans/ directory structure**: plan.dot + maintenance.dot + README.md per query
-- **Pre-aggregation extension**: flag decomposable aggregates on MI candidates
-- Cardinality-based ranking metric (input/output size) for candidate tie-breaking
-
-### Long-term
-
-- Window functions, DISTINCT in sort-based pipelines
-- Functional dependency-based matching (`o_orderkey → o_custkey`)
+It builds nested pipelines around orderkey, partkey, `(partkey, suppkey)`,
+suppkey, and nationkey. This is a useful stress test for nested registration and
+maintenance-plan capture. It is not proof that the chosen join sequence, final
+ordering, or filter placement is optimal.
+
+Known issue: the saved root query plan currently contains an MI scan feeding a
+filter and `EnumerableAggregate`. A hash aggregate does not guarantee the final
+`ORDER BY n_name, o_year DESC`.
+
+### Q12
+
+The current Q12 example demonstrates an ORDERS/LINEITEM pipeline and a grouped
+root plan. The test should be corrected before using it as evidence for TPC-H
+semantics: TPC-H Q12 counts high-priority orders for both `1-URGENT` and
+`2-HIGH`, while the current test only handles `1-URGENT`.
+
+## Maintenance Notes
+
+The maintenance converter can derive scoped logical delta plans and convert them
+to Enumerable plans. Treat those plans as reference structures. They are not an
+execution contract yet.
+
+Do not claim blanket 1-to-1 cascade cost. One source-record update adds one
+entry to a raw-source MI, but a downstream pipeline can emit multiple rows if
+the changed record joins with many rows, changes an aggregate state, or feeds a
+parent MI with a different key.
+
+Open execution details include signed deltas, aggregate retractions, old/new
+row visibility, batching, downstream application order, and transaction rules.
+
+## LeanStore Handoff
+
+The next LeanStore phase is manual C++ plans first. Use Calcite as a reference
+for order-sharing structure, pipeline boundaries, and maintenance hypotheses.
+Adapt the implementation when LeanStore's physical indexes make a better plan
+possible, as in Q3/Q5/Q10.
+
+Record each adaptation explicitly:
+
+- which Calcite pipeline it corresponds to
+- which LeanStore index and key layout it uses
+- which operators remain at query time
+- which predicates or aggregates are applied manually
+- what correctness check will compare it against
+
+## Next Planning Steps
+
+1. Correct Q3 and Q12 SQL semantics in the structural tests and regenerate DOT
+   artifacts.
+2. Inspect the Q9 root plan and decide how final ordering should be enforced or
+   represented.
+3. Build a query-by-query manual-plan worksheet for TPC-H Q1-Q22, starting from
+   which queries plausibly need multiple pipelines.
+4. Map selected queries to LeanStore manual C++ implementation work, using Q3,
+   Q5, and Q10 as style references.
+
+The September 2026 sweep only updates documentation. It does not choose new
+query execution algorithms.
