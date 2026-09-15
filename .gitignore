@@ -70,6 +70,7 @@ local.properties
 # Generated DOT plan files from MergedIndexTpchPlanTest
 plus/test-dot-output/**/*.dot
 plus/test-dot-output/**/*.png
+plus/plus/test-output-ind-ord/**/*.dot
 
 # claude
 .claude/*
